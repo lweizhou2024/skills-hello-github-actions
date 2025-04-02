@@ -1,0 +1,12 @@
+Install pytesseract
+Install opencv
+
+install tesseract-ocr
+https://github.com/UB-Mannheim/tesseract/wiki
+
+Install letsgodigital training data:
+https://github.com/adrianlazaro8/Tesseract_sevenSegmentsLetsGoDigital
+
+You only need lets.traineddata, but perhaps will need clone whole project. 
+
+Follow Hans instruction and find digits x,y start and end. 
