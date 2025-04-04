@@ -1,0 +1,66 @@
+from odbAccess import *
+from abaqusConstants import *
+import numpy as np
+
+def extract_temperature_data(odb_file_path, output_file_path):
+    """
+    Extract NT11 temperature values from an Abaqus ODB file at the last step and frame
+    and write to an output file.
+    
+    Args:
+        odb_file_path (str): Path to the Abaqus ODB file
+        output_file_path (str): Path to save the output file
+    """
+    print("Opening ODB file: " + odb_file_path)
+    odb = openOdb(path=odb_file_path, readOnly=True)
+    
+    # Get the last step
+    step_names = odb.steps.keys()
+    last_step_name = step_names[-1]
+    last_step = odb.steps[last_step_name]
+    
+    # Get the last frame
+    last_frame_index = len(last_step.frames) - 1
+    last_frame = last_step.frames[last_frame_index]
+    
+    print(f"Extracting NT11 data from Step: {last_step_name}, Frame: {last_frame_index}")
+    
+    # Check if NT11 field output exists
+    nt11_field = None
+    for field in last_frame.fieldOutputs.keys():
+        if field == 'NT11':
+            nt11_field = last_frame.fieldOutputs['NT11']
+            break
+    
+    if nt11_field is None:
+        print("Error: NT11 field output not found in the ODB file")
+        odb.close()
+        return
+    
+    # Open output file
+    with open(output_file_path, 'w') as f:
+        f.write("instance_name.node_number, nt11\n")
+        
+        # Loop through all instances
+        for instance_name in odb.rootAssembly.instances.keys():
+            instance = odb.rootAssembly.instances[instance_name]
+            
+            # Get NT11 values for this instance
+            instance_values = nt11_field.getSubset(region=instance)
+            
+            if instance_values:
+                # Loop through each value
+                for value in instance_values.values:
+                    node_number = value.nodeLabel
+                    temperature = value.data
+                    f.write(f"{instance_name}.{node_number}, {temperature}\n")
+    
+    print(f"Data extraction complete. Results saved to: {output_file_path}")
+    odb.close()
+
+if __name__ == "__main__":
+    # Replace these paths with your actual file paths
+    odb_file_path = "your_model.odb"
+    output_file_path = "temperature_results.csv"
+    
+    extract_temperature_data(odb_file_path, output_file_path)
