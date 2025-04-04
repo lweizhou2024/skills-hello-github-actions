@@ -1,6 +1,5 @@
 from odbAccess import *
 from abaqusConstants import *
-import numpy as np
 
 def extract_temperature_data(odb_file_path, output_file_path):
     """
@@ -23,7 +22,7 @@ def extract_temperature_data(odb_file_path, output_file_path):
     last_frame_index = len(last_step.frames) - 1
     last_frame = last_step.frames[last_frame_index]
     
-    print(f"Extracting NT11 data from Step: {last_step_name}, Frame: {last_frame_index}")
+    print("Extracting NT11 data from Step: " + last_step_name + ", Frame: " + str(last_frame_index))
     
     # Check if NT11 field output exists
     nt11_field = None
@@ -38,24 +37,26 @@ def extract_temperature_data(odb_file_path, output_file_path):
         return
     
     # Open output file
-    with open(output_file_path, 'w') as f:
-        f.write("instance_name.node_number, nt11\n")
-        
-        # Loop through all instances
-        for instance_name in odb.rootAssembly.instances.keys():
-            instance = odb.rootAssembly.instances[instance_name]
-            
-            # Get NT11 values for this instance
-            instance_values = nt11_field.getSubset(region=instance)
-            
-            if instance_values:
-                # Loop through each value
-                for value in instance_values.values:
-                    node_number = value.nodeLabel
-                    temperature = value.data
-                    f.write(f"{instance_name}.{node_number}, {temperature}\n")
+    output_file = open(output_file_path, 'w')
+    output_file.write("instance_name.node_number, nt11\n")
     
-    print(f"Data extraction complete. Results saved to: {output_file_path}")
+    # Loop through all instances
+    for instance_name in odb.rootAssembly.instances.keys():
+        instance = odb.rootAssembly.instances[instance_name]
+        
+        # Get NT11 values for this instance
+        instance_values = nt11_field.getSubset(region=instance)
+        
+        if instance_values:
+            # Loop through each value
+            for value in instance_values.values:
+                node_number = value.nodeLabel
+                temperature = value.data
+                output_line = instance_name + "." + str(node_number) + ", " + str(temperature)
+                output_file.write(output_line + "\n")
+    
+    output_file.close()
+    print("Data extraction complete. Results saved to: " + output_file_path)
     odb.close()
 
 if __name__ == "__main__":
