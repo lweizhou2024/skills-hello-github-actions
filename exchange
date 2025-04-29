@@ -1,70 +1,62 @@
-function [values, units, lineMap] = readDelimitedMultiValueFile(filename, delimiter)
-    % Set default delimiter if not provided
+function [values, units, lineNumbers] = readEveryNthLine(filename, n)
+    % Default to every 10th line if n is not specified
     if nargin < 2
-        delimiter = '\t'; % Default to tab delimiter
+        n = 10;
     end
     
     % Open the file
-    fileID = fopen(filename, 'r');
+    fileID = fopen(filename, 'r', 'n', 'UTF-8');
     
     % Skip header
     fgetl(fileID);
     
-    % Read the file line by line
-    lines = textscan(fileID, '%s', 'Delimiter', '\n');
-    fclose(fileID);
-    lines = lines{1};
-    numLines = length(lines);
+    % Initialize variables
+    values = [];
+    units = {};
+    lineNumbers = [];
     
-    % Pattern for scientific notation with units
-    pattern = '(\d+,\d+(?:E[+-]?\d+)?)([a-zA-Z]*)';
+    % Pattern for scientific notation with units (including degree sign)
+    pattern = '(\d+,\d+(?:E[+-]?\d+)?)([^\s\d,]+)';
     
-    % Preallocate with an estimated size
-    estValuesPerLine = 10; % Adjust based on your data
-    estTotalValues = numLines * estValuesPerLine;
-    values = zeros(estTotalValues, 1);
-    units = cell(estTotalValues, 1);
-    lineMap = zeros(estTotalValues, 1);
-    
-    valueCount = 0;
-    
-    % Process each line
-    for lineIdx = 1:numLines
-        % Split the line by delimiter
-        items = strsplit(lines{lineIdx}, delimiter);
+    % Process the file line by line
+    lineCount = 0;
+    while ~feof(fileID)
+        lineCount = lineCount + 1;
+        line = fgetl(fileID);
         
-        % Process each item
-        for j = 1:length(items)
-            % Find matches in this item
-            [tokens, ~] = regexp(items{j}, pattern, 'tokens', 'match');
+        % Skip if not a multiple of n
+        if mod(lineCount, n) ~= 0
+            continue;
+        end
+        
+        % Process this line (every nth line)
+        if ~isempty(line)
+            % Find all matches in this line
+            [tokens, ~] = regexp(line, pattern, 'tokens', 'match');
             
-            % Process all matches (usually just one per item)
-            for k = 1:length(tokens)
-                valueCount = valueCount + 1;
+            % Process each match
+            for j = 1:length(tokens)
+                % Extract and convert the numeric part
+                numStr = tokens{j}{1};
+                value = str2double(strrep(numStr, ',', '.'));
                 
-                % Resize arrays if needed
-                if valueCount > length(values)
-                    values = [values; zeros(estTotalValues, 1)];
-                    units = [units; cell(estTotalValues, 1)];
-                    lineMap = [lineMap; zeros(estTotalValues, 1)];
-                end
+                % Extract the unit
+                unit = tokens{j}{2};
                 
-                % Store the data
-                numStr = tokens{k}{1};
-                values(valueCount) = str2double(strrep(numStr, ',', '.'));
-                units{valueCount} = tokens{k}{2};
-                lineMap(valueCount) = lineIdx;
+                % Add to our results
+                values = [values; value];
+                units{end+1,1} = unit;
+                lineNumbers = [lineNumbers; lineCount];
             end
         end
         
         % Show progress for large files
-        if mod(lineIdx, 10000) == 0
-            fprintf('Processed %d of %d lines...\n', lineIdx, numLines);
+        if mod(lineCount, n*1000) == 0
+            fprintf('Processed up to line %d (found %d values)...\n', lineCount, length(values));
         end
     end
     
-    % Trim arrays to the actual size
-    values = values(1:valueCount);
-    units = units(1:valueCount);
-    lineMap = lineMap(1:valueCount);
+    fclose(fileID);
+    
+    fprintf('Complete! Extracted %d values from %d lines.\n', length(values), lineCount);
 end
