@@ -1,67 +1,49 @@
-from odbAccess import *
-from abaqusConstants import *
-
-def extract_temperature_data(odb_file_path, output_file_path):
-    """
-    Extract NT11 temperature values from an Abaqus ODB file at the last step and frame
-    and write to an output file.
+function [values, units] = readLargeFileWithScientific(filename)
+    % Open the file
+    fileID = fopen(filename, 'r');
     
-    Args:
-        odb_file_path (str): Path to the Abaqus ODB file
-        output_file_path (str): Path to save the output file
-    """
-    print("Opening ODB file: " + odb_file_path)
-    odb = openOdb(path=odb_file_path, readOnly=True)
+    % Skip header
+    fgetl(fileID);
     
-    # Get the last step
-    step_names = odb.steps.keys()
-    last_step_name = step_names[-1]
-    last_step = odb.steps[last_step_name]
+    % Read the file as strings
+    data = textscan(fileID, '%s', 'Delimiter', '\n');
+    fclose(fileID);
     
-    # Get the last frame
-    last_frame_index = len(last_step.frames) - 1
-    last_frame = last_step.frames[last_frame_index]
+    % Get the strings
+    strings = data{1};
+    n = length(strings);
     
-    print("Extracting NT11 data from Step: " + last_step_name + ", Frame: " + str(last_frame_index))
+    % Prepare output arrays
+    values = zeros(n, 1);
+    units = cell(n, 1);
     
-    # Check if NT11 field output exists
-    nt11_field = None
-    for field in last_frame.fieldOutputs.keys():
-        if field == 'NT11':
-            nt11_field = last_frame.fieldOutputs['NT11']
-            break
+    % Define the pattern for scientific notation with units
+    pattern = '(\d+,\d+(?:E[+-]?\d+)?)([a-zA-Z]*)';
     
-    if nt11_field is None:
-        print("Error: NT11 field output not found in the ODB file")
-        odb.close()
-        return
+    % Process in batches for better performance
+    batchSize = 10000;
+    numBatches = ceil(n/batchSize);
     
-    # Open output file
-    output_file = open(output_file_path, 'w')
-    output_file.write("instance_name.node_number, nt11\n")
-    
-    # Loop through all instances
-    for instance_name in odb.rootAssembly.instances.keys():
-        instance = odb.rootAssembly.instances[instance_name]
+    for b = 1:numBatches
+        % Calculate batch indices
+        startIdx = (b-1)*batchSize + 1;
+        endIdx = min(b*batchSize, n);
         
-        # Get NT11 values for this instance
-        instance_values = nt11_field.getSubset(region=instance)
-        
-        if instance_values:
-            # Loop through each value
-            for value in instance_values.values:
-                node_number = value.nodeLabel
-                temperature = value.data
-                output_line = instance_name + "." + str(node_number) + ", " + str(temperature)
-                output_file.write(output_line + "\n")
-    
-    output_file.close()
-    print("Data extraction complete. Results saved to: " + output_file_path)
-    odb.close()
-
-if __name__ == "__main__":
-    # Replace these paths with your actual file paths
-    odb_file_path = "your_model.odb"
-    output_file_path = "temperature_results.csv"
-    
-    extract_temperature_data(odb_file_path, output_file_path)
+        % Process batch
+        for i = startIdx:endIdx
+            % Extract numeric part and unit
+            [tokens, ~] = regexp(strings{i}, pattern, 'tokens', 'match');
+            
+            if ~isempty(tokens)
+                % Replace comma with period and convert
+                numStr = tokens{1}{1};
+                values(i) = str2double(strrep(numStr, ',', '.'));
+                units{i} = tokens{1}{2};
+            else
+                % Handle lines that don't match pattern
+                values(i) = NaN;
+                units{i} = '';
+            end
+        end
+    end
+end
