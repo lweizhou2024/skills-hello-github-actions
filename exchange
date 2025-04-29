@@ -1,49 +1,70 @@
-function [values, units] = readLargeFileWithScientific(filename)
+function [values, units, lineMap] = readDelimitedMultiValueFile(filename, delimiter)
+    % Set default delimiter if not provided
+    if nargin < 2
+        delimiter = '\t'; % Default to tab delimiter
+    end
+    
     % Open the file
     fileID = fopen(filename, 'r');
     
     % Skip header
     fgetl(fileID);
     
-    % Read the file as strings
-    data = textscan(fileID, '%s', 'Delimiter', '\n');
+    % Read the file line by line
+    lines = textscan(fileID, '%s', 'Delimiter', '\n');
     fclose(fileID);
+    lines = lines{1};
+    numLines = length(lines);
     
-    % Get the strings
-    strings = data{1};
-    n = length(strings);
-    
-    % Prepare output arrays
-    values = zeros(n, 1);
-    units = cell(n, 1);
-    
-    % Define the pattern for scientific notation with units
+    % Pattern for scientific notation with units
     pattern = '(\d+,\d+(?:E[+-]?\d+)?)([a-zA-Z]*)';
     
-    % Process in batches for better performance
-    batchSize = 10000;
-    numBatches = ceil(n/batchSize);
+    % Preallocate with an estimated size
+    estValuesPerLine = 10; % Adjust based on your data
+    estTotalValues = numLines * estValuesPerLine;
+    values = zeros(estTotalValues, 1);
+    units = cell(estTotalValues, 1);
+    lineMap = zeros(estTotalValues, 1);
     
-    for b = 1:numBatches
-        % Calculate batch indices
-        startIdx = (b-1)*batchSize + 1;
-        endIdx = min(b*batchSize, n);
+    valueCount = 0;
+    
+    % Process each line
+    for lineIdx = 1:numLines
+        % Split the line by delimiter
+        items = strsplit(lines{lineIdx}, delimiter);
         
-        % Process batch
-        for i = startIdx:endIdx
-            % Extract numeric part and unit
-            [tokens, ~] = regexp(strings{i}, pattern, 'tokens', 'match');
+        % Process each item
+        for j = 1:length(items)
+            % Find matches in this item
+            [tokens, ~] = regexp(items{j}, pattern, 'tokens', 'match');
             
-            if ~isempty(tokens)
-                % Replace comma with period and convert
-                numStr = tokens{1}{1};
-                values(i) = str2double(strrep(numStr, ',', '.'));
-                units{i} = tokens{1}{2};
-            else
-                % Handle lines that don't match pattern
-                values(i) = NaN;
-                units{i} = '';
+            % Process all matches (usually just one per item)
+            for k = 1:length(tokens)
+                valueCount = valueCount + 1;
+                
+                % Resize arrays if needed
+                if valueCount > length(values)
+                    values = [values; zeros(estTotalValues, 1)];
+                    units = [units; cell(estTotalValues, 1)];
+                    lineMap = [lineMap; zeros(estTotalValues, 1)];
+                end
+                
+                % Store the data
+                numStr = tokens{k}{1};
+                values(valueCount) = str2double(strrep(numStr, ',', '.'));
+                units{valueCount} = tokens{k}{2};
+                lineMap(valueCount) = lineIdx;
             end
         end
+        
+        % Show progress for large files
+        if mod(lineIdx, 10000) == 0
+            fprintf('Processed %d of %d lines...\n', lineIdx, numLines);
+        end
     end
+    
+    % Trim arrays to the actual size
+    values = values(1:valueCount);
+    units = units(1:valueCount);
+    lineMap = lineMap(1:valueCount);
 end
