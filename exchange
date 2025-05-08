@@ -3,6 +3,8 @@ function [header, data] = readZonFile(filename)
 %   [HEADER, DATA] = READZONFILE(FILENAME) reads a .zon file from a profilometer
 %   and returns the header information and the height data matrix.
 %
+%   Specifically designed to handle KPK16 BM6 format files with 256x256 dimensions.
+%
 %   Input:
 %       filename - String, path to the .zon file
 %
@@ -144,70 +146,174 @@ try
     end
     
     % Now read the data
-    % Try to determine if data is in ASCII or binary format
-    % First try reading as ASCII
-    try
-        % Try reading first data line to determine format
-        testLine = fgetl(fid);
-        fseek(fid, position - length(line) - 2, 'bof'); % Go back
+        % Handle KPK16 BM6 format specifically
+    if contains(header.fileType, 'KPK16') && contains(header.fileType, 'BM6')
+        % Since we know it's a 256x256 binary file with specific format
+        fprintf('Detected KPK16 BM6 format file with 256x256 dimensions\n');
         
-        % Check if line contains numbers separated by whitespace
-        nums = str2num(testLine); %#ok<ST2NM>
-        if length(nums) > 1
-            % Likely ASCII format
-            data = zeros(header.ySize, header.xSize);
-            for y = 1:header.ySize
-                line = fgetl(fid);
-                if ~isempty(line)
-                    rowData = str2num(line); %#ok<ST2NM>
-                    if length(rowData) ~= header.xSize
-                        rowData = rowData(1:min(length(rowData), header.xSize));
-                        if length(rowData) < header.xSize
-                            rowData(end+1:header.xSize) = NaN;
-                        end
-                    end
-                    data(y, :) = rowData;
-                else
-                    data(y, :) = NaN;
-                end
-            end
-        else
-            % Try binary format - reset position
-            fseek(fid, position, 'bof');
-            
-            % Try reading as binary floating point (32-bit)
-            data = fread(fid, [header.xSize, header.ySize], 'float32');
-            data = data';
-            
-            % If data size doesn't match expected, try other formats
-            if numel(data) ~= header.xSize * header.ySize
-                fseek(fid, position, 'bof');
-                data = fread(fid, [header.xSize, header.ySize], 'float64');
-                data = data';
-            end
-            
-            if numel(data) ~= header.xSize * header.ySize
-                fseek(fid, position, 'bof');
-                data = fread(fid, [header.xSize, header.ySize], 'int16');
-                data = data';
-            end
-            
-            if numel(data) ~= header.xSize * header.ySize
-                fseek(fid, position, 'bof');
-                data = fread(fid, [header.xSize, header.ySize], 'int32');
-                data = data';
+        % Reset file pointer to the beginning
+        frewind(fid);
+        
+        % Skip the header section - first analyze the file to find the data offset
+        % Read the entire file as bytes
+        fseek(fid, 0, 'eof');
+        fileSize = ftell(fid);
+        frewind(fid);
+        
+        % Read the first chunk of bytes to analyze
+        headerBytes = fread(fid, min(1000, fileSize), 'uint8');
+        
+        % Look for potential data offset patterns - this is a heuristic approach
+        % For KPK16 BM6 files, the header size can vary but is typically fixed
+        % Try different common header sizes
+        potentialHeaderSizes = [4108, 4096, 2048, 1024, 512, 256];
+        
+        % We're looking for a fixed header size that will lead to exactly 256x256 values
+        % of a specific data type (float32, int16, etc.)
+        
+        % Calculate expected data bytes for a 256x256 matrix
+        expectedDataBytes = 256 * 256;
+        
+        % Find the best header size
+        headerSize = 0;
+        for potSize = potentialHeaderSizes
+            if fileSize - potSize == expectedDataBytes * 4  % float32 or int32
+                headerSize = potSize;
+                dataType = 'float32';
+                break;
+            elseif fileSize - potSize == expectedDataBytes * 2  % int16
+                headerSize = potSize;
+                dataType = 'int16';
+                break;
+            elseif fileSize - potSize == expectedDataBytes * 8  % double
+                headerSize = potSize;
+                dataType = 'double';
+                break;
             end
         end
-    catch
-        warning('Error reading data. Attempting alternative parsing methods.');
         
-        % Reset position and try binary format directly
-        fseek(fid, position, 'bof');
+        if headerSize == 0
+            % If we couldn't determine the header size, try a common case
+            % For many .zon files, data starts after a fixed header size
+            headerSize = 4096;  % Typical for some profilometer files
+            dataType = 'float32'; % Most common for height data
+            warning('Could not automatically determine header size. Using default of %d bytes.', headerSize);
+        end
+        
+        % Position the file pointer at the start of the data section
+        fseek(fid, headerSize, 'bof');
+        
+        % Read the data based on the determined type
+        switch dataType
+            case 'float32'
+                data = fread(fid, [256, 256], 'float32');
+            case 'int16'
+                data = fread(fid, [256, 256], 'int16');
+            case 'int32'
+                data = fread(fid, [256, 256], 'int32');
+            case 'double'
+                data = fread(fid, [256, 256], 'double');
+            otherwise
+                data = fread(fid, [256, 256], 'float32');
+        end
+        
+        % Transpose the data to get the right orientation
+        data = data';
+        
+        % Extract additional header information for debugging
+        header.detectedDataType = dataType;
+        header.detectedHeaderSize = headerSize;
+        header.fileSize = fileSize;
+        header.xSize = 256;
+        header.ySize = 256;
+        
+        % For the KPK16 BM6 format, try different byte order if data looks incorrect
+        if min(data(:)) == max(data(:)) || all(isnan(data(:))) || all(isinf(data(:)))
+            % Data looks wrong, try with a different byte order
+            frewind(fid);
+            fseek(fid, headerSize, 'bof');
+            
+            if strcmp(dataType, 'float32')
+                data = fread(fid, [256, 256], 'float32', 'ieee-be'); % Big endian
+                data = data';
+                
+                if min(data(:)) == max(data(:)) || all(isnan(data(:))) || all(isinf(data(:)))
+                    % Still wrong, try int16 big endian
+                    frewind(fid);
+                    fseek(fid, headerSize, 'bof');
+                    data = fread(fid, [256, 256], 'int16', 'ieee-be');
+                    data = data';
+                    header.detectedDataType = 'int16-be';
+                else
+                    header.detectedDataType = 'float32-be';
+                end
+            end
+        end
+    else
+        % Generic approach for other file formats
         try
-            data = fread(fid, [header.xSize, header.ySize], 'float32');
-            data = data';
+            % Try reading first data line to determine format
+            testLine = fgetl(fid);
+            fseek(fid, position - length(line) - 2, 'bof'); % Go back
+            
+            % Check if line contains numbers separated by whitespace
+            nums = str2num(testLine); %#ok<ST2NM>
+            if length(nums) > 1
+                % Likely ASCII format
+                data = zeros(header.ySize, header.xSize);
+                for y = 1:header.ySize
+                    line = fgetl(fid);
+                    if ~isempty(line)
+                        rowData = str2num(line); %#ok<ST2NM>
+                        if length(rowData) ~= header.xSize
+                            rowData = rowData(1:min(length(rowData), header.xSize));
+                            if length(rowData) < header.xSize
+                                rowData(end+1:header.xSize) = NaN;
+                            end
+                        end
+                        data(y, :) = rowData;
+                    else
+                        data(y, :) = NaN;
+                    end
+                end
+            else
+                % Try binary format - reset position
+                fseek(fid, position, 'bof');
+                
+                % Try reading as binary floating point (32-bit)
+                data = fread(fid, [header.xSize, header.ySize], 'float32');
+                data = data';
+                
+                % If data size doesn't match expected, try other formats
+                if numel(data) ~= header.xSize * header.ySize
+                    fseek(fid, position, 'bof');
+                    data = fread(fid, [header.xSize, header.ySize], 'float64');
+                    data = data';
+                end
+                
+                if numel(data) ~= header.xSize * header.ySize
+                    fseek(fid, position, 'bof');
+                    data = fread(fid, [header.xSize, header.ySize], 'int16');
+                    data = data';
+                end
+                
+                if numel(data) ~= header.xSize * header.ySize
+                    fseek(fid, position, 'bof');
+                    data = fread(fid, [header.xSize, header.ySize], 'int32');
+                    data = data';
+                end
+            end
         catch
-            error('Failed to read data section of .zon file.');
+            warning('Error reading data. Attempting alternative parsing methods.');
+            
+            % Reset position and try binary format directly
+            fseek(fid, position, 'bof');
+            try
+                data = fread(fid, [header.xSize, header.ySize], 'float32');
+                data = data';
+            catch
+                error('Failed to read data section of .zon file.');
+            end
         end
     end
     
@@ -239,22 +345,307 @@ end
 
 end
 
+% Custom function for problematic files with known parameters
+function [header, data] = readZonFileCustom(filename, options)
+% READZONFILECUSTOM Reads a .zon file with custom parameters
+%   Allows manual specification of header size, byte order, and data type
+%   for problematic files that don't conform to standard formats
+
+% Check if the file exists
+if ~exist(filename, 'file')
+    error('File does not exist: %s', filename);
+end
+
+% Open the file
+fid = fopen(filename, 'r');
+if fid == -1
+    error('Could not open file: %s', filename);
+end
+
+try
+    % Create basic header structure
+    header = struct();
+    header.fileType = 'KPK16 BM6 (custom reader)';
+    header.xSize = 256;
+    header.ySize = 256;
+    header.heightUnits = 'μm';
+    
+    % File information
+    fileInfo = dir(filename);
+    header.fileSize = fileInfo.bytes;
+    
+    % Use specified header size or guess it
+    if ~isempty(options.headerSize)
+        headerSize = options.headerSize;
+    else
+        % Guess header size based on total file size
+        fileSize = header.fileSize;
+        expectedDataBytes = 256 * 256;
+        
+        % Try to determine header size from file size for common data types
+        if mod(fileSize - expectedDataBytes*4, 512) == 0
+            headerSize = fileSize - expectedDataBytes*4;  % float32
+            header.dataType = 'float32';
+        elseif mod(fileSize - expectedDataBytes*2, 512) == 0
+            headerSize = fileSize - expectedDataBytes*2;  % int16
+            header.dataType = 'int16';
+        elseif mod(fileSize - expectedDataBytes*8, 512) == 0
+            headerSize = fileSize - expectedDataBytes*8;  % double
+            header.dataType = 'double';
+        else
+            % Default header size if we can't determine it
+            headerSize = 4096;
+            header.dataType = 'float32';
+        end
+    end
+    
+    % Use specified data type or use the guessed one
+    if ~isempty(options.dataType)
+        dataType = options.dataType;
+    elseif isfield(header, 'dataType')
+        dataType = header.dataType;
+    else
+        dataType = 'float32';  % Default to float32
+    end
+    
+    % Record the values we're using
+    header.usedHeaderSize = headerSize;
+    header.usedDataType = dataType;
+    
+    % Skip the header
+    fseek(fid, headerSize, 'bof');
+    
+    % Set up byte order
+    byteOrder = '';
+    if ~isempty(options.byteOrder)
+        if strcmpi(options.byteOrder, 'big')
+            byteOrder = 'ieee-be';
+        elseif strcmpi(options.byteOrder, 'little')
+            byteOrder = 'ieee-le';
+        end
+    end
+    
+    % Read the data with the specified format
+    if ~isempty(byteOrder)
+        data = fread(fid, [256, 256], dataType, 0, byteOrder);
+    else
+        data = fread(fid, [256, 256], dataType);
+    end
+    
+    % Transpose to get correct orientation
+    data = data';
+    
+    % If data looks invalid, try different combinations
+    if all(isnan(data(:))) || all(isinf(data(:))) || min(data(:)) == max(data(:))
+        % Try the opposite byte order
+        fseek(fid, headerSize, 'bof');
+        if strcmp(byteOrder, 'ieee-be')
+            data = fread(fid, [256, 256], dataType, 0, 'ieee-le');
+        elseif strcmp(byteOrder, 'ieee-le')
+            data = fread(fid, [256, 256], dataType, 0, 'ieee-be');
+        else
+            if strcmp(computer('arch'), 'win64') || strcmp(computer('arch'), 'win32')
+                % Windows is typically little-endian
+                data = fread(fid, [256, 256], dataType, 0, 'ieee-be');
+            else
+                % Try little-endian for other systems
+                data = fread(fid, [256, 256], dataType, 0, 'ieee-le');
+            end
+        end
+        data = data';
+    end
+    
+    % Handle data processing
+    % Some .zon files have inverted Z-axis
+    if mean(data(:), 'omitnan') < 0
+        data = -data;
+    end
+    
+    % Remove outliers (optional, can be disabled)
+    validData = data(~isnan(data) & ~isinf(data));
+    if ~isempty(validData)
+        q1 = quantile(validData, 0.01);
+        q99 = quantile(validData, 0.99);
+        extremeThreshold = 5 * (q99 - q1);
+        extremeOutliers = data < (q1 - extremeThreshold) | data > (q99 + extremeThreshold);
+        data(extremeOutliers) = NaN;
+    end
+    
+catch me
+    fclose(fid);
+    rethrow(me);
+end
+
+% Close the file
+fclose(fid);
+
+end
+
+% Hexdump utility function for debugging binary files
+function hexdump(filename, startByte, numBytes)
+% HEXDUMP Display a hexadecimal dump of a binary file
+%   HEXDUMP(FILENAME, STARTBYTE, NUMBYTES) displays a hex dump of 
+%   NUMBYTES bytes starting at STARTBYTE in the file.
+%
+%   Example:
+%       hexdump('sample.zon', 0, 256);  % Show first 256 bytes
+
+if nargin < 2
+    startByte = 0;
+end
+
+if nargin < 3
+    numBytes = 256;  % Default to showing 256 bytes
+end
+
+% Open the file
+fid = fopen(filename, 'r');
+if fid == -1
+    error('Could not open file: %s', filename);
+end
+
+% Seek to the starting position
+fseek(fid, startByte, 'bof');
+
+% Read the requested bytes
+data = fread(fid, numBytes, 'uint8');
+
+% Close the file
+fclose(fid);
+
+% Display the hex dump
+bytesPerLine = 16;
+for i = 1:bytesPerLine:length(data)
+    % Address
+    fprintf('%08X: ', startByte + i - 1);
+    
+    % Hex values
+    lineData = data(i:min(i+bytesPerLine-1, length(data)));
+    for j = 1:length(lineData)
+        fprintf('%02X ', lineData(j));
+        if j == 8
+            fprintf(' ');  % Extra space in the middle for readability
+        end
+    end
+    
+    % Pad if less than bytesPerLine
+    for j = length(lineData)+1:bytesPerLine
+        fprintf('   ');
+        if j == 8
+            fprintf(' ');
+        end
+    end
+    
+    % ASCII representation
+    fprintf(' |');
+    for j = 1:length(lineData)
+        if lineData(j) >= 32 && lineData(j) <= 126
+            fprintf('%c', char(lineData(j)));
+        else
+            fprintf('.');
+        end
+    end
+    fprintf('|\n');
+end
+
+end
+
 % Example usage function
-function plotZonData(filename)
+function plotZonData(filename, varargin)
 % PLOTZONDATA Reads and plots a .zon file from a profilometer
 %   PLOTZONDATA(FILENAME) reads a .zon file and creates visualizations
 %   of the surface profile data.
 %
+%   PLOTZONDATA(FILENAME, 'debug', true) enables additional debugging
+%   information for troubleshooting problematic files.
+%
+%   PLOTZONDATA(FILENAME, 'headerSize', SIZE) specifies a custom header size
+%   in bytes to try when reading the file.
+%
+%   PLOTZONDATA(FILENAME, 'byteOrder', ORDER) specifies byte order
+%   ('little' or 'big', default is system native).
+%
+%   PLOTZONDATA(FILENAME, 'dataType', TYPE) specifies data type
+%   ('float32', 'int16', 'int32', etc.)
+%
 %   Input:
 %       filename - String, path to the .zon file
+%       varargin - Name-value pairs for additional options
 %
 %   Example:
 %       plotZonData('sample.zon');
+%       plotZonData('sample.zon', 'debug', true);
+%       plotZonData('sample.zon', 'headerSize', 4096, 'dataType', 'float32');
+
+% Parse input arguments
+p = inputParser;
+addParameter(p, 'debug', false, @islogical);
+addParameter(p, 'headerSize', [], @isnumeric);
+addParameter(p, 'byteOrder', '', @ischar);
+addParameter(p, 'dataType', '', @ischar);
+parse(p, varargin{:});
+options = p.Results;
 
 % Read the file
-[header, data] = readZonFile(filename);
+if ~isempty(options.headerSize) || ~isempty(options.byteOrder) || ~isempty(options.dataType)
+    % Use custom reader for problematic files
+    [header, data] = readZonFileCustom(filename, options);
+else
+    [header, data] = readZonFile(filename);
+end
 
-% Create a figure
+% If debug mode is enabled, show file information
+if options.debug
+    % Create a debug figure with file details
+    debugFig = figure('Name', ['Debug Info: ' filename], 'NumberTitle', 'off', 'Position', [100, 100, 500, 400]);
+    
+    % Display header information
+    uicontrol('Style', 'text', 'String', 'File Debug Information', ...
+              'Position', [10, 360, 480, 30], 'FontSize', 14, 'FontWeight', 'bold');
+    
+    fieldNames = fieldnames(header);
+    debugText = '';
+    for i = 1:length(fieldNames)
+        val = header.(fieldNames{i});
+        if isnumeric(val) && isscalar(val)
+            debugText = [debugText, fieldNames{i}, ': ', num2str(val), '\n']; %#ok<AGROW>
+        elseif ischar(val) && length(val) < 50
+            debugText = [debugText, fieldNames{i}, ': ', val, '\n']; %#ok<AGROW>
+        elseif islogical(val) && isscalar(val)
+            debugText = [debugText, fieldNames{i}, ': ', num2str(val), '\n']; %#ok<AGROW>
+        end
+    end
+    
+    % Add basic data statistics
+    debugText = [debugText, '\nData Statistics:\n'];
+    debugText = [debugText, 'Dimensions: ', num2str(size(data,1)), 'x', num2str(size(data,2)), '\n'];
+    debugText = [debugText, 'Min value: ', num2str(min(data(:))), '\n'];
+    debugText = [debugText, 'Max value: ', num2str(max(data(:))), '\n'];
+    debugText = [debugText, 'Mean value: ', num2str(mean(data(:), 'omitnan')), '\n'];
+    debugText = [debugText, 'NaN count: ', num2str(sum(isnan(data(:)))), '\n'];
+    debugText = [debugText, 'Inf count: ', num2str(sum(isinf(data(:)))), '\n'];
+    
+    % Add file size information
+    fileInfo = dir(filename);
+    if ~isempty(fileInfo)
+        debugText = [debugText, '\nFile size: ', num2str(fileInfo.bytes), ' bytes\n'];
+    end
+    
+    % Create a histogram of the data values
+    subplot(2,1,1);
+    histogram(data(:), min(100, round(sqrt(numel(data)))));
+    title('Data Value Distribution');
+    xlabel('Value');
+    ylabel('Frequency');
+    grid on;
+    
+    % Show debug text
+    subplot(2,1,2);
+    axis off;
+    text(0.05, 0.95, debugText, 'VerticalAlignment', 'top', 'FontSize', 9, 'FontName', 'Monospace');
+end
+
+% Create main figure for data visualization
 figure('Name', ['Surface Profile: ' filename], 'NumberTitle', 'off');
 
 % Create a subplot layout
