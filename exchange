@@ -1,62 +1,345 @@
-function [values, units, lineNumbers] = readEveryNthLine(filename, n)
-    % Default to every 10th line if n is not specified
-    if nargin < 2
-        n = 10;
-    end
+function [header, data] = readZonFile(filename)
+% READZONFILE Reads a .zon file from a profilometer
+%   [HEADER, DATA] = READZONFILE(FILENAME) reads a .zon file from a profilometer
+%   and returns the header information and the height data matrix.
+%
+%   Input:
+%       filename - String, path to the .zon file
+%
+%   Output:
+%       header - Structure containing header information from the file
+%       data - 2D matrix containing the height data (in the units specified in header)
+%
+%   Example:
+%       [header, data] = readZonFile('sample.zon');
+%       surf(data);
+%       title(['Surface Profile - ' header.title]);
+%       xlabel('X direction');
+%       ylabel('Y direction');
+%       zlabel(['Height (' header.heightUnits ')']);
+
+% Check if the file exists
+if ~exist(filename, 'file')
+    error('File does not exist: %s', filename);
+end
+
+% Open the file
+fid = fopen(filename, 'r');
+if fid == -1
+    error('Could not open file: %s', filename);
+end
+
+% Initialize header structure
+header = struct();
+
+% Read header information
+try
+    % Most .zon files start with a header section containing metadata
+    line = fgetl(fid);
+    header.fileType = line;  % First line typically identifies the file type
     
-    % Open the file
-    fileID = fopen(filename, 'r', 'n', 'UTF-8');
+    % Read header lines until data section begins
+    dataStarted = false;
+    headerLines = {};
+    lineCount = 1;
     
-    % Skip header
-    fgetl(fileID);
-    
-    % Initialize variables
-    values = [];
-    units = {};
-    lineNumbers = [];
-    
-    % Pattern for scientific notation with units (including degree sign)
-    pattern = '(\d+,\d+(?:E[+-]?\d+)?)([^\s\d,]+)';
-    
-    % Process the file line by line
-    lineCount = 0;
-    while ~feof(fileID)
+    while ~dataStarted && ~feof(fid)
+        line = fgetl(fid);
         lineCount = lineCount + 1;
-        line = fgetl(fileID);
         
-        % Skip if not a multiple of n
-        if mod(lineCount, n) ~= 0
-            continue;
+        % Store the line for later parsing
+        headerLines{end+1} = line;
+        
+        % Check if we've reached the data section
+        % This is format-specific, might need to be adjusted based on actual file format
+        if contains(lower(line), 'data begin') || contains(lower(line), 'begin data') || ...
+           contains(lower(line), '[data]') || isempty(line) && lineCount > 20
+            dataStarted = true;
         end
         
-        % Process this line (every nth line)
-        if ~isempty(line)
-            % Find all matches in this line
-            [tokens, ~] = regexp(line, pattern, 'tokens', 'match');
-            
-            % Process each match
-            for j = 1:length(tokens)
-                % Extract and convert the numeric part
-                numStr = tokens{j}{1};
-                value = str2double(strrep(numStr, ',', '.'));
+        % Parse key-value pairs in header
+        if contains(line, ':')
+            parts = split(line, ':');
+            if length(parts) >= 2
+                key = strtrim(parts{1});
+                value = strtrim(join(parts(2:end), ':'));
                 
-                % Extract the unit
-                unit = tokens{j}{2};
+                % Convert key to valid field name
+                key = regexprep(key, '[^a-zA-Z0-9]', '');
+                if isempty(key) || ~isvarname(key)
+                    key = ['field', num2str(length(fieldnames(header)) + 1)];
+                end
                 
-                % Add to our results
-                values = [values; value];
-                units{end+1,1} = unit;
-                lineNumbers = [lineNumbers; lineCount];
+                % Try to convert numeric values
+                numValue = str2double(value);
+                if ~isnan(numValue)
+                    header.(key) = numValue;
+                else
+                    header.(key) = value;
+                end
             end
         end
-        
-        % Show progress for large files
-        if mod(lineCount, n*1000) == 0
-            fprintf('Processed up to line %d (found %d values)...\n', lineCount, length(values));
+    end
+    
+    % Try to extract common parameters from header
+    if ~isfield(header, 'xSize') && isfield(header, 'XSize')
+        header.xSize = header.XSize;
+    end
+    if ~isfield(header, 'ySize') && isfield(header, 'YSize')
+        header.ySize = header.YSize;
+    end
+    if ~isfield(header, 'xRes') && isfield(header, 'XRes')
+        header.xRes = header.XRes;
+    end
+    if ~isfield(header, 'yRes') && isfield(header, 'YRes')
+        header.yRes = header.YRes;
+    end
+    
+    % Store raw header text
+    header.rawHeaderLines = headerLines;
+    
+    % Guess data dimensions if not explicitly given
+    if ~isfield(header, 'xSize') || ~isfield(header, 'ySize')
+        % Try to find dimensions in the header lines
+        for i = 1:length(headerLines)
+            if contains(lower(headerLines{i}), 'resolution') || ...
+               contains(lower(headerLines{i}), 'dimension') || ...
+               contains(lower(headerLines{i}), 'size')
+                dimMatch = regexp(headerLines{i}, '(\d+)\s*[xX]\s*(\d+)', 'tokens');
+                if ~isempty(dimMatch)
+                    header.xSize = str2double(dimMatch{1}{1});
+                    header.ySize = str2double(dimMatch{1}{2});
+                    break;
+                end
+            end
         end
     end
     
-    fclose(fileID);
+    % Default dimensions if still not found
+    if ~isfield(header, 'xSize')
+        header.xSize = 256; % Default assumption
+        warning('X dimension not found in header, assuming %d', header.xSize);
+    end
+    if ~isfield(header, 'ySize')
+        header.ySize = 256; % Default assumption
+        warning('Y dimension not found in header, assuming %d', header.ySize);
+    end
     
-    fprintf('Complete! Extracted %d values from %d lines.\n', length(values), lineCount);
+    % Units information
+    if ~isfield(header, 'heightUnits')
+        header.heightUnits = 'μm'; % Default assumption
+    end
+    
+    % Now read the data section
+    % First, skip any remaining header lines or comments
+    line = fgetl(fid);
+    while ~feof(fid) && (isempty(line) || line(1) == '%' || line(1) == '#')
+        line = fgetl(fid);
+    end
+    
+    % Go back one line if we found a non-comment line
+    if ~feof(fid)
+        position = ftell(fid);
+        fseek(fid, position - length(line) - 2, 'bof'); % -2 for the newline chars
+    end
+    
+    % Now read the data
+    % Try to determine if data is in ASCII or binary format
+    % First try reading as ASCII
+    try
+        % Try reading first data line to determine format
+        testLine = fgetl(fid);
+        fseek(fid, position - length(line) - 2, 'bof'); % Go back
+        
+        % Check if line contains numbers separated by whitespace
+        nums = str2num(testLine); %#ok<ST2NM>
+        if length(nums) > 1
+            % Likely ASCII format
+            data = zeros(header.ySize, header.xSize);
+            for y = 1:header.ySize
+                line = fgetl(fid);
+                if ~isempty(line)
+                    rowData = str2num(line); %#ok<ST2NM>
+                    if length(rowData) ~= header.xSize
+                        rowData = rowData(1:min(length(rowData), header.xSize));
+                        if length(rowData) < header.xSize
+                            rowData(end+1:header.xSize) = NaN;
+                        end
+                    end
+                    data(y, :) = rowData;
+                else
+                    data(y, :) = NaN;
+                end
+            end
+        else
+            % Try binary format - reset position
+            fseek(fid, position, 'bof');
+            
+            % Try reading as binary floating point (32-bit)
+            data = fread(fid, [header.xSize, header.ySize], 'float32');
+            data = data';
+            
+            % If data size doesn't match expected, try other formats
+            if numel(data) ~= header.xSize * header.ySize
+                fseek(fid, position, 'bof');
+                data = fread(fid, [header.xSize, header.ySize], 'float64');
+                data = data';
+            end
+            
+            if numel(data) ~= header.xSize * header.ySize
+                fseek(fid, position, 'bof');
+                data = fread(fid, [header.xSize, header.ySize], 'int16');
+                data = data';
+            end
+            
+            if numel(data) ~= header.xSize * header.ySize
+                fseek(fid, position, 'bof');
+                data = fread(fid, [header.xSize, header.ySize], 'int32');
+                data = data';
+            end
+        end
+    catch
+        warning('Error reading data. Attempting alternative parsing methods.');
+        
+        % Reset position and try binary format directly
+        fseek(fid, position, 'bof');
+        try
+            data = fread(fid, [header.xSize, header.ySize], 'float32');
+            data = data';
+        catch
+            error('Failed to read data section of .zon file.');
+        end
+    end
+    
+    % Handle potential scaling factors from header
+    if isfield(header, 'zScale') && isnumeric(header.zScale) && header.zScale ~= 0
+        data = data * header.zScale;
+    end
+    
+    % Clean up any invalid values
+    data(isinf(data)) = NaN;
+    
+catch me
+    fclose(fid);
+    rethrow(me);
+end
+
+% Close the file
+fclose(fid);
+
+% Make sure data is correctly oriented
+if size(data, 1) ~= header.ySize || size(data, 2) ~= header.xSize
+    if size(data, 1) == header.xSize && size(data, 2) == header.ySize
+        data = data';
+    else
+        warning('Data size (%dx%d) does not match expected dimensions (%dx%d).', ...
+                size(data, 2), size(data, 1), header.xSize, header.ySize);
+    end
+end
+
+end
+
+% Example usage function
+function plotZonData(filename)
+% PLOTZONDATA Reads and plots a .zon file from a profilometer
+%   PLOTZONDATA(FILENAME) reads a .zon file and creates visualizations
+%   of the surface profile data.
+%
+%   Input:
+%       filename - String, path to the .zon file
+%
+%   Example:
+%       plotZonData('sample.zon');
+
+% Read the file
+[header, data] = readZonFile(filename);
+
+% Create a figure
+figure('Name', ['Surface Profile: ' filename], 'NumberTitle', 'off');
+
+% Create a subplot layout
+subplot(2, 2, 1);
+% Surface plot
+surf(data);
+shading interp;
+title('Surface Plot');
+xlabel('X');
+ylabel('Y');
+if isfield(header, 'heightUnits')
+    zlabel(['Height (' header.heightUnits ')']);
+else
+    zlabel('Height');
+end
+colorbar;
+
+% Top-down view with colormap
+subplot(2, 2, 2);
+imagesc(data);
+axis equal tight;
+title('Top View');
+xlabel('X');
+ylabel('Y');
+colorbar;
+colormap(jet);
+
+% X cross-section at the middle
+subplot(2, 2, 3);
+midY = round(size(data, 1) / 2);
+plot(data(midY, :));
+title(['X Cross-section at Y = ' num2str(midY)]);
+xlabel('X Position');
+if isfield(header, 'heightUnits')
+    ylabel(['Height (' header.heightUnits ')']);
+else
+    ylabel('Height');
+end
+grid on;
+
+% Y cross-section at the middle
+subplot(2, 2, 4);
+midX = round(size(data, 2) / 2);
+plot(data(:, midX));
+title(['Y Cross-section at X = ' num2str(midX)]);
+xlabel('Y Position');
+if isfield(header, 'heightUnits')
+    ylabel(['Height (' header.heightUnits ')']);
+else
+    ylabel('Height');
+end
+grid on;
+
+% Print some basic statistics
+fprintf('File: %s\n', filename);
+fprintf('Dimensions: %d x %d\n', size(data, 2), size(data, 1));
+fprintf('Height range: %.3f to %.3f\n', min(data(:)), max(data(:)));
+if isfield(header, 'heightUnits')
+    fprintf('Units: %s\n', header.heightUnits);
+end
+fprintf('Mean height: %.3f\n', mean(data(:), 'omitnan'));
+fprintf('Median height: %.3f\n', median(data(:), 'omitnan'));
+fprintf('Standard deviation: %.3f\n', std(data(:), 'omitnan'));
+
+% Calculate and display roughness parameters
+validData = data(~isnan(data));
+if ~isempty(validData)
+    % Ra - Mean roughness
+    Ra = mean(abs(validData - mean(validData)));
+    fprintf('Ra (Mean roughness): %.3f\n', Ra);
+    
+    % Rq - Root mean square roughness
+    Rq = sqrt(mean((validData - mean(validData)).^2));
+    fprintf('Rq (RMS roughness): %.3f\n', Rq);
+    
+    % Rz - Mean height difference between peaks and valleys
+    if length(validData) > 10
+        % Simple estimation of Rz
+        sortedData = sort(validData);
+        n = length(sortedData);
+        peaksMean = mean(sortedData(max(1, n-4):n));
+        valleysMean = mean(sortedData(1:min(5, n)));
+        Rz = peaksMean - valleysMean;
+        fprintf('Rz (Peak-to-valley height): %.3f\n', Rz);
+    end
+end
+
 end
