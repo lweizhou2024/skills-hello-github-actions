@@ -1,50 +1,7 @@
-/POST1
-! Read the last set from results file
-FILE,'mesh_temp_files\dp0\SYS-1\MECH\file','rst'
-SET,LAST
+$source = "C:\SourceFolder"
+$destination = "C:\DestinationFolder"
 
-/PAGE,999999,,9999,999999
-
-PATH,ABR,4,30,30
-PPATH,1,,1819.9,0.0,406.1
-PPATH,2,,1866.6,0.0,406.1
-PPATH,3,,1870.3,0.0,406.43
-PPATH,4,,1879.6,0.0,408.7
-PATH,EBC,4,30,30
-PPATH,1,,1819.9,0.0,406.44
-PPATH,2,,1866.6,0.0,406.44
-PPATH,3,,1870.3,0.0,406.77
-PPATH,4,,1879.6,0.0,409.04
-PATH,CMC,4,30,30
-PPATH,1,,1819.9,0.0,406.56
-PPATH,2,,1866.6,0.0,406.56
-PPATH,3,,1870.3,0.0,406.89
-PPATH,4,,1879.6,0.0,409.16
-PATH,flow_LE,2,30,30
-PPATH,1,,1819.9,0.0,405.82
-PPATH,2,,1826.7,0.0,405.82
-PATH,flow_center,2,30,30
-PPATH,1,,1826.7,0.0,405.99
-PPATH,2,,1863.4,0.0,405.99
-PATH,flow_te,4,30,30
-PPATH,1,,1863.4,0.0,405.82
-PPATH,2,,1866.6,0.0,405.82
-PPATH,3,,1870.3,0.0,406.2
-PPATH,4,,1879.6,0.0,408.9
-*dim,pp,char,6
-pp(1)='ABR'
-pp(2)='EBC'
-pp(3)='CMC'
-pp(4)='flow_LE'
-pp(5)='flow_center'
-pp(6)='flow_te'
-numpath=6
-
-*DO,II,1,numpath
-    PATH,pp(II)
-    PSEL,S,pp(II)
-    PDEF,'TEMP',BFE,TEMP
-    /output,%pp(II)%,'txt'
-    prpath,'TEMP'
-    /output
-*ENDDO
+Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object {
+    $dest = $_.FullName.Replace($source, $destination)
+    New-Item -ItemType Directory -Path $dest -Force
+}
