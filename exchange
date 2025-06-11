@@ -7,6 +7,14 @@ Sub PlotScatterByColorAndShape()
 
     Dim chart As Chart
     Set chart = chartObj.Chart
+    chart.HasTitle = True
+    chart.ChartTitle.Text = "My Scatter Plot"
+    
+    chart.Axes(xlCategory).HasTitle = True
+    chart.Axes(xlCategory).AxisTitle.Text = "X Axis Label"
+    
+    chart.Axes(xlValue).HasTitle = True
+    chart.Axes(xlValue).AxisTitle.Text = "Y Axis Label"
     chart.ChartType = xlXYScatter
     chart.HasLegend = True
 
