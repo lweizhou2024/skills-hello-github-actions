@@ -57,7 +57,7 @@ Sub PlotScatterByColorAndShape()
             .Values = yVals
             .Name = keyItem
 
-            ' ----- Shape -----
+            ' ----- Marker Shape -----
             Select Case Split(keyItem, "_")(1)
                 Case "circle": .MarkerStyle = xlMarkerStyleCircle
                 Case "square": .MarkerStyle = xlMarkerStyleSquare
@@ -65,7 +65,7 @@ Sub PlotScatterByColorAndShape()
                 Case Else: .MarkerStyle = xlMarkerStyleDiamond
             End Select
 
-            ' ----- Color -----
+            ' ----- Marker Color -----
             Dim colorCode As Long
             Select Case Split(keyItem, "_")(0)
                 Case "0": colorCode = RGB(0, 102, 204)     ' Blue
@@ -73,14 +73,11 @@ Sub PlotScatterByColorAndShape()
                 Case Else: colorCode = RGB(0, 0, 0)
             End Select
 
-            With .Format
-                .Line.ForeColor.RGB = colorCode           ' Border color
-                .Fill.ForeColor.RGB = colorCode           ' Fill color
-                .Line.Visible = msoTrue
-                .Fill.Visible = msoTrue
-            End With
+            .MarkerForegroundColor = colorCode      ' Border color
+            .MarkerBackgroundColor = colorCode      ' Fill color
+            .MarkerSize = 8
 
-            .MarkerSize = 7
+            .Format.Line.Visible = msoFalse         ' No connecting lines
         End With
 
         seriesIndex = seriesIndex + 1
