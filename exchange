@@ -1,10 +1,10 @@
 @echo off
-set "source=C:\SourceFolder"
-set "destination=C:\DestinationFolder"
+set "source=C:\Path With Spaces\Source"
+set "destination=C:\Path With Spaces\Destination"
 
 powershell -NoProfile -Command ^
-    "$source='%source%'; $destination='%destination%'; ^
-    Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object { ^
+    "$source = '%source%'; $destination = '%destination%'; ^
+    Get-ChildItem -Path `"$source`" -Recurse -Directory | ForEach-Object { ^
         $dest = $_.FullName.Replace($source, $destination); ^
         New-Item -ItemType Directory -Path $dest -Force ^
     }"
