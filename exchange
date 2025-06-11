@@ -1,10 +1,17 @@
+param (
+    [string]$source,
+    [string]$destination
+)
+
+Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object {
+    $dest = $_.FullName.Replace($source, $destination)
+    New-Item -ItemType Directory -Path $dest -Force
+}
+
+
+
 @echo off
 set "source=C:\Path With Spaces\Source"
 set "destination=C:\Path With Spaces\Destination"
 
-powershell -NoProfile -Command ^
-    "$source = '%source%'; $destination = '%destination%'; ^
-    Get-ChildItem -Path `"$source`" -Recurse -Directory | ForEach-Object { ^
-        $dest = $_.FullName.Replace($source, $destination); ^
-        New-Item -ItemType Directory -Path $dest -Force ^
-    }"
+powershell -NoProfile -ExecutionPolicy Bypass -File "CopyFoldersOnly.ps1" -source "%source%" -destination "%destination%"
