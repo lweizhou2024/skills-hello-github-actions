@@ -1,18 +1,75 @@
-param (
-    [string]$source,
-    [string]$destination
-)
+Sub PlotScatterByColorAndShape()
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
 
-# Get only the first-level directories (non-recursive)
-Get-ChildItem -Path $source -Directory | ForEach-Object {
-    $dest = Join-Path $destination $_.Name
-    New-Item -ItemType Directory -Path $dest -Force
-}
+    Dim chartObj As ChartObject
+    Set chartObj = ws.ChartObjects.Add(Left:=300, Width:=500, Top:=50, Height:=300)
 
+    Dim chart As Chart
+    Set chart = chartObj.Chart
+    chart.ChartType = xlXYScatter
+    chart.HasLegend = True
 
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
 
-@echo off
-set "source=C:\Path With Spaces\Source"
-set "destination=C:\Path With Spaces\Destination"
+    Dim dict As Object
+    Set dict = CreateObject("Scripting.Dictionary")
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "CopyFoldersOnly.ps1" -source "%source%" -destination "%destination%"
+    Dim i As Long
+    For i = 2 To lastRow
+        Dim key As String
+        key = ws.Cells(i, 3).Value & "_" & ws.Cells(i, 4).Value ' Color_Shape
+
+        If Not dict.exists(key) Then
+            dict.Add key, New Collection
+        End If
+        dict(key).Add i
+    Next i
+
+    Dim seriesIndex As Long
+    seriesIndex = 1
+
+    Dim keyItem As Variant
+    For Each keyItem In dict.Keys
+        Dim indices As Collection
+        Set indices = dict(keyItem)
+
+        Dim xVals() As Double
+        Dim yVals() As Double
+        ReDim xVals(1 To indices.Count)
+        ReDim yVals(1 To indices.Count)
+
+        For i = 1 To indices.Count
+            xVals(i) = ws.Cells(indices(i), 1).Value
+            yVals(i) = ws.Cells(indices(i), 2).Value
+        Next i
+
+        chart.SeriesCollection.NewSeries
+        With chart.SeriesCollection(seriesIndex)
+            .XValues = xVals
+            .Values = yVals
+            .Name = keyItem
+
+            ' Set marker style
+            Select Case Split(keyItem, "_")(1)
+                Case "circle": .MarkerStyle = xlMarkerStyleCircle
+                Case "square": .MarkerStyle = xlMarkerStyleSquare
+                Case "triangle": .MarkerStyle = xlMarkerStyleTriangle
+                Case Else: .MarkerStyle = xlMarkerStyleDiamond
+            End Select
+
+            ' Set color
+            Select Case Split(keyItem, "_")(0)
+                Case "0": .MarkerForegroundColor = RGB(0, 102, 204)
+                Case "1": .MarkerForegroundColor = RGB(204, 0, 0)
+                Case Else: .MarkerForegroundColor = RGB(0, 0, 0)
+            End Select
+
+            .MarkerSize = 7
+        End With
+
+        seriesIndex = seriesIndex + 1
+    Next keyItem
+
+End Sub
