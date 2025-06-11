@@ -3,8 +3,9 @@ param (
     [string]$destination
 )
 
-Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object {
-    $dest = $_.FullName.Replace($source, $destination)
+# Get only the first-level directories (non-recursive)
+Get-ChildItem -Path $source -Directory | ForEach-Object {
+    $dest = Join-Path $destination $_.Name
     New-Item -ItemType Directory -Path $dest -Force
 }
 
