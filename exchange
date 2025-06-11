@@ -1,7 +1,10 @@
-$source = "C:\SourceFolder"
-$destination = "C:\DestinationFolder"
+@echo off
+set "source=C:\SourceFolder"
+set "destination=C:\DestinationFolder"
 
-Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object {
-    $dest = $_.FullName.Replace($source, $destination)
-    New-Item -ItemType Directory -Path $dest -Force
-}
+powershell -NoProfile -Command ^
+    "$source='%source%'; $destination='%destination%'; ^
+    Get-ChildItem -Path $source -Recurse -Directory | ForEach-Object { ^
+        $dest = $_.FullName.Replace($source, $destination); ^
+        New-Item -ItemType Directory -Path $dest -Force ^
+    }"
