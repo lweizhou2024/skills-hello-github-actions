@@ -1,93 +1,135 @@
-Sub PlotScatterByColorAndShape()
-    Dim ws As Worksheet
-    Set ws = ActiveSheet
-
-    Dim chartObj As ChartObject
-    Set chartObj = ws.ChartObjects.Add(Left:=300, Width:=500, Top:=50, Height:=300)
-
-    Dim chart As Chart
-    Set chart = chartObj.Chart
-    chart.HasTitle = True
-    chart.ChartTitle.Text = "My Scatter Plot"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sidebar Navigation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: Arial, sans-serif;
+            height: 100vh;
+            display: flex;
+        }
+        
+        .sidebar {
+            width: 250px;
+            background-color: #2c3e50;
+            color: white;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .sidebar h2 {
+            margin-bottom: 20px;
+            color: #ecf0f1;
+            border-bottom: 2px solid #34495e;
+            padding-bottom: 10px;
+        }
+        
+        .sidebar ul {
+            list-style: none;
+        }
+        
+        .sidebar li {
+            margin-bottom: 10px;
+        }
+        
+        .sidebar a {
+            color: #bdc3c7;
+            text-decoration: none;
+            display: block;
+            padding: 10px 15px;
+            border-radius: 5px;
+            transition: background-color 0.3s;
+        }
+        
+        .sidebar a:hover {
+            background-color: #34495e;
+            color: #ecf0f1;
+        }
+        
+        .sidebar a.active {
+            background-color: #3498db;
+            color: white;
+        }
+        
+        .content {
+            flex: 1;
+            background-color: #ecf0f1;
+        }
+        
+        .content iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+            background-color: white;
+        }
+        
+        .welcome-message {
+            padding: 40px;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 18px;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <h2>Navigation</h2>
+        <ul>
+            <li><a href="#" onclick="loadPage('page1.html')" data-page="page1.html">Page 1</a></li>
+            <li><a href="#" onclick="loadPage('page2.html')" data-page="page2.html">Page 2</a></li>
+            <li><a href="#" onclick="loadPage('subfolder/page3.html')" data-page="subfolder/page3.html">Page 3</a></li>
+            <li><a href="#" onclick="loadPage('../other/page4.html')" data-page="../other/page4.html">Page 4</a></li>
+            <li><a href="#" onclick="loadPage('docs/documentation.html')" data-page="docs/documentation.html">Documentation</a></li>
+        </ul>
+    </div>
     
-    chart.Axes(xlCategory).HasTitle = True
-    chart.Axes(xlCategory).AxisTitle.Text = "X Axis Label"
-    
-    chart.Axes(xlValue).HasTitle = True
-    chart.Axes(xlValue).AxisTitle.Text = "Y Axis Label"
-    chart.ChartType = xlXYScatter
-    chart.HasLegend = True
+    <div class="content">
+        <iframe id="contentFrame" src="" style="display: none;"></iframe>
+        <div id="welcomeMessage" class="welcome-message">
+            <h2>Welcome</h2>
+            <p>Select a page from the sidebar to view its content.</p>
+        </div>
+    </div>
 
-    Dim lastRow As Long
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-
-    Dim dict As Object
-    Set dict = CreateObject("Scripting.Dictionary")
-
-    Dim i As Long
-    For i = 2 To lastRow
-        Dim colorGroup As String
-        colorGroup = ws.Cells(i, 3).Value  ' 0 or 1
-
-        Dim shape As String
-        shape = LCase(Trim(ws.Cells(i, 4).Value))
-
-        Dim key As String
-        key = colorGroup & "_" & shape
-
-        If Not dict.exists(key) Then
-            dict.Add key, New Collection
-        End If
-        dict(key).Add i
-    Next i
-
-    Dim seriesIndex As Long
-    seriesIndex = 1
-
-    Dim keyItem As Variant
-    For Each keyItem In dict.Keys
-        Dim indices As Collection
-        Set indices = dict(keyItem)
-
-        Dim xVals() As Double
-        Dim yVals() As Double
-        ReDim xVals(1 To indices.Count)
-        ReDim yVals(1 To indices.Count)
-
-        For i = 1 To indices.Count
-            xVals(i) = ws.Cells(indices(i), 1).Value
-            yVals(i) = ws.Cells(indices(i), 2).Value
-        Next i
-
-        chart.SeriesCollection.NewSeries
-        With chart.SeriesCollection(seriesIndex)
-            .XValues = xVals
-            .Values = yVals
-            .Name = keyItem
-
-            ' ----- Marker Shape -----
-            Select Case Split(keyItem, "_")(1)
-                Case "circle": .MarkerStyle = xlMarkerStyleCircle
-                Case "square": .MarkerStyle = xlMarkerStyleSquare
-                Case "triangle": .MarkerStyle = xlMarkerStyleTriangle
-                Case Else: .MarkerStyle = xlMarkerStyleDiamond
-            End Select
-
-            ' ----- Marker Color -----
-            Dim colorCode As Long
-            Select Case Split(keyItem, "_")(0)
-                Case "0": colorCode = RGB(0, 102, 204)     ' Blue
-                Case "1": colorCode = RGB(220, 0, 0)        ' Red
-                Case Else: colorCode = RGB(0, 0, 0)
-            End Select
-
-            .MarkerForegroundColor = colorCode      ' Border color
-            .MarkerBackgroundColor = colorCode      ' Fill color
-            .MarkerSize = 8
-
-            .Format.Line.Visible = msoFalse         ' No connecting lines
-        End With
-
-        seriesIndex = seriesIndex + 1
-    Next keyItem
-End Sub
+    <script>
+        function loadPage(pagePath) {
+            const iframe = document.getElementById('contentFrame');
+            const welcomeMessage = document.getElementById('welcomeMessage');
+            
+            // Update active link
+            const links = document.querySelectorAll('.sidebar a');
+            links.forEach(link => link.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            // Load the page
+            iframe.src = pagePath;
+            iframe.style.display = 'block';
+            welcomeMessage.style.display = 'none';
+            
+            // Handle iframe load errors
+            iframe.onload = function() {
+                console.log('Page loaded successfully: ' + pagePath);
+            };
+            
+            iframe.onerror = function() {
+                iframe.style.display = 'none';
+                welcomeMessage.innerHTML = '<h2>Error</h2><p>Could not load: ' + pagePath + '</p><p>Please check if the file exists.</p>';
+                welcomeMessage.style.display = 'block';
+            };
+        }
+        
+        // Optional: Load a default page on startup
+        // window.onload = function() {
+        //     loadPage('page1.html');
+        // };
+    </script>
+</body>
+</html>
