@@ -1,135 +1,266 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Sidebar Navigation</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: Arial, sans-serif;
-            height: 100vh;
-            display: flex;
-        }
-        
-        .sidebar {
-            width: 250px;
-            background-color: #2c3e50;
-            color: white;
-            padding: 20px;
-            overflow-y: auto;
-        }
-        
-        .sidebar h2 {
-            margin-bottom: 20px;
-            color: #ecf0f1;
-            border-bottom: 2px solid #34495e;
-            padding-bottom: 10px;
-        }
-        
-        .sidebar ul {
-            list-style: none;
-        }
-        
-        .sidebar li {
-            margin-bottom: 10px;
-        }
-        
-        .sidebar a {
-            color: #bdc3c7;
-            text-decoration: none;
-            display: block;
-            padding: 10px 15px;
-            border-radius: 5px;
-            transition: background-color 0.3s;
-        }
-        
-        .sidebar a:hover {
-            background-color: #34495e;
-            color: #ecf0f1;
-        }
-        
-        .sidebar a.active {
-            background-color: #3498db;
-            color: white;
-        }
-        
-        .content {
-            flex: 1;
-            background-color: #ecf0f1;
-        }
-        
-        .content iframe {
-            width: 100%;
-            height: 100%;
-            border: none;
-            background-color: white;
-        }
-        
-        .welcome-message {
-            padding: 40px;
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 18px;
-        }
-    </style>
-</head>
-<body>
-    <div class="sidebar">
-        <h2>Navigation</h2>
-        <ul>
-            <li><a href="#" onclick="loadPage('page1.html')" data-page="page1.html">Page 1</a></li>
-            <li><a href="#" onclick="loadPage('page2.html')" data-page="page2.html">Page 2</a></li>
-            <li><a href="#" onclick="loadPage('subfolder/page3.html')" data-page="subfolder/page3.html">Page 3</a></li>
-            <li><a href="#" onclick="loadPage('../other/page4.html')" data-page="../other/page4.html">Page 4</a></li>
-            <li><a href="#" onclick="loadPage('docs/documentation.html')" data-page="docs/documentation.html">Documentation</a></li>
-        </ul>
-    </div>
-    
-    <div class="content">
-        <iframe id="contentFrame" src="" style="display: none;"></iframe>
-        <div id="welcomeMessage" class="welcome-message">
-            <h2>Welcome</h2>
-            <p>Select a page from the sidebar to view its content.</p>
-        </div>
-    </div>
+from odbAccess import *
+import numpy as np
 
-    <script>
-        function loadPage(pagePath) {
-            const iframe = document.getElementById('contentFrame');
-            const welcomeMessage = document.getElementById('welcomeMessage');
-            
-            // Update active link
-            const links = document.querySelectorAll('.sidebar a');
-            links.forEach(link => link.classList.remove('active'));
-            event.target.classList.add('active');
-            
-            // Load the page
-            iframe.src = pagePath;
-            iframe.style.display = 'block';
-            welcomeMessage.style.display = 'none';
-            
-            // Handle iframe load errors
-            iframe.onload = function() {
-                console.log('Page loaded successfully: ' + pagePath);
-            };
-            
-            iframe.onerror = function() {
-                iframe.style.display = 'none';
-                welcomeMessage.innerHTML = '<h2>Error</h2><p>Could not load: ' + pagePath + '</p><p>Please check if the file exists.</p>';
-                welcomeMessage.style.display = 'block';
-            };
-        }
+def extract_max_stress_history(odb_path, node_labels, output_file):
+    """
+    Extract maximum stress history for a list of nodes from Abaqus ODB file.
+    
+    Parameters:
+    odb_path: Path to the ODB file
+    node_labels: List of node numbers to analyze
+    output_file: Path to output file
+    """
+    
+    # Open the ODB file
+    print(f"Opening ODB file: {odb_path}")
+    odb = openOdb(path=odb_path)
+    
+    try:
+        # Get the first instance (modify if you have multiple instances)
+        instance_name = odb.rootAssembly.instances.keys()[0]
+        instance = odb.rootAssembly.instances[instance_name]
         
-        // Optional: Load a default page on startup
-        // window.onload = function() {
-        //     loadPage('page1.html');
-        // };
-    </script>
-</body>
-</html>
+        print(f"Analyzing {len(node_labels)} nodes")
+        
+        # Get node coordinates for the specified nodes
+        node_coords = {}
+        all_nodes = instance.nodes
+        
+        # Create a dictionary for quick node lookup
+        node_dict = {node.label: node for node in all_nodes}
+        
+        # Verify that all specified nodes exist and get their coordinates
+        valid_node_labels = []
+        for label in node_labels:
+            if label in node_dict:
+                node_coords[label] = node_dict[label].coordinates
+                valid_node_labels.append(label)
+            else:
+                print(f"Warning: Node {label} not found in the model")
+        
+        if not valid_node_labels:
+            print("Error: No valid nodes found")
+            return
+        
+        print(f"Found {len(valid_node_labels)} valid nodes out of {len(node_labels)} requested")
+        node_labels = valid_node_labels
+        
+        # Get the last step (modify if needed)
+        step_name = odb.steps.keys()[-1]  # Use last step
+        step = odb.steps[step_name]
+        
+        print(f"Analyzing step: {step_name}")
+        print(f"Number of frames: {len(step.frames)}")
+        
+        # Initialize dictionaries to store maximum values
+        max_principal_stress = {}
+        max_s11_stress = {}
+        
+        # Initialize with very small values
+        for label in node_labels:
+            max_principal_stress[label] = -float('inf')
+            max_s11_stress[label] = -float('inf')
+        
+        # Loop through all frames to find maximum values
+        for frame_idx, frame in enumerate(step.frames):
+            print(f"Processing frame {frame_idx + 1}/{len(step.frames)}")
+            
+            # Get stress field output
+            if 'S' not in frame.fieldOutputs:
+                print(f"Warning: Stress field 'S' not found in frame {frame_idx}")
+                continue
+            
+            stress_field = frame.fieldOutputs['S']
+            
+            # Get stress values for the specified nodes
+            stress_subset = stress_field.getSubset(region=instance, nodeLabels=node_labels)
+            
+            for stress_value in stress_subset.values:
+                node_label = stress_value.nodeLabel
+                
+                if node_label in node_labels:
+                    # Get stress components
+                    stress_data = stress_value.data
+                    
+                    # Calculate maximum principal stress
+                    # For 3D: S11, S22, S33, S12, S13, S23
+                    # For 2D: S11, S22, S33, S12
+                    if len(stress_data) >= 6:  # 3D case
+                        s11, s22, s33, s12, s13, s23 = stress_data[:6]
+                        # Calculate principal stresses
+                        stress_matrix = np.array([
+                            [s11, s12, s13],
+                            [s12, s22, s23],
+                            [s13, s23, s33]
+                        ])
+                    elif len(stress_data) >= 4:  # 2D case
+                        s11, s22, s33, s12 = stress_data[:4]
+                        stress_matrix = np.array([
+                            [s11, s12, 0],
+                            [s12, s22, 0],
+                            [0, 0, s33]
+                        ])
+                    else:
+                        print(f"Warning: Unexpected stress data format for node {node_label}")
+                        continue
+                    
+                    # Calculate eigenvalues (principal stresses)
+                    eigenvalues = np.linalg.eigvals(stress_matrix)
+                    max_principal = np.max(eigenvalues)
+                    
+                    # Update maximum values
+                    if max_principal > max_principal_stress[node_label]:
+                        max_principal_stress[node_label] = max_principal
+                    
+                    if s11 > max_s11_stress[node_label]:
+                        max_s11_stress[node_label] = s11
+        
+        # Prepare data for output
+        output_data = []
+        for node_label in node_labels:
+            y_coord = node_coords[node_label][1]  # Y-coordinate is index 1
+            max_prin = max_principal_stress[node_label]
+            max_s11 = max_s11_stress[node_label]
+            
+            # Skip nodes where no stress data was found
+            if max_prin == -float('inf') or max_s11 == -float('inf'):
+                print(f"Warning: No stress data found for node {node_label}")
+                continue
+            
+            output_data.append([y_coord, max_prin, max_s11])
+        
+        # Sort by Y-coordinate
+        output_data.sort(key=lambda x: x[0])
+        
+        # Write to output file
+        print(f"Writing results to: {output_file}")
+        with open(output_file, 'w') as f:
+            f.write("# Y-Coordinate, Max Principal Stress, Max S11 Stress\n")
+            for row in output_data:
+                f.write(f"{row[0]:.6e}\t{row[1]:.6e}\t{row[2]:.6e}\n")
+        
+        print(f"Successfully processed {len(output_data)} nodes")
+        print(f"Results written to {output_file}")
+        
+    finally:
+        # Close the ODB file
+        odb.close()
+
+def extract_max_stress_from_node_list_alternative(odb_path, node_labels, output_file):
+    """
+    Alternative approach: Extract stress for specific nodes by processing all stress data
+    and filtering for the nodes of interest. Use this if the getSubset method doesn't work.
+    """
+    print(f"Opening ODB file: {odb_path}")
+    odb = openOdb(path=odb_path)
+    
+    try:
+        # Get the first instance
+        instance_name = odb.rootAssembly.instances.keys()[0]
+        instance = odb.rootAssembly.instances[instance_name]
+        
+        # Get node coordinates for the specified nodes
+        node_coords = {}
+        all_nodes = instance.nodes
+        node_dict = {node.label: node for node in all_nodes}
+        
+        valid_node_labels = []
+        for label in node_labels:
+            if label in node_dict:
+                node_coords[label] = node_dict[label].coordinates
+                valid_node_labels.append(label)
+            else:
+                print(f"Warning: Node {label} not found in the model")
+        
+        node_labels = valid_node_labels
+        node_labels_set = set(node_labels)  # For faster lookup
+        
+        # Get the last step
+        step_name = odb.steps.keys()[-1]
+        step = odb.steps[step_name]
+        
+        # Initialize dictionaries to store maximum values
+        max_principal_stress = {label: -float('inf') for label in node_labels}
+        max_s11_stress = {label: -float('inf') for label in node_labels}
+        
+        # Loop through all frames
+        for frame_idx, frame in enumerate(step.frames):
+            print(f"Processing frame {frame_idx + 1}/{len(step.frames)}")
+            
+            if 'S' not in frame.fieldOutputs:
+                continue
+            
+            stress_field = frame.fieldOutputs['S']
+            
+            # Process all stress values and filter for our nodes
+            for stress_value in stress_field.values:
+                node_label = stress_value.nodeLabel
+                
+                if node_label in node_labels_set:
+                    stress_data = stress_value.data
+                    
+                    # Calculate maximum principal stress and get S11
+                    if len(stress_data) >= 6:  # 3D case
+                        s11, s22, s33, s12, s13, s23 = stress_data[:6]
+                        stress_matrix = np.array([
+                            [s11, s12, s13],
+                            [s12, s22, s23],
+                            [s13, s23, s33]
+                        ])
+                    elif len(stress_data) >= 4:  # 2D case
+                        s11, s22, s33, s12 = stress_data[:4]
+                        stress_matrix = np.array([
+                            [s11, s12, 0],
+                            [s12, s22, 0],
+                            [0, 0, s33]
+                        ])
+                    else:
+                        continue
+                    
+                    # Calculate principal stresses
+                    eigenvalues = np.linalg.eigvals(stress_matrix)
+                    max_principal = np.max(eigenvalues)
+                    
+                    # Update maximum values
+                    if max_principal > max_principal_stress[node_label]:
+                        max_principal_stress[node_label] = max_principal
+                    
+                    if s11 > max_s11_stress[node_label]:
+                        max_s11_stress[node_label] = s11
+        
+        # Prepare and write output
+        output_data = []
+        for node_label in node_labels:
+            y_coord = node_coords[node_label][1]
+            max_prin = max_principal_stress[node_label]
+            max_s11 = max_s11_stress[node_label]
+            
+            if max_prin != -float('inf') and max_s11 != -float('inf'):
+                output_data.append([y_coord, max_prin, max_s11])
+        
+        # Sort by Y-coordinate
+        output_data.sort(key=lambda x: x[0])
+        
+        # Write to output file
+        with open(output_file, 'w') as f:
+            f.write("# Y-Coordinate, Max Principal Stress, Max S11 Stress\n")
+            for row in output_data:
+                f.write(f"{row[0]:.6e}\t{row[1]:.6e}\t{row[2]:.6e}\n")
+        
+        print(f"Successfully processed {len(output_data)} nodes")
+        
+    finally:
+        odb.close()
+
+# Main execution
+if __name__ == "__main__":
+    # User inputs - modify these values
+    odb_file_path = "your_analysis.odb"  # Replace with your ODB file path
+    
+    # Replace this list with your actual node numbers
+    node_numbers = [1, 5, 10, 15, 20, 25, 30]  # Example node numbers
+    
+    output_file_path = "stress_results.txt"  # Output file name
+    
+    # Extract stress data
+    extract_max_stress_history(odb_file_path, node_numbers, output_file_path)
