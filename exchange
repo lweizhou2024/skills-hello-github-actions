@@ -6,7 +6,7 @@ y = sin(x);
 fig = figure;
 ax = axes('Parent', fig, 'Position', [0.1 0.2 0.8 0.7]); % Adjust position as needed
 plot(ax, x, y);
-title('Plot with X-Axis Panning Slider');
+title('Plot with X-Axis Panning Slider (Continuous Update)');
 
 % Set initial x-axis limits
 xmin_initial = min(x);
@@ -38,18 +38,31 @@ end
 slider_initial_value = xmin_initial;
 
 % Calculate the slider step. These are normalized steps between 0 and 1.
-% A small step could be, for example, 1% of the total slider range.
-% A large step could be 10% of the total slider range.
 slider_range = slider_max_val - slider_min_val;
 
-% Avoid division by zero if slider_range is 0 (i.e., no panning possible)
 if slider_range == 0
-    minor_step = 0.1; % Arbitrary small value, won't really do anything
-    major_step = 0.1; % Arbitrary small value
+    minor_step = 0.1;
+    major_step = 0.1;
 else
-    minor_step = 0.01; % 1% of the total movable range
-    major_step = 0.1;  % 10% of the total movable range
+    % A step size that is, for example, 1% of the visible window
+    minor_step = (current_xlim_width / 100) / slider_range;
+    % A large step could be 10% of the visible window
+    major_step = (current_xlim_width / 10) / slider_range;
+
+    % Ensure step values are valid (between 0 and 1, and minor <= major)
+    minor_step = max(0, min(1, minor_step));
+    major_step = max(0, min(1, major_step));
+    if minor_step > major_step
+        major_step = minor_step; % Ensure major is not smaller than minor
+    end
+    if minor_step == 0 && slider_range > 0 % Fallback if minor_step became 0 but range exists
+        minor_step = 0.001; % Very small default
+    end
+    if major_step == 0 && slider_range > 0
+        major_step = 0.01; % Small default
+    end
 end
+
 
 % Define the position of the slider [left bottom width height]
 slider_position = [0.1 0.05 0.8 0.05];
@@ -61,8 +74,10 @@ sld = uicontrol('Parent', fig, ...
     'min', slider_min_val, ...
     'max', slider_max_val, ...
     'Value', slider_initial_value, ...
-    'SliderStep', [minor_step major_step], ...
-    'Callback', @(es, ed) updateXlim(ax, es.Value, current_xlim_width));
+    'SliderStep', [minor_step major_step]); % Removed Callback from here
+
+% --- IMPORTANT CHANGE: Add a listener for continuous updates ---
+addlistener(sld, 'Value', 'PostSet', @(es, ed) updateXlim(ax, es.Value, current_xlim_width));
 
 % Callback function to update the x-axis limits
 function updateXlim(ax, new_xmin, window_width)
