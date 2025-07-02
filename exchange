@@ -16,7 +16,34 @@ xlim(ax, [xmin_initial xmax_initial]);
 % Create the slider
 slider_min = min(x);
 slider_max = max(x);
-slider_step = (slider_max - slider_min) / 100; % Adjust step size as needed
+
+% Calculate the visible window size
+window_size = xmax_initial - xmin_initial;
+
+% The maximum value the slider can reach should be slider_max - window_size
+% This ensures that when the slider is at its max, the window ends at slider_max
+slider_actual_max = slider_max - window_size;
+
+% Define the total range of the slider's value
+slider_range = slider_actual_max - slider_min;
+
+% Calculate the minor and major step sizes as fractions of the total range
+% For example, if you want 100 small steps across the full range of the slider's movable part
+minor_step_normalized = ( (slider_max - slider_min) / 100 ) / slider_range;
+major_step_normalized = ( (slider_max - slider_min) / 10 ) / slider_range; % For clicking the trough
+
+% Ensure step sizes are not zero if the range is very small or division results in it
+if minor_step_normalized == 0
+    minor_step_normalized = 0.01; % A small default if needed
+end
+if major_step_normalized == 0
+    major_step_normalized = 0.1; % A small default if needed
+end
+
+% Ensure the step values are between 0 and 1
+minor_step_normalized = max(0, min(1, minor_step_normalized));
+major_step_normalized = max(0, min(1, major_step_normalized));
+
 slider_initial_min = xmin_initial;
 
 % Define the position of the slider [left bottom width height]
@@ -27,10 +54,10 @@ sld = uicontrol('Parent', fig, ...
     'Units', 'normalized', ...
     'Position', slider_position, ...
     'min', slider_min, ...
-    'max', slider_max - (xmax_initial - xmin_initial), ... % Adjust max for the window size
+    'max', slider_actual_max, ... % Set the max value for the slider's thumb
     'Value', slider_initial_min, ...
-    'SliderStep', [slider_step slider_step * 5], ... % Small and large slider steps
-    'Callback', @(es, ed) updateXlim(ax, es.Value, xmax_initial - xmin_initial));
+    'SliderStep', [minor_step_normalized major_step_normalized], ... % Small and large slider steps
+    'Callback', @(es, ed) updateXlim(ax, es.Value, window_size));
 
 % Callback function to update the x-axis limits
 function updateXlim(ax, new_xmin, window_size)
