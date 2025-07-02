@@ -1,3 +1,6 @@
+function createPlotWithSlider()
+% This function creates a plot with a panning slider that updates continuously.
+
 % Create some sample data
 x = 0:0.1:10;
 y = sin(x);
@@ -31,7 +34,7 @@ slider_max_val = data_max_x - current_xlim_width;
 % the slider_max_val might be less than slider_min_val.
 % In such a case, adjust slider_max_val to be at least slider_min_val.
 if slider_max_val < slider_min_val
-    slider_max_val = slider_min_val; % Disables panning if viewable window is full data range
+    slider_max_val = slider_min_val;
 end
 
 % Set the initial value of the slider to the current xmin
@@ -44,25 +47,21 @@ if slider_range == 0
     minor_step = 0.1;
     major_step = 0.1;
 else
-    % A step size that is, for example, 1% of the visible window
     minor_step = (current_xlim_width / 100) / slider_range;
-    % A large step could be 10% of the visible window
     major_step = (current_xlim_width / 10) / slider_range;
 
-    % Ensure step values are valid (between 0 and 1, and minor <= major)
     minor_step = max(0, min(1, minor_step));
     major_step = max(0, min(1, major_step));
     if minor_step > major_step
-        major_step = minor_step; % Ensure major is not smaller than minor
+        major_step = minor_step;
     end
-    if minor_step == 0 && slider_range > 0 % Fallback if minor_step became 0 but range exists
-        minor_step = 0.001; % Very small default
+    if minor_step == 0 && slider_range > 0
+        minor_step = 0.001;
     end
     if major_step == 0 && slider_range > 0
-        major_step = 0.01; % Small default
+        major_step = 0.01;
     end
 end
-
 
 % Define the position of the slider [left bottom width height]
 slider_position = [0.1 0.05 0.8 0.05];
@@ -74,14 +73,19 @@ sld = uicontrol('Parent', fig, ...
     'min', slider_min_val, ...
     'max', slider_max_val, ...
     'Value', slider_initial_value, ...
-    'SliderStep', [minor_step major_step]); % Removed Callback from here
+    'SliderStep', [minor_step major_step]);
 
-% --- IMPORTANT CHANGE: Add a listener for continuous updates ---
+% --- IMPORTANT: Add a listener for continuous updates ---
+% The listener needs to be tied to the object's lifecycle.
+% When the slider object persists (because it's part of an open figure),
+% the listener will persist.
 addlistener(sld, 'Value', 'PostSet', @(es, ed) updateXlim(ax, es.Value, current_xlim_width));
 
-% Callback function to update the x-axis limits
-function updateXlim(ax, new_xmin, window_width)
-    % new_xmin is the value of the slider, which will be our new lower x-limit
-    new_xmax = new_xmin + window_width;
-    xlim(ax, [new_xmin new_xmax]);
-end
+% Nested function for the callback. Nested functions can access variables
+% from the parent function's workspace (like 'ax' and 'current_xlim_width').
+    function updateXlim(axis_handle, new_xmin_val, window_width)
+        new_xmax = new_xmin_val + window_width;
+        xlim(axis_handle, [new_xmin_val new_xmax]);
+    end
+
+end % End of main function
