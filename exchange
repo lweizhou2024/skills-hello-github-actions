@@ -1,13 +1,14 @@
 function createPlotWithSlider()
-% This function creates a plot with a panning slider that updates continuously.
+% This function creates a plot with a panning slider that updates continuously,
+% ensuring listener persistence using guidata.
 
 % Create some sample data
 x = 0:0.1:10;
 y = sin(x);
 
 % Create a figure and axes
-fig = figure;
-ax = axes('Parent', fig, 'Position', [0.1 0.2 0.8 0.7]); % Adjust position as needed
+fig = figure('CloseRequestFcn', @myCloseReqFcn); % Add a CloseRequestFcn for cleanup
+ax = axes('Parent', fig, 'Position', [0.1 0.2 0.8 0.7]);
 plot(ax, x, y);
 title('Plot with X-Axis Panning Slider (Continuous Update)');
 
@@ -30,17 +31,14 @@ slider_min_val = data_min_x;
 % viewable window is such that the right edge of the window aligns with data_max_x.
 slider_max_val = data_max_x - current_xlim_width;
 
-% If the initial window covers the entire data range or more,
-% the slider_max_val might be less than slider_min_val.
-% In such a case, adjust slider_max_val to be at least slider_min_val.
 if slider_max_val < slider_min_val
-    slider_max_val = slider_min_val;
+    slider_max_val = slider_min_val; % Disables panning if viewable window is full data range
 end
 
 % Set the initial value of the slider to the current xmin
 slider_initial_value = xmin_initial;
 
-% Calculate the slider step. These are normalized steps between 0 and 1.
+% Calculate the slider step.
 slider_range = slider_max_val - slider_min_val;
 
 if slider_range == 0
@@ -75,17 +73,45 @@ sld = uicontrol('Parent', fig, ...
     'Value', slider_initial_value, ...
     'SliderStep', [minor_step major_step]);
 
-% --- IMPORTANT: Add a listener for continuous updates ---
-% The listener needs to be tied to the object's lifecycle.
-% When the slider object persists (because it's part of an open figure),
-% the listener will persist.
-addlistener(sld, 'Value', 'PostSet', @(es, ed) updateXlim(ax, es.Value, current_xlim_width));
+% --- Store necessary handles and data in the figure's guidata ---
+% This makes 'ax' and 'current_xlim_width' accessible to any callback
+% associated with this figure.
+handles.ax = ax;
+handles.sld = sld; % Store slider handle too, though not strictly needed for this specific callback
+handles.current_xlim_width = current_xlim_width;
+guidata(fig, handles); % Store the 'handles' structure in the figure's guidata
 
-% Nested function for the callback. Nested functions can access variables
-% from the parent function's workspace (like 'ax' and 'current_xlim_width').
-    function updateXlim(axis_handle, new_xmin_val, window_width)
-        new_xmax = new_xmin_val + window_width;
-        xlim(axis_handle, [new_xmin_val new_xmax]);
+% --- Add the listener for continuous updates ---
+% The callback now takes the figure handle as its first argument
+% so it can retrieve the stored data using guidata.
+listener = addlistener(sld, 'Value', 'PostSet', @(es, ed) updateXlimCallback(fig, es.Value));
+
+% --- Important: Store the listener object itself ---
+% If the listener object is not stored, it will also be cleared from memory
+% and the listener will stop working! Store it in the figure's guidata.
+handles.listener = listener;
+guidata(fig, handles); % Update guidata with the listener handle
+
+% Nested callback function (or a separate helper function)
+% It takes the figure handle and the slider value
+function updateXlimCallback(hFig, new_xmin_val)
+    % Retrieve the stored handles and data from the figure
+    data = guidata(hFig);
+    ax_handle = data.ax;
+    window_width = data.current_xlim_width;
+
+    new_xmax = new_xmin_val + window_width;
+    xlim(ax_handle, [new_xmin_val new_xmax]);
+end
+
+% Function to clean up when the figure is closed
+function myCloseReqFcn(src,~)
+    % Get the stored handles and listener object
+    data = guidata(src);
+    if isfield(data, 'listener') && isvalid(data.listener)
+        delete(data.listener); % Delete the listener object
     end
+    delete(src); % Close the figure
+end
 
 end % End of main function
