@@ -6,45 +6,50 @@ y = sin(x);
 fig = figure;
 ax = axes('Parent', fig, 'Position', [0.1 0.2 0.8 0.7]); % Adjust position as needed
 plot(ax, x, y);
-title('Plot with X-Axis Slider');
+title('Plot with X-Axis Panning Slider');
 
 % Set initial x-axis limits
 xmin_initial = min(x);
 xmax_initial = max(x);
 xlim(ax, [xmin_initial xmax_initial]);
 
-% Create the slider
-slider_min = min(x);
-slider_max = max(x);
+% Get the initial width of the displayed x-axis
+current_xlim_width = xmax_initial - xmin_initial;
 
-% Calculate the visible window size
-window_size = xmax_initial - xmin_initial;
+% Define the full range of your data for the slider's min and max
+data_min_x = min(x);
+data_max_x = max(x);
 
-% The maximum value the slider can reach should be slider_max - window_size
-% This ensures that when the slider is at its max, the window ends at slider_max
-slider_actual_max = slider_max - window_size;
+% The slider's minimum value should be the absolute minimum of your data
+slider_min_val = data_min_x;
 
-% Define the total range of the slider's value
-slider_range = slider_actual_max - slider_min;
+% The slider's maximum value should be the point where the left edge of the
+% viewable window is such that the right edge of the window aligns with data_max_x.
+slider_max_val = data_max_x - current_xlim_width;
 
-% Calculate the minor and major step sizes as fractions of the total range
-% For example, if you want 100 small steps across the full range of the slider's movable part
-minor_step_normalized = ( (slider_max - slider_min) / 100 ) / slider_range;
-major_step_normalized = ( (slider_max - slider_min) / 10 ) / slider_range; % For clicking the trough
-
-% Ensure step sizes are not zero if the range is very small or division results in it
-if minor_step_normalized == 0
-    minor_step_normalized = 0.01; % A small default if needed
-end
-if major_step_normalized == 0
-    major_step_normalized = 0.1; % A small default if needed
+% If the initial window covers the entire data range or more,
+% the slider_max_val might be less than slider_min_val.
+% In such a case, adjust slider_max_val to be at least slider_min_val.
+if slider_max_val < slider_min_val
+    slider_max_val = slider_min_val; % Disables panning if viewable window is full data range
 end
 
-% Ensure the step values are between 0 and 1
-minor_step_normalized = max(0, min(1, minor_step_normalized));
-major_step_normalized = max(0, min(1, major_step_normalized));
+% Set the initial value of the slider to the current xmin
+slider_initial_value = xmin_initial;
 
-slider_initial_min = xmin_initial;
+% Calculate the slider step. These are normalized steps between 0 and 1.
+% A small step could be, for example, 1% of the total slider range.
+% A large step could be 10% of the total slider range.
+slider_range = slider_max_val - slider_min_val;
+
+% Avoid division by zero if slider_range is 0 (i.e., no panning possible)
+if slider_range == 0
+    minor_step = 0.1; % Arbitrary small value, won't really do anything
+    major_step = 0.1; % Arbitrary small value
+else
+    minor_step = 0.01; % 1% of the total movable range
+    major_step = 0.1;  % 10% of the total movable range
+end
 
 % Define the position of the slider [left bottom width height]
 slider_position = [0.1 0.05 0.8 0.05];
@@ -53,14 +58,15 @@ sld = uicontrol('Parent', fig, ...
     'Style', 'slider', ...
     'Units', 'normalized', ...
     'Position', slider_position, ...
-    'min', slider_min, ...
-    'max', slider_actual_max, ... % Set the max value for the slider's thumb
-    'Value', slider_initial_min, ...
-    'SliderStep', [minor_step_normalized major_step_normalized], ... % Small and large slider steps
-    'Callback', @(es, ed) updateXlim(ax, es.Value, window_size));
+    'min', slider_min_val, ...
+    'max', slider_max_val, ...
+    'Value', slider_initial_value, ...
+    'SliderStep', [minor_step major_step], ...
+    'Callback', @(es, ed) updateXlim(ax, es.Value, current_xlim_width));
 
 % Callback function to update the x-axis limits
-function updateXlim(ax, new_xmin, window_size)
-    new_xmax = new_xmin + window_size;
+function updateXlim(ax, new_xmin, window_width)
+    % new_xmin is the value of the slider, which will be our new lower x-limit
+    new_xmax = new_xmin + window_width;
     xlim(ax, [new_xmin new_xmax]);
 end
