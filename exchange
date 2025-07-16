@@ -1,117 +1,168 @@
-function createPlotWithSlider()
-% This function creates a plot with a panning slider that updates continuously,
-% ensuring listener persistence using guidata.
+from odbAccess import *
+from abaqusConstants import *
 
-% Create some sample data
-x = 0:0.1:10;
-y = sin(x);
+def getHydrostaticStressAndCentroid(odb_filepath, element_set_name, frame_index=-1, step_name=None):
+    """
+    Reads hydrostatic stress at the centroid of elements for a given element set
+    from an Abaqus ODB file and outputs their coordinates and hydrostatic stress.
 
-% Create a figure and axes
-fig = figure('CloseRequestFcn', @myCloseReqFcn); % Add a CloseRequestFcn for cleanup
-ax = axes('Parent', fig, 'Position', [0.1 0.2 0.8 0.7]);
-plot(ax, x, y);
-title('Plot with X-Axis Panning Slider (Continuous Update)');
+    Args:
+        odb_filepath (str): The full path to the Abaqus ODB file.
+        element_set_name (str): The name of the element set to analyze.
+        frame_index (int, optional): The index of the frame to analyze.
+                                     -1 (default) for the last frame.
+        step_name (str, optional): The name of the step to analyze. If None,
+                                   the last step will be used.
 
-% Set initial x-axis limits
-xmin_initial = min(x);
-xmax_initial = max(x);
-xlim(ax, [xmin_initial xmax_initial]);
+    Returns:
+        list: A list of tuples, where each tuple contains
+              (element_label, centroid_coordinates, hydrostatic_stress).
+              Returns an empty list if the element set or stress data is not found.
+    """
+    try:
+        odb = openOdb(odb_filepath)
+        print(f"Successfully opened ODB file: {odb_filepath}")
+    except Exception as e:
+        print(f"Error opening ODB file: {e}")
+        return []
 
-% Get the initial width of the displayed x-axis
-current_xlim_width = xmax_initial - xmin_initial;
+    try:
+        if step_name:
+            if step_name not in odb.steps:
+                print(f"Error: Step '{step_name}' not found in the ODB file.")
+                odb.close()
+                return []
+            step = odb.steps[step_name]
+        else:
+            # Get the last step if no step name is provided
+            step_names = list(odb.steps.keys())
+            if not step_names:
+                print("Error: No steps found in the ODB file.")
+                odb.close()
+                return []
+            step = odb.steps[step_names[-1]]
+            print(f"Using last step: {step.name}")
 
-% Define the full range of your data for the slider's min and max
-data_min_x = min(x);
-data_max_x = max(x);
+        if not step.frames:
+            print(f"Error: No frames found in step '{step.name}'.")
+            odb.close()
+            return []
 
-% The slider's minimum value should be the absolute minimum of your data
-slider_min_val = data_min_x;
+        # Get the desired frame
+        if frame_index == -1:
+            frame = step.frames[-1]  # Last frame
+            print(f"Using last frame (index: {len(step.frames) - 1})")
+        elif 0 <= frame_index < len(step.frames):
+            frame = step.frames[frame_index]
+            print(f"Using frame at index: {frame_index}")
+        else:
+            print(f"Error: Frame index {frame_index} is out of bounds.")
+            odb.close()
+            return []
 
-% The slider's maximum value should be the point where the left edge of the
-% viewable window is such that the right edge of the window aligns with data_max_x.
-slider_max_val = data_max_x - current_xlim_width;
+        # Check if the element set exists
+        if element_set_name not in odb.rootAssembly.elementSets:
+            print(f"Error: Element set '{element_set_name}' not found in the ODB file.")
+            odb.close()
+            return []
 
-if slider_max_val < slider_min_val
-    slider_max_val = slider_min_val; % Disables panning if viewable window is full data range
-end
+        element_set = odb.rootAssembly.elementSets[element_set_name]
 
-% Set the initial value of the slider to the current xmin
-slider_initial_value = xmin_initial;
+        # Check for stress output
+        if 'S' not in frame.fieldOutputs:
+            print("Error: Stress (S) output not found in the selected frame.")
+            odb.close()
+            return []
 
-% Calculate the slider step.
-slider_range = slider_max_val - slider_min_val;
+        stress_field = frame.fieldOutputs['S']
 
-if slider_range == 0
-    minor_step = 0.1;
-    major_step = 0.1;
-else
-    minor_step = (current_xlim_width / 100) / slider_range;
-    major_step = (current_xlim_width / 10) / slider_range;
+        # Get the stress field for the specific element set and at centroids
+        # Abaqus often stores stress at integration points. To get it at the centroid,
+        # we'll request invariant 'MISES' and then calculate hydrostatic.
+        # Alternatively, you can directly request 'PRESS' if available and already calculated.
+        # For this script, we'll calculate hydrostatic stress from the stress tensor.
 
-    minor_step = max(0, min(1, minor_step));
-    major_step = max(0, min(1, major_step));
-    if minor_step > major_step
-        major_step = minor_step;
-    end
-    if minor_step == 0 && slider_range > 0
-        minor_step = 0.001;
-    end
-    if major_step == 0 && slider_range > 0
-        major_step = 0.01;
-    end
-end
+        # Filter for the element set
+        stress_field_on_set = stress_field.getSubset(region=element_set, position=CENTROID)
 
-% Define the position of the slider [left bottom width height]
-slider_position = [0.1 0.05 0.8 0.05];
+        if not stress_field_on_set.values:
+            print(f"No stress data found for element set '{element_set_name}' at centroid position.")
+            odb.close()
+            return []
 
-sld = uicontrol('Parent', fig, ...
-    'Style', 'slider', ...
-    'Units', 'normalized', ...
-    'Position', slider_position, ...
-    'min', slider_min_val, ...
-    'max', slider_max_val, ...
-    'Value', slider_initial_value, ...
-    'SliderStep', [minor_step major_step]);
+        results = []
+        for v in stress_field_on_set.values:
+            element_label = v.elementLabel
+            # Ensure the stress data is a tensor and has the expected components
+            if hasattr(v.data, '__len__') and len(v.data) >= 3: # Check for at least S11, S22, S33
+                s11 = v.data[0]
+                s22 = v.data[1]
+                s33 = v.data[2]
+                hydrostatic_stress = (s11 + s22 + s33) / 3.0
+            else:
+                print(f"Warning: Unexpected stress data format for element {element_label}. Skipping.")
+                continue
 
-% --- Store necessary handles and data in the figure's guidata ---
-% This makes 'ax' and 'current_xlim_width' accessible to any callback
-% associated with this figure.
-handles.ax = ax;
-handles.sld = sld; % Store slider handle too, though not strictly needed for this specific callback
-handles.current_xlim_width = current_xlim_width;
-guidata(fig, handles); % Store the 'handles' structure in the figure's guidata
+            # Get element centroid coordinates
+            # This is a bit more involved as element coordinates are not directly in fieldOutputs.
+            # We need to access the section points or element connectivity and node coordinates.
+            # For simplicity, if the position is CENTROID, Abaqus often provides a conceptual centroid.
+            # A more robust way would be to calculate it from node coordinates.
+            # For now, we'll assume the element's conceptual centroid is represented.
+            # Abaqus ODB API doesn't directly expose centroid coordinates for elements without iteration.
+            # A common approach is to calculate it from the node coordinates of the element.
 
-% --- Add the listener for continuous updates ---
-% The callback now takes the figure handle as its first argument
-% so it can retrieve the stored data using guidata.
-listener = addlistener(sld, 'Value', 'PostSet', @(es, ed) updateXlimCallback(fig, es.Value));
+            # Get the element object from the assembly
+            element = odb.rootAssembly.instances[v.instanceName].elements[v.elementLabel - 1] # -1 because element labels are 1-based
 
-% --- Important: Store the listener object itself ---
-% If the listener object is not stored, it will also be cleared from memory
-% and the listener will stop working! Store it in the figure's guidata.
-handles.listener = listener;
-guidata(fig, handles); % Update guidata with the listener handle
+            node_coords = []
+            for node in element.nodes:
+                node_coords.append(node.coordinates)
 
-% Nested callback function (or a separate helper function)
-% It takes the figure handle and the slider value
-function updateXlimCallback(hFig, new_xmin_val)
-    % Retrieve the stored handles and data from the figure
-    data = guidata(hFig);
-    ax_handle = data.ax;
-    window_width = data.current_xlim_width;
+            # Calculate the centroid from node coordinates
+            if node_coords:
+                num_nodes = len(node_coords)
+                centroid_x = sum([coord[0] for coord in node_coords]) / num_nodes
+                centroid_y = sum([coord[1] for coord in node_coords]) / num_nodes
+                centroid_z = sum([coord[2] for coord in node_coords]) / num_nodes
+                centroid_coordinates = (centroid_x, centroid_y, centroid_z)
+            else:
+                centroid_coordinates = (None, None, None) # Fallback if no nodes found
 
-    new_xmax = new_xmin_val + window_width;
-    xlim(ax_handle, [new_xmin_val new_xmax]);
-end
+            results.append((element_label, centroid_coordinates, hydrostatic_stress))
 
-% Function to clean up when the figure is closed
-function myCloseReqFcn(src,~)
-    % Get the stored handles and listener object
-    data = guidata(src);
-    if isfield(data, 'listener') && isvalid(data.listener)
-        delete(data.listener); % Delete the listener object
-    end
-    delete(src); % Close the figure
-end
+        odb.close()
+        return results
 
-end % End of main function
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        if 'odb' in locals() and odb.is
+            odb.close()
+        return []
+
+# --- Example Usage ---
+if __name__ == '__main__':
+    # IMPORTANT: Replace with your actual ODB file path and element set name
+    odb_file = 'your_model.odb'  # e.g., 'C:/temp/my_analysis/job-1.odb'
+    element_set_to_analyze = 'SET-1' # e.g., 'ALL_ELEMENTS' or a custom set name
+
+    # Optional: Specify frame index and step name if you don't want the last ones
+    # frame_idx = 0  # First frame
+    # specific_step_name = 'Step-1'
+
+    # Get results for the last step and last frame by default
+    hydrostatic_data = getHydrostaticStressAndCentroid(odb_file, element_set_to_analyze)
+
+    # If you want a specific frame or step:
+    # hydrostatic_data = getHydrostaticStressAndCentroid(odb_file, element_set_to_analyze,
+    #                                                    frame_index=frame_idx, step_name=specific_step_name)
+
+    if hydrostatic_data:
+        print("\n--- Hydrostatic Stress and Centroid Coordinates ---")
+        print("{:<15} {:<30} {:<20}".format("Element Label", "Centroid Coordinates (X, Y, Z)", "Hydrostatic Stress"))
+        print("-" * 65)
+        for label, coords, stress in hydrostatic_data:
+            coord_str = f"({coords[0]:.4f}, {coords[1]:.4f}, {coords[2]:.4f})" if all(c is not None for c in coords) else "N/A"
+            print(f"{label:<15} {coord_str:<30} {stress:<20.4f}")
+    else:
+        print("No data was extracted. Please check the ODB file path, element set name, and script output for errors.")
