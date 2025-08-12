@@ -1,91 +1,48 @@
-import numpy as np
+from odbAccess import openOdb
 
-def bin_and_average(arr, n_bins=50):
-    """
-    Bin a 2D array based on first column values and compute averages.
-    
-    Parameters:
-    arr: numpy array with shape (n, 3)
-    n_bins: number of bins to create (default: 50)
-    
-    Returns:
-    bin_centers: array of bin center values
-    avg_col2: average values of column 2 for each bin
-    avg_col3: average values of column 3 for each bin
-    """
-    
-    # Get min and max of first column
-    col1_min = arr[:, 0].min()
-    col1_max = arr[:, 0].max()
-    
-    # Create bin edges
-    bin_edges = np.linspace(col1_min, col1_max, n_bins + 1)
-    
-    # Calculate bin centers
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-    
-    # Assign each row to a bin
-    bin_indices = np.digitize(arr[:, 0], bin_edges) - 1
-    
-    # Handle edge case where values equal to max fall into bin n_bins
-    bin_indices = np.clip(bin_indices, 0, n_bins - 1)
-    
-    # Initialize arrays for averages
-    avg_col2 = np.full(n_bins, np.nan)
-    avg_col3 = np.full(n_bins, np.nan)
-    
-    # Calculate averages for each bin
-    for i in range(n_bins):
-        mask = bin_indices == i
-        if np.any(mask):
-            avg_col2[i] = arr[mask, 1].mean()
-            avg_col3[i] = arr[mask, 2].mean()
-    
-    return bin_centers, avg_col2, avg_col3
+# ===== USER INPUTS =====
+odb_path = 'model.odb'      # Path to your ODB file
+node_set_name = 'NSET_RF'   # Node set for total reaction force
+disp_node_label = 10        # Node label for displacement output
+instance_name = 'PART-1-1'  # Instance name in the ODB
+# ========================
 
-# Example usage:
-if __name__ == "__main__":
-    # Create sample data
-    np.random.seed(42)
-    n_points = 1000
-    
-    # Generate random unsorted data
-    sample_data = np.random.rand(n_points, 3)
-    sample_data[:, 0] *= 100  # Scale first column to 0-100
-    sample_data[:, 1] *= 10   # Scale second column to 0-10
-    sample_data[:, 2] *= 5    # Scale third column to 0-5
-    
-    # Apply binning
-    bin_centers, avg_col2, avg_col3 = bin_and_average(sample_data)
-    
-    # Display results
-    print("Bin Center\tAvg Col2\tAvg Col3")
-    print("-" * 40)
-    for i, (center, avg2, avg3) in enumerate(zip(bin_centers, avg_col2, avg_col3)):
-        if not np.isnan(avg2):  # Only show bins with data
-            print(f"{center:.2f}\t\t{avg2:.3f}\t\t{avg3:.3f}")
-    
-    # Alternative: Return as structured array or DataFrame-like format
-    def bin_and_average_structured(arr, n_bins=50):
-        """
-        Same as above but returns results in a more structured format
-        """
-        bin_centers, avg_col2, avg_col3 = bin_and_average(arr, n_bins)
-        
-        # Filter out empty bins
-        valid_mask = ~np.isnan(avg_col2)
-        
-        results = np.column_stack([
-            bin_centers[valid_mask],
-            avg_col2[valid_mask], 
-            avg_col3[valid_mask]
-        ])
-        
-        return results
-    
-    print("\n\nStructured output (only non-empty bins):")
-    print("Bin Center\tAvg Col2\tAvg Col3")
-    print("-" * 40)
-    structured_results = bin_and_average_structured(sample_data)
-    for row in structured_results:
-        print(f"{row[0]:.2f}\t\t{row[1]:.3f}\t\t{row[2]:.3f}")
+# Open ODB
+odb = openOdb(path=odb_path)
+
+# Get last step name (change if you want a specific step)
+step_name = list(odb.steps.keys())[-1]
+step = odb.steps[step_name]
+
+# --- Total Reaction Force over time ---
+print(f"\nTotal Reaction Force history for node set '{node_set_name}':")
+# Find all nodes in the set
+node_set = odb.rootAssembly.nodeSets[node_set_name]
+node_labels = [n.label for n in node_set.nodes[0]]
+
+# Loop over frames and sum RF
+for frame in step.frames:
+    total_rf1 = 0.0
+    total_rf2 = 0.0
+    rf_field = frame.fieldOutputs['RF']
+    for node_label in node_labels:
+        rf_val = rf_field.getSubset(region=node_set).getSubset(region=odb.rootAssembly.instances[instance_name].getNodeFromLabel(node_label)).values
+        if rf_val:
+            rf = rf_val[0].data
+            total_rf1 += rf[0]
+            total_rf2 += rf[1]
+    time_val = frame.frameValue
+    print(f"Time={time_val:.6f}, RF1={total_rf1:.6f}, RF2={total_rf2:.6f}")
+
+# --- Displacement history for a specific node ---
+print(f"\nDisplacement history for node {disp_node_label}:")
+node_region = odb.rootAssembly.instances[instance_name].getNodeFromLabel(disp_node_label)
+
+for frame in step.frames:
+    u_field = frame.fieldOutputs['U']
+    u_val = u_field.getSubset(region=node_region).values
+    if u_val:
+        u = u_val[0].data
+        print(f"Time={frame.frameValue:.6f}, U1={u[0]:.6f}, U2={u[1]:.6f}")
+
+odb.close()
