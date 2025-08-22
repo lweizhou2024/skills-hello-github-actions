@@ -1,48 +1,76 @@
-from odbAccess import openOdb
+Coating Residual Stress
 
-# ===== USER INPUTS =====
-odb_path = 'model.odb'      # Path to your ODB file
-node_set_name = 'NSET_RF'   # Node set for total reaction force
-disp_node_label = 10        # Node label for displacement output
-instance_name = 'PART-1-1'  # Instance name in the ODB
-# ========================
+During the coating spray and heat treatment processes, residual stress inevitably develops in both the coating and substrate. The main contributing mechanisms include:
 
-# Open ODB
-odb = openOdb(path=odb_path)
+Initial temperature differences,
 
-# Get last step name (change if you want a specific step)
-step_name = list(odb.steps.keys())[-1]
-step = odb.steps[step_name]
+Phase transformations,
 
-# --- Total Reaction Force over time ---
-print(f"\nTotal Reaction Force history for node set '{node_set_name}':")
-# Find all nodes in the set
-node_set = odb.rootAssembly.nodeSets[node_set_name]
-node_labels = [n.label for n in node_set.nodes[0]]
+Crystallization,
 
-# Loop over frames and sum RF
-for frame in step.frames:
-    total_rf1 = 0.0
-    total_rf2 = 0.0
-    rf_field = frame.fieldOutputs['RF']
-    for node_label in node_labels:
-        rf_val = rf_field.getSubset(region=node_set).getSubset(region=odb.rootAssembly.instances[instance_name].getNodeFromLabel(node_label)).values
-        if rf_val:
-            rf = rf_val[0].data
-            total_rf1 += rf[0]
-            total_rf2 += rf[1]
-    time_val = frame.frameValue
-    print(f"Time={time_val:.6f}, RF1={total_rf1:.6f}, RF2={total_rf2:.6f}")
+Sintering,
 
-# --- Displacement history for a specific node ---
-print(f"\nDisplacement history for node {disp_node_label}:")
-node_region = odb.rootAssembly.instances[instance_name].getNodeFromLabel(disp_node_label)
+Creep, and
 
-for frame in step.frames:
-    u_field = frame.fieldOutputs['U']
-    u_val = u_field.getSubset(region=node_region).values
-    if u_val:
-        u = u_val[0].data
-        print(f"Time={frame.frameValue:.6f}, U1={u[0]:.6f}, U2={u[1]:.6f}")
+Coefficient of Thermal Expansion (CTE) mismatch.
 
-odb.close()
+A fully detailed residual stress model is complex due to the multiphysics nature of the problem and the limited availability of material behavior data and process details. Therefore, a simplified approach is adopted here.
+
+For a given coating material and heat treatment process, an eigenstrain value is assigned. This eigenstrain is calibrated by measuring the curvature change after each spray and heat-treatment step. The calibrated eigenstrain values are summarized in Table X for two different heat-treatment conditions.
+
+Because residual stresses result from the mismatch between substrate and coating strain, the substrate is assumed to have zero eigenstrain, and only the coating layers require calibration.
+
+Implementation in Finite Element Models
+
+To incorporate eigenstrain into finite element simulations:
+
+Each coating layer is assigned a unique stress-free (initial) temperature.
+
+Stress-free temperatures are calculated using the coating’s CTE value and listed in Table Y.
+
+The substrate is defined with zero eigenstrain, so its initial temperature is set to the reference temperature, 22 °C.
+
+Coating Creep
+
+At the service temperatures encountered in engines, coating materials undergo creep. This has two important effects:
+
+Stress relaxation at high temperature, and
+
+Accumulation of creep strain, which leads to tensile stresses during cooldown to lower temperatures.
+
+Therefore, coating creep must be considered when modeling coating failure.
+
+A strain-hardening creep model is used, which can capture both primary and secondary creep. Tertiary creep is excluded since creep rupture is not the focus.
+
+Model Formulation
+
+Both ANSYS and ABAQUS use equivalent formulations, which can be converted between one another at a given temperature:
+
+ANSYS uses an Arrhenius-type temperature dependency.
+
+During calibration, the ANSYS form is fitted and then converted into temperature-dependent parameters for use in ABAQUS.
+
+Calibration was performed using four-point bending (flexure) tests, and the resulting parameters for different coatings and FE packages are provided in Table Z.
+
+Implementation in ANSYS Workbench
+
+Under Material Properties, add Strain Hardening Creep. Use reference units:
+mm, s, K, tonne mm s⁻². Input parameters C1–C4.
+
+In Analysis Settings, enable Creep Effects.
+
+For program-controlled time stepping, set the Creep Limit Ratio between 1–10 (higher values allow larger time steps).
+
+To prioritize speed with manual control, a very large number can be used.
+
+Implementation in ABAQUS/CAE
+
+Under Material Properties → Plasticity → Creep, add Strain Hardening creep.
+
+Enable Temperature-Dependent Data.
+
+Input model parameters.
+
+In the Step Module, select Visco to activate creep.
+
+Alternatively, creep parameters can be entered directly in the input deck.
