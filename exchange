@@ -1,76 +1,66 @@
-Coating Residual Stress
+Step 1. Define your model function
+function strain_model = myModel(C, t, s)
+    % C: [C1, C2, C3]
+    % t: time series (vector)
+    % s: scalar condition
+    strain_model = (t .* C(1) .* s.^C(2)).^(1./(1 - C(3))) * 100;
+end
 
-During the coating spray and heat treatment processes, residual stress inevitably develops in both the coating and substrate. The main contributing mechanisms include:
+Step 2. Build the objective function
 
-Initial temperature differences,
+We want to fit across all experiments.
 
-Phase transformations,
+function err = objectiveFunction(C, data_all, s_all)
+    % data_all: cell array of n_i x 2 matrices [time, strain]
+    % s_all: vector of conditions, one per dataset
 
-Crystallization,
+    err = [];
+    N = numel(data_all);
 
-Sintering,
+    for i = 1:N
+        t = data_all{i}(:,1);
+        strain_exp = data_all{i}(:,2);
+        s = s_all(i);
 
-Creep, and
+        strain_model = myModel(C, t, s);
 
-Coefficient of Thermal Expansion (CTE) mismatch.
+        % residuals (for lsqnonlin)
+        err = [err; (strain_model - strain_exp)];
+    end
+end
 
-A fully detailed residual stress model is complex due to the multiphysics nature of the problem and the limited availability of material behavior data and process details. Therefore, a simplified approach is adopted here.
+Step 3. Run calibration with lsqnonlin
+% Example: load your data (cell array, each element is n_i x 2)
+% data_all{1} = [time1, strain1];
+% data_all{2} = [time2, strain2];
+% ...
+% s_all = [s1, s2, ...];   % known conditions
 
-For a given coating material and heat treatment process, an eigenstrain value is assigned. This eigenstrain is calibrated by measuring the curvature change after each spray and heat-treatment step. The calibrated eigenstrain values are summarized in Table X for two different heat-treatment conditions.
+% Initial guess for C
+C0 = [0.01, 1, 0.5];  % you should pick reasonable starting values
 
-Because residual stresses result from the mismatch between substrate and coating strain, the substrate is assumed to have zero eigenstrain, and only the coating layers require calibration.
+% Lower/upper bounds (optional, to keep parameters physical)
+lb = [0, -Inf, -Inf];
+ub = [Inf, Inf, 0.99];  % avoid division by 0 if C3 -> 1
 
-Implementation in Finite Element Models
+% Objective handle
+fun = @(C) objectiveFunction(C, data_all, s_all);
 
-To incorporate eigenstrain into finite element simulations:
+% Optimization
+options = optimoptions('lsqnonlin','Display','iter','MaxFunctionEvaluations',1e5);
+C_best = lsqnonlin(fun, C0, lb, ub, options);
 
-Each coating layer is assigned a unique stress-free (initial) temperature.
+Step 4. Validate results
+for i = 1:numel(data_all)
+    t = data_all{i}(:,1);
+    strain_exp = data_all{i}(:,2);
+    s = s_all(i);
 
-Stress-free temperatures are calculated using the coating’s CTE value and listed in Table Y.
+    strain_fit = myModel(C_best, t, s);
 
-The substrate is defined with zero eigenstrain, so its initial temperature is set to the reference temperature, 22 °C.
-
-Coating Creep
-
-At the service temperatures encountered in engines, coating materials undergo creep. This has two important effects:
-
-Stress relaxation at high temperature, and
-
-Accumulation of creep strain, which leads to tensile stresses during cooldown to lower temperatures.
-
-Therefore, coating creep must be considered when modeling coating failure.
-
-A strain-hardening creep model is used, which can capture both primary and secondary creep. Tertiary creep is excluded since creep rupture is not the focus.
-
-Model Formulation
-
-Both ANSYS and ABAQUS use equivalent formulations, which can be converted between one another at a given temperature:
-
-ANSYS uses an Arrhenius-type temperature dependency.
-
-During calibration, the ANSYS form is fitted and then converted into temperature-dependent parameters for use in ABAQUS.
-
-Calibration was performed using four-point bending (flexure) tests, and the resulting parameters for different coatings and FE packages are provided in Table Z.
-
-Implementation in ANSYS Workbench
-
-Under Material Properties, add Strain Hardening Creep. Use reference units:
-mm, s, K, tonne mm s⁻². Input parameters C1–C4.
-
-In Analysis Settings, enable Creep Effects.
-
-For program-controlled time stepping, set the Creep Limit Ratio between 1–10 (higher values allow larger time steps).
-
-To prioritize speed with manual control, a very large number can be used.
-
-Implementation in ABAQUS/CAE
-
-Under Material Properties → Plasticity → Creep, add Strain Hardening creep.
-
-Enable Temperature-Dependent Data.
-
-Input model parameters.
-
-In the Step Module, select Visco to activate creep.
-
-Alternatively, creep parameters can be entered directly in the input deck.
+    figure; 
+    plot(t, strain_exp, 'ko', 'DisplayName','Experiment'); hold on;
+    plot(t, strain_fit, 'r-', 'LineWidth', 2, 'DisplayName','Model');
+    xlabel('Time'); ylabel('Strain');
+    legend; title(['Test ' num2str(i)]);
+end
