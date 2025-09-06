@@ -1,66 +1,23 @@
-Step 1. Define your model function
-function strain_model = myModel(C, t, s)
-    % C: [C1, C2, C3]
-    % t: time series (vector)
-    % s: scalar condition
-    strain_model = (t .* C(1) .* s.^C(2)).^(1./(1 - C(3))) * 100;
-end
+Ahmed, T., & Rack, H. J. (1998) — Phase transformations during cooling in α+β titanium alloys. Classic paper on cooling-rate dependent transformations (diffusional, massive, martensitic) in Ti alloys — essential to decide which transformation model to use. 
+ScienceDirect
 
-Step 2. Build the objective function
+Oh, S. A. et al. (2024) — In-situ studies / martensite decomposition in Ti-6Al-4V. Recent experimental work showing α′ martensite formation/decomposition under rapid thermal cycles — important if you expect martensite during quenching. 
+Nature
 
-We want to fit across all experiments.
+Tunay, M. et al. (2023) — A fully coupled thermal–microstructural–mechanical finite-element model for Ti-6Al-4V. Good example of implementing a coupled FEM framework (microstructure + thermo + mechanics) for residual stress/distortion prediction. Useful as a modeling blueprint. 
+Taylor & Francis Online
 
-function err = objectiveFunction(C, data_all, s_all)
-    % data_all: cell array of n_i x 2 matrices [time, strain]
-    % s_all: vector of conditions, one per dataset
+Teixeira, Ó. et al. (2020) — Review: Heat treatments on Ti-6Al-4V (AM parts) — A focused review on heat treatments and residual-stress reduction strategies (also discusses property changes after heat treatment). Good for practical heat-treatment parameter ranges and post-processing strategies. 
+MDPI
 
-    err = [];
-    N = numel(data_all);
+Strumza / experimental thermophysical measurements (2022) — Thermophysical properties (Cp, thermal diffusivity, expansion) measured up to ≈1000°C. Use these for temperature-dependent Cp, k, α(T) data and validation. 
+ScienceDirect
 
-    for i = 1:N
-        t = data_all{i}(:,1);
-        strain_exp = data_all{i}(:,2);
-        s = s_all(i);
+TIMET / industry datasheet (Ti-6Al-4V properties) — vendor datasheet with standard mechanical/thermal property tables (useful baseline). 
+Timet
 
-        strain_model = myModel(C, t, s);
+Motyka, M. (2021) — Martensite formation/decomposition review for α+β Ti alloys. Good survey of martensitic behavior and implications for properties. 
+MDPI
 
-        % residuals (for lsqnonlin)
-        err = [err; (strain_model - strain_exp)];
-    end
-end
-
-Step 3. Run calibration with lsqnonlin
-% Example: load your data (cell array, each element is n_i x 2)
-% data_all{1} = [time1, strain1];
-% data_all{2} = [time2, strain2];
-% ...
-% s_all = [s1, s2, ...];   % known conditions
-
-% Initial guess for C
-C0 = [0.01, 1, 0.5];  % you should pick reasonable starting values
-
-% Lower/upper bounds (optional, to keep parameters physical)
-lb = [0, -Inf, -Inf];
-ub = [Inf, Inf, 0.99];  % avoid division by 0 if C3 -> 1
-
-% Objective handle
-fun = @(C) objectiveFunction(C, data_all, s_all);
-
-% Optimization
-options = optimoptions('lsqnonlin','Display','iter','MaxFunctionEvaluations',1e5);
-C_best = lsqnonlin(fun, C0, lb, ub, options);
-
-Step 4. Validate results
-for i = 1:numel(data_all)
-    t = data_all{i}(:,1);
-    strain_exp = data_all{i}(:,2);
-    s = s_all(i);
-
-    strain_fit = myModel(C_best, t, s);
-
-    figure; 
-    plot(t, strain_exp, 'ko', 'DisplayName','Experiment'); hold on;
-    plot(t, strain_fit, 'r-', 'LineWidth', 2, 'DisplayName','Model');
-    xlabel('Time'); ylabel('Strain');
-    legend; title(['Test ' num2str(i)]);
-end
+Denlinger, E. R., et al. (Additive manufacturing simulation examples) — practical FEM work where residual stresses are predicted for Ti-6Al-4V using sequential thermal–mechanical coupling; useful for numerical strategy and boundary conditions. 
+PMC
