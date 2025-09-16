@@ -1,23 +1,25 @@
-Ahmed, T., & Rack, H. J. (1998) — Phase transformations during cooling in α+β titanium alloys. Classic paper on cooling-rate dependent transformations (diffusional, massive, martensitic) in Ti alloys — essential to decide which transformation model to use. 
-ScienceDirect
+% Input/output filenames
+inFile = 'input.avi';
+outFile = 'output_first15s.avi';
 
-Oh, S. A. et al. (2024) — In-situ studies / martensite decomposition in Ti-6Al-4V. Recent experimental work showing α′ martensite formation/decomposition under rapid thermal cycles — important if you expect martensite during quenching. 
-Nature
+% Open video for reading
+v = VideoReader(inFile);
 
-Tunay, M. et al. (2023) — A fully coupled thermal–microstructural–mechanical finite-element model for Ti-6Al-4V. Good example of implementing a coupled FEM framework (microstructure + thermo + mechanics) for residual stress/distortion prediction. Useful as a modeling blueprint. 
-Taylor & Francis Online
+% Open video for writing
+out = VideoWriter(outFile, 'Uncompressed AVI'); % or 'Motion JPEG AVI'
+out.FrameRate = v.FrameRate;
+open(out);
 
-Teixeira, Ó. et al. (2020) — Review: Heat treatments on Ti-6Al-4V (AM parts) — A focused review on heat treatments and residual-stress reduction strategies (also discusses property changes after heat treatment). Good for practical heat-treatment parameter ranges and post-processing strategies. 
-MDPI
+% Duration you want to keep (first 15 seconds)
+keepDuration = 15;
 
-Strumza / experimental thermophysical measurements (2022) — Thermophysical properties (Cp, thermal diffusivity, expansion) measured up to ≈1000°C. Use these for temperature-dependent Cp, k, α(T) data and validation. 
-ScienceDirect
+% Read and write frames until 15 s
+while hasFrame(v) && v.CurrentTime <= keepDuration
+    frame = readFrame(v);
+    writeVideo(out, frame);
+end
 
-TIMET / industry datasheet (Ti-6Al-4V properties) — vendor datasheet with standard mechanical/thermal property tables (useful baseline). 
-Timet
+% Close output file
+close(out);
 
-Motyka, M. (2021) — Martensite formation/decomposition review for α+β Ti alloys. Good survey of martensitic behavior and implications for properties. 
-MDPI
-
-Denlinger, E. R., et al. (Additive manufacturing simulation examples) — practical FEM work where residual stresses are predicted for Ti-6Al-4V using sequential thermal–mechanical coupling; useful for numerical strategy and boundary conditions. 
-PMC
+disp('Done! Saved first 15 seconds.');
