@@ -1,25 +1,49 @@
-% Input/output filenames
-inFile = 'input.avi';
-outFile = 'output_first15s.avi';
+from odbAccess import openOdb
+import numpy as np
+import csv
 
-% Open video for reading
-v = VideoReader(inFile);
+# --------- USER SETTINGS ---------
+odb_path = 'Job-1.odb'          # Path to your ODB file
+step_name = 'Step-1'            # Name of the step
+output_csv = 'crack_tip.csv'    # Output CSV file
+crack_direction = 0             # 0=x, 1=y, 2=z, adjust to your crack growth
+# ---------------------------------
 
-% Open video for writing
-out = VideoWriter(outFile, 'Uncompressed AVI'); % or 'Motion JPEG AVI'
-out.FrameRate = v.FrameRate;
-open(out);
+odb = openOdb(odb_path)
+step = odb.steps[step_name]
 
-% Duration you want to keep (first 15 seconds)
-keepDuration = 15;
+tip_positions = []
 
-% Read and write frames until 15 s
-while hasFrame(v) && v.CurrentTime <= keepDuration
-    frame = readFrame(v);
-    writeVideo(out, frame);
-end
+# Loop over all frames in the step
+for frame in step.frames:
+    # Get PHILSM field
+    philsm = frame.fieldOutputs['PHILSM']
+    
+    # Gather node coordinates and PHILSM values
+    node_data = []
+    for value in philsm.values:
+        coord = value.instance.nodes[value.nodeLabel-1].coordinates
+        node_data.append((value.data, coord))
+    
+    # Filter nodes near the crack surface (PHILSM ~ 0)
+    tol = 1e-6  # adjust tolerance if needed
+    crack_nodes = [coord for phi, coord in node_data if abs(phi) < tol]
+    
+    if crack_nodes:
+        # Assume crack grows along a primary axis; pick farthest node
+        tip_node = max(crack_nodes, key=lambda c: c[crack_direction])
+        tip_positions.append((frame.frameValue, tip_node))
+    else:
+        # No crack at this frame
+        tip_positions.append((frame.frameValue, (np.nan, np.nan, np.nan)))
 
-% Close output file
-close(out);
+odb.close()
 
-disp('Done! Saved first 15 seconds.');
+# Write to CSV
+with open(output_csv, 'w', newline='') as f:
+    writer = csv.writer(f)
+    writer.writerow(['Time', 'X', 'Y', 'Z'])
+    for t, pos in tip_positions:
+        writer.writerow([t, pos[0], pos[1], pos[2]])
+
+print(f'Crack tip coordinates exported to {output_csv}')
