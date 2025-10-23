@@ -1,12 +1,12 @@
-% ScreenCapture_Manual_Save.m
-% Capture the full screen manually and save to MP4.
+% ScreenCapture_Manual_Save_Fixed.m
+% Capture the full screen manually (on keypress/mouse click) and save to MP4.
 
 outputFile = 'screen_capture_manual.mp4';
-videoFrameRate = 1; % 1 frame per second playback
+videoFrameRate = 1; % playback fps
 
 fprintf('Starting manual screen capture...\n');
 fprintf('Click or press any key to capture a frame.\n');
-fprintf('Press ESC or close the control window to stop.\n');
+fprintf('Press ESC or close window to stop.\n');
 
 % --- Setup video writer ---
 v = VideoWriter(outputFile, 'MPEG-4');
@@ -51,15 +51,15 @@ while ishandle(fig)
         d.trigger = false;
         guidata(fig, d);
 
-        % Capture the screen as image
+        % --- Capture the screen as image ---
         img = robot.createScreenCapture(rect);
         pixels = reshape(typecast(img.getRGB(0,0,width,height,[],0,width),'int32'), width, height)';
         R = uint8(bitshift(bitand(pixels, hex2dec('00FF0000')),-16));
         G = uint8(bitshift(bitand(pixels, hex2dec('0000FF00')),-8));
-        B = uint8(bitand(pixels, hex2dec('000000FF')),0);
+        B = uint8(bitand(pixels, hex2dec('000000FF')));
         frame = cat(3,R,G,B);
 
-        % Write to video
+        % --- Write to video ---
         writeVideo(v, frame);
         frameCount = frameCount + 1;
         fprintf('Captured frame %d\n', frameCount);
