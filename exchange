@@ -9,8 +9,8 @@ fprintf('Click or press any key to capture a frame.\n');
 fprintf('Press ESC or close control window to stop.\n');
 
 % --- Setup video writer ---
-v = VideoWriter(outputFile, 'MPEG-4');
-v.FrameRate = videoFrameRate;
+v = VideoWriter('screen_capture_manual.avi','Motion JPEG AVI');
+v.FrameRate = 1;
 open(v);
 
 % --- Create control window ---
