@@ -1,23 +1,17 @@
-% ScreenCapture_Manual_Save_Fixed.m
-% Capture the full screen manually (on keypress/mouse click) and save to MP4.
+% ScreenCapture_FullDesktop_Manual.m
+% Capture the full screen on key/mouse trigger (works even if MATLAB not in front)
 
 outputFile = 'screen_capture_manual.mp4';
 videoFrameRate = 1; % playback fps
 
-fprintf('Starting manual screen capture...\n');
+fprintf('Starting manual full-screen capture...\n');
 fprintf('Click or press any key to capture a frame.\n');
-fprintf('Press ESC or close window to stop.\n');
+fprintf('Press ESC or close control window to stop.\n');
 
 % --- Setup video writer ---
 v = VideoWriter(outputFile, 'MPEG-4');
 v.FrameRate = videoFrameRate;
 open(v);
-
-% --- Screen size ---
-set(0, 'Units', 'pixels');
-scr = get(0, 'ScreenSize');
-width = scr(3);
-height = scr(4);
 
 % --- Create control window ---
 fig = figure('Name','Screen Capture Control', ...
@@ -36,9 +30,6 @@ data.stop = false;
 data.trigger = false;
 guidata(fig, data);
 
-% --- Java Robot setup ---
-robot = java.awt.Robot();
-rect = java.awt.Rectangle(width, height);
 frameCount = 0;
 
 % --- Capture loop ---
@@ -51,32 +42,41 @@ while ishandle(fig)
         d.trigger = false;
         guidata(fig, d);
 
-        % --- Capture the screen as image ---
-        img = robot.createScreenCapture(rect);
-        pixels = reshape(typecast(img.getRGB(0,0,width,height,[],0,width),'int32'), width, height)';
-        R = uint8(bitshift(bitand(pixels, hex2dec('00FF0000')),-16));
-        G = uint8(bitshift(bitand(pixels, hex2dec('0000FF00')),-8));
-        B = uint8(bitand(pixels, hex2dec('000000FF')));
-        frame = cat(3,R,G,B);
+        % --- Capture entire screen via .NET ---
+        bounds = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
+        import System.Drawing.*
+        bmp = Bitmap(bounds.Width, bounds.Height);
+        g = Graphics.FromImage(bmp);
+        g.CopyFromScreen(Point(0,0), Point(0,0), bmp.Size);
+        % Convert .NET bitmap to MATLAB image
+        stream = System.IO.MemoryStream();
+        bmp.Save(stream, Imaging.ImageFormat.Png);
+        bytes = uint8(stream.ToArray());
+        frame = imdecode(bytes, 'png');
 
         % --- Write to video ---
         writeVideo(v, frame);
         frameCount = frameCount + 1;
         fprintf('Captured frame %d\n', frameCount);
+
+        % Clean up .NET objects
+        g.Dispose();
+        bmp.Dispose();
+        stream.Dispose();
     end
     pause(0.05);
 end
 
-% --- Finalize ---
+% --- Finalize video ---
 close(v);
 if ishandle(fig), delete(fig); end
 pause(0.5);
-fprintf('✅ Done. Saved %d frames to %s\n', frameCount, outputFile);
+fprintf('✅ Done! Saved %d frames to %s\n', frameCount, outputFile);
 msgbox(sprintf('Manual capture done.\nFrames: %d\nFile: %s', ...
-    frameCount, outputFile),'Done');
+    frameCount, outputFile), 'Done');
 load handel; sound(y, Fs);
 
-% ---------------- Callbacks ----------------
+% --- Callbacks ---
 function keyCallback(src,event)
     d = guidata(src);
     if strcmp(event.Key,'escape')
