@@ -1,15 +1,14 @@
-% ScreenCapture_Interactive_Fixed.m
-% Capture the whole screen manually (key or mouse) into MP4.
-% Works reliably on all MATLAB versions.
+% ScreenCapture_Interactive_Working.m
+% Capture full screen on keypress or mouse click, save as MP4.
 
-outputFile = 'screen_capture_manual.mp4';   % Output filename
-videoFrameRate = 1;                         % Playback fps
+outputFile = 'screen_capture_manual.mp4';
+videoFrameRate = 1; % Playback fps
 
 disp('Interactive screen capture started.');
-disp('Press any key or click the mouse to capture a frame.');
-disp('Press ESC or close the window to stop.');
+disp('Click or press any key to capture a frame.');
+disp('Press ESC or close window to stop.');
 
-% Video writer setup
+% Setup video writer
 v = VideoWriter(outputFile, 'MPEG-4');
 v.FrameRate = videoFrameRate;
 open(v);
@@ -20,7 +19,7 @@ screenSize = get(0,'ScreenSize');
 width  = screenSize(3);
 height = screenSize(4);
 
-% Create control figure
+% Control figure
 fig = figure('Name','Screen Capture Control', ...
     'NumberTitle','off', 'MenuBar','none', 'ToolBar','none', ...
     'Color','w', 'Position',[200 200 420 120], ...
@@ -29,20 +28,38 @@ fig = figure('Name','Screen Capture Control', ...
     'CloseRequestFcn',@closeCallback);
 
 uicontrol('Style','text','String',...
-    'Click or press any key to capture a frame. Press ESC to stop.',...
+    'Click or press any key to capture. Press ESC to stop.',...
     'FontSize',11,'Units','normalized','Position',[0.05 0.3 0.9 0.4]);
+
+% Store state
+data.stopCapture = false;
+data.newEvent = false;
+guidata(fig, data);
 
 robot = java.awt.Robot();
 rect  = java.awt.Rectangle(width, height);
 frameCount = 0;
-stopCapture = false;
 
-while ~stopCapture && ishandle(fig)
-    uiwait(fig); % Wait for event
-    if stopCapture || ~ishandle(fig)
+% Main loop
+while ishandle(fig)
+    % Wait for event
+    data = guidata(fig);
+    while ~data.newEvent && ishandle(fig)
+        pause(0.05);
+        data = guidata(fig);
+    end
+    if ~ishandle(fig)
         break;
     end
-    
+
+    % If stop flag set, exit
+    data = guidata(fig);
+    if data.stopCapture
+        break;
+    end
+    data.newEvent = false;
+    guidata(fig, data);
+
     % Capture screen
     img = robot.createScreenCapture(rect);
     w = int32(img.getWidth());
@@ -62,37 +79,34 @@ while ~stopCapture && ishandle(fig)
     disp(['Captured frame ', num2str(frameCount)]);
 end
 
-close(v);  % Ensure video file is finalized
+close(v);
 if ishandle(fig), delete(fig); end
-
-pause(0.5); % Give file system a moment to flush
-
-disp(['Done! Saved ', num2str(frameCount), ' frames to ', outputFile]);
-load handel; sound(y, Fs);
+pause(0.5);
+disp(['✅ Done! Saved ', num2str(frameCount), ' frames to ', outputFile]);
 msgbox(sprintf('Manual capture complete!\nFrames: %d\nFile: %s', ...
     frameCount, outputFile), 'Done');
+load handel; sound(y, Fs);
 
-% --- Local functions -----------------------------------------------------
+% --- Callbacks -----------------------------------------------------------
 function keyCallback(src, event)
-    % Called when a key is pressed
-    set(src,'UserData',event.Key);
+    data = guidata(src);
     if strcmp(event.Key, 'escape')
-        assignin('base','stopCapture',true);
-        uiresume(src);
+        data.stopCapture = true;
     else
-        uiresume(src);
+        data.newEvent = true;
     end
+    guidata(src, data);
 end
 
 function clickCallback(src, ~)
-    % Called when mouse clicked
-    set(src,'UserData','click');
-    uiresume(src);
+    data = guidata(src);
+    data.newEvent = true;
+    guidata(src, data);
 end
 
 function closeCallback(src, ~)
-    % Called when user closes window
-    assignin('base','stopCapture',true);
-    uiresume(src);
+    data = guidata(src);
+    data.stopCapture = true;
+    guidata(src, data);
     delete(src);
 end
