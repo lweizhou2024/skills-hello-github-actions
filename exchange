@@ -59,4 +59,43 @@ while ishandle(fig)
         B = uint8(bitand(pixels, hex2dec('000000FF')),0);
         frame = cat(3,R,G,B);
 
-        % Write to vid
+        % Write to video
+        writeVideo(v, frame);
+        frameCount = frameCount + 1;
+        fprintf('Captured frame %d\n', frameCount);
+    end
+    pause(0.05);
+end
+
+% --- Finalize ---
+close(v);
+if ishandle(fig), delete(fig); end
+pause(0.5);
+fprintf('✅ Done. Saved %d frames to %s\n', frameCount, outputFile);
+msgbox(sprintf('Manual capture done.\nFrames: %d\nFile: %s', ...
+    frameCount, outputFile),'Done');
+load handel; sound(y, Fs);
+
+% ---------------- Callbacks ----------------
+function keyCallback(src,event)
+    d = guidata(src);
+    if strcmp(event.Key,'escape')
+        d.stop = true;
+    else
+        d.trigger = true;
+    end
+    guidata(src,d);
+end
+
+function clickCallback(src,~)
+    d = guidata(src);
+    d.trigger = true;
+    guidata(src,d);
+end
+
+function closeCallback(src,~)
+    d = guidata(src);
+    d.stop = true;
+    guidata(src,d);
+    delete(src);
+end
