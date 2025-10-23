@@ -1,87 +1,85 @@
-% ScreenCapture_Optris_fixed.m
-% Reliable full-screen capture using Java Robot and getRGB
+% ScreenCapture_Interactive.m
+% Capture full screen when user presses a key or clicks mouse.
 
-% --- user settings ---
-outputFile = 'screen_capture.mp4';   % output video filename
-numFrames = 30;                      % total frames to capture
-captureInterval = 10;                % seconds between captures (your RAVI rate)
-videoFrameRate = 1;                  % playback rate in output video (1 frame/sec)
-startDelay = 10;                     % seconds to wait before first capture
-% ----------------------
+outputFile = 'screen_capture_manual.mp4';   % output video filename
+videoFrameRate = 1;                         % playback fps for output video
 
-disp('Starting screen capture (using Java Robot) ...');
-disp(['Waiting ', num2str(startDelay), ' seconds so you can start PIX playback...']);
-pause(startDelay);
+disp('Interactive screen capture started.');
+disp('Press any key or click the mouse to capture a frame.');
+disp('Press ESC or close the figure window to stop.');
 
 % Create video writer
 v = VideoWriter(outputFile, 'MPEG-4');
 v.FrameRate = videoFrameRate;
 open(v);
 
-% Get screen size (for multi-monitor, this gives virtual screen)
+% Get screen size
 set(0,'Units','pixels');
-screenSize = get(0,'ScreenSize');   % [left bottom width height]
+screenSize = get(0,'ScreenSize');
 width = screenSize(3);
 height = screenSize(4);
 
-% create Java Robot and rectangle
+% Create figure to capture key/click events
+fig = figure('Name','Screen Capture Control', ...
+    'NumberTitle','off', 'MenuBar','none', 'ToolBar','none', ...
+    'Color','w', 'Position',[100 100 400 150], ...
+    'KeyPressFcn',@keyCallback, 'WindowButtonDownFcn',@clickCallback);
+
+uicontrol('Style','text','String',...
+    'Click or press any key to capture a frame. Press ESC to stop.',...
+    'FontSize',11,'Units','normalized','Position',[0.05 0.3 0.9 0.4]);
+
+% Initialize flags
+stopCapture = false;
+frameCount = 0;
+
+% Java Robot for screen capture
 robot = java.awt.Robot();
 rect = java.awt.Rectangle(width, height);
 
-for i = 1:numFrames
-    % capture
-    img = robot.createScreenCapture(rect);   % java.awt.image.BufferedImage
-
-    % dimensions
-    w = int32(img.getWidth());
-    h = int32(img.getHeight());
-
-    % getRGB returns an int32 java array of length w*h (packed ARGB)
-    % The MATLAB int conversion yields a column vector of length w*h
-    rgbInts = typecast(img.getRGB(0,0,w,h,zeros(1,w*h,'int32'),0,w),'int32'); 
-    % In some MATLAB/JVM combos img.getRGB(...) already returns a MATLAB array:
-    if isempty(rgbInts)
-        % fallback: directly call and convert
-        rgbJava = img.getRGB(0,0,w,h,[],0,w); % java array
-        rgbInts = zeros(1,w*h,'int32');
-        for k = 1:length(rgbJava)
-            rgbInts(k) = int32(rgbJava(k));
+% Nested callback functions
+    function keyCallback(~, event)
+        if strcmp(event.Key, 'escape')
+            stopCapture = true;
+            uiresume(fig);
+        else
+            uiresume(fig);
         end
     end
 
-    % extract channels from packed ARGB: bits 16-23 R, 8-15 G, 0-7 B
-    % Use bit operations (works even if values are signed)
+    function clickCallback(~, ~)
+        uiresume(fig);
+    end
+
+% Capture loop
+while ~stopCapture && ishandle(fig)
+    uiwait(fig);  % wait for key or mouse
+    if stopCapture || ~ishandle(fig)
+        break;
+    end
+    
+    % Capture screen
+    img = robot.createScreenCapture(rect);
+    w = int32(img.getWidth());
+    h = int32(img.getHeight());
+    rgbInts = typecast(img.getRGB(0,0,w,h,zeros(1,w*h,'int32'),0,w),'int32');
     rVals = bitand(bitshift(rgbInts, -16), 255);
     gVals = bitand(bitshift(rgbInts, -8), 255);
     bVals = bitand(rgbInts, 255);
-
-    % reshape to 2D (column-major). rgbInts is row-major order from getRGB:
-    % We need to reshape into (w x h) and then transpose to (h x w)
     R = reshape(uint8(rVals), [w, h])';
     G = reshape(uint8(gVals), [w, h])';
     B = reshape(uint8(bVals), [w, h])';
-
-    frame = cat(3, R, G, B);  % h x w x 3
-
-    % write to video
+    frame = cat(3, R, G, B);
+    
+    frameCount = frameCount + 1;
     writeVideo(v, frame);
-    disp(['Captured frame ', num2str(i), ' of ', num2str(numFrames)]);
-
-    if i < numFrames
-        pause(captureInterval);
-    end
+    disp(['Captured frame ', num2str(frameCount)]);
 end
 
 close(v);
+if ishandle(fig), close(fig); end
 
-% Notify user: sound + message box
-disp(['Done! Video saved as ', outputFile]);
-try
-    load handel;
-    sound(y, Fs);
-catch
-    % ignore if no sound data
-end
-msgbox(sprintf('Screen capture complete!\nFile: %s\nFrames: %d\nInterval: %g s', ...
-    outputFile, numFrames, captureInterval), 'Done');
-
+disp(['Done! Saved ', num2str(frameCount), ' frames to ', outputFile]);
+load handel; sound(y, Fs);
+msgbox(sprintf('Manual capture complete!\nFrames: %d\nFile: %s', ...
+    frameCount, outputFile), 'Done');
