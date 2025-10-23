@@ -1,112 +1,62 @@
-% ScreenCapture_Interactive_Working.m
-% Capture full screen on keypress or mouse click, save as MP4.
+% ScreenCapture_Manual_Save.m
+% Capture the full screen manually and save to MP4.
 
 outputFile = 'screen_capture_manual.mp4';
-videoFrameRate = 1; % Playback fps
+videoFrameRate = 1; % 1 frame per second playback
 
-disp('Interactive screen capture started.');
-disp('Click or press any key to capture a frame.');
-disp('Press ESC or close window to stop.');
+fprintf('Starting manual screen capture...\n');
+fprintf('Click or press any key to capture a frame.\n');
+fprintf('Press ESC or close the control window to stop.\n');
 
-% Setup video writer
+% --- Setup video writer ---
 v = VideoWriter(outputFile, 'MPEG-4');
 v.FrameRate = videoFrameRate;
 open(v);
 
-% Screen size
-set(0,'Units','pixels');
-screenSize = get(0,'ScreenSize');
-width  = screenSize(3);
-height = screenSize(4);
+% --- Screen size ---
+set(0, 'Units', 'pixels');
+scr = get(0, 'ScreenSize');
+width = scr(3);
+height = scr(4);
 
-% Control figure
+% --- Create control window ---
 fig = figure('Name','Screen Capture Control', ...
-    'NumberTitle','off', 'MenuBar','none', 'ToolBar','none', ...
-    'Color','w', 'Position',[200 200 420 120], ...
+    'NumberTitle','off','MenuBar','none','ToolBar','none', ...
+    'Color','w','Position',[200 200 420 120], ...
     'KeyPressFcn',@keyCallback, ...
     'WindowButtonDownFcn',@clickCallback, ...
     'CloseRequestFcn',@closeCallback);
 
 uicontrol('Style','text','String',...
-    'Click or press any key to capture. Press ESC to stop.',...
+    'Click or press key = capture; ESC = stop.',...
     'FontSize',11,'Units','normalized','Position',[0.05 0.3 0.9 0.4]);
 
-% Store state
-data.stopCapture = false;
-data.newEvent = false;
+% --- Shared state ---
+data.stop = false;
+data.trigger = false;
 guidata(fig, data);
 
+% --- Java Robot setup ---
 robot = java.awt.Robot();
-rect  = java.awt.Rectangle(width, height);
+rect = java.awt.Rectangle(width, height);
 frameCount = 0;
 
-% Main loop
+% --- Capture loop ---
 while ishandle(fig)
-    % Wait for event
-    data = guidata(fig);
-    while ~data.newEvent && ishandle(fig)
-        pause(0.05);
-        data = guidata(fig);
-    end
-    if ~ishandle(fig)
-        break;
-    end
+    drawnow;
+    d = guidata(fig);
+    if d.stop, break; end
 
-    % If stop flag set, exit
-    data = guidata(fig);
-    if data.stopCapture
-        break;
-    end
-    data.newEvent = false;
-    guidata(fig, data);
+    if d.trigger
+        d.trigger = false;
+        guidata(fig, d);
 
-    % Capture screen
-    img = robot.createScreenCapture(rect);
-    w = int32(img.getWidth());
-    h = int32(img.getHeight());
-    rgbInts = typecast(img.getRGB(0,0,w,h,zeros(1,w*h,'int32'),0,w),'int32');
-    rVals = bitand(bitshift(rgbInts, -16), 255);
-    gVals = bitand(bitshift(rgbInts, -8), 255);
-    bVals = bitand(rgbInts, 255);
-    R = reshape(uint8(rVals), [w, h])';
-    G = reshape(uint8(gVals), [w, h])';
-    B = reshape(uint8(bVals), [w, h])';
-    frame = cat(3, R, G, B);
+        % Capture the screen as image
+        img = robot.createScreenCapture(rect);
+        pixels = reshape(typecast(img.getRGB(0,0,width,height,[],0,width),'int32'), width, height)';
+        R = uint8(bitshift(bitand(pixels, hex2dec('00FF0000')),-16));
+        G = uint8(bitshift(bitand(pixels, hex2dec('0000FF00')),-8));
+        B = uint8(bitand(pixels, hex2dec('000000FF')),0);
+        frame = cat(3,R,G,B);
 
-    % Write video frame
-    writeVideo(v, frame);
-    frameCount = frameCount + 1;
-    disp(['Captured frame ', num2str(frameCount)]);
-end
-
-close(v);
-if ishandle(fig), delete(fig); end
-pause(0.5);
-disp(['✅ Done! Saved ', num2str(frameCount), ' frames to ', outputFile]);
-msgbox(sprintf('Manual capture complete!\nFrames: %d\nFile: %s', ...
-    frameCount, outputFile), 'Done');
-load handel; sound(y, Fs);
-
-% --- Callbacks -----------------------------------------------------------
-function keyCallback(src, event)
-    data = guidata(src);
-    if strcmp(event.Key, 'escape')
-        data.stopCapture = true;
-    else
-        data.newEvent = true;
-    end
-    guidata(src, data);
-end
-
-function clickCallback(src, ~)
-    data = guidata(src);
-    data.newEvent = true;
-    guidata(src, data);
-end
-
-function closeCallback(src, ~)
-    data = guidata(src);
-    data.stopCapture = true;
-    guidata(src, data);
-    delete(src);
-end
+        % Write to vid
