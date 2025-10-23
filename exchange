@@ -1,74 +1,51 @@
-from odbAccess import openOdb
-import csv
-import numpy as np
+% ScreenCapture_Optris.m
+% Capture full screen periodically and save to video
 
-# -------- USER SETTINGS --------
-odb_path = 'Job-1.odb'             # Path to your ODB
-output_csv = 'crack_tip_psilsm.csv'
-crack_direction = 1                # 0=x, 1=y, 2=z; crack grows along this axis (Y for vertical cracks)
+% --- user settings ---
+outputFile = 'screen_capture.mp4';   % output video filename
+numFrames = 30;                      % total frames to capture
+captureInterval = 10;                % seconds between captures (your RAVI rate)
+videoFrameRate = 1;                  % playback rate in output video (1 frame/sec)
+startDelay = 10;                     % seconds to wait before first capture
+% ----------------------
 
-# Approximate X positions of each vertical crack
-crack_seeds = [1.0, 3.0, 5.0]     
-seed_tolerance = 1e-2              # Tolerance to select elements near each crack
-# --------------------------------
+disp('Starting screen capture...');
+disp(['Waiting ', num2str(startDelay), ' seconds so you can start PIX playback...']);
+pause(startDelay);
 
-odb = openOdb(odb_path)
-all_steps = odb.steps.keys()
-tip_records = []
+% Create video writer
+v = VideoWriter(outputFile, 'MPEG-4');
+v.FrameRate = videoFrameRate;
+open(v);
 
-for step_name in all_steps:
-    step = odb.steps[step_name]
-    for frame in step.frames:
-        time = frame.frameValue
-        psilsm = frame.fieldOutputs['PSILSM']  # nodal level set to crack front
+% Get screen size
+set(0,'Units','pixels');
+screenSize = get(0,'ScreenSize');
+width = screenSize(3);
+height = screenSize(4);
 
-        # Organize nodal values by instance and nodeLabel for easy access
-        instance_nodes = {}
-        for val in psilsm.values:
-            inst_name = val.instance.name
-            if inst_name not in instance_nodes:
-                instance_nodes[inst_name] = {}
-            instance_nodes[inst_name][val.nodeLabel] = val
+% Use Java Robot to capture screen (faster than getframe)
+robot = java.awt.Robot();
 
-        # Track each crack
-        for crack_index, seed_x in enumerate(crack_seeds, start=1):
-            candidate_tips = []
+for i = 1:numFrames
+    % Capture current screen
+    img = robot.createScreenCapture(java.awt.Rectangle(width, height));
+    rgb = typecast(img.getData().getDataStorage(), 'uint8');
+    rgb = reshape(rgb, [3, width, height]);
+    frame = cat(3, ...
+        rot90(reshape(rgb(3,:,:), [width, height])', -1), ...
+        rot90(reshape(rgb(2,:,:), [width, height])', -1), ...
+        rot90(reshape(rgb(1,:,:), [width, height])', -1));
+    
+    % Write frame to video
+    writeVideo(v, im2frame(frame));
+    disp(['Captured frame ', num2str(i), ' of ', num2str(numFrames)]);
+    
+    % Wait for next capture
+    if i < numFrames
+        pause(captureInterval);
+    end
+end
 
-            # Loop over all elements
-            for elem in frame.fieldOutputs['PSILSM'].values:
-                inst_name = elem.instance.name
-                elem_nodes = elem.instance.elements[elem.elementLabel-1].connectivity
-                # Check if element is near the crack seed
-                elem_coords = np.array([elem.instance.nodes[n-1].coordinates for n in elem_nodes])
-                if np.any(np.abs(elem_coords[:,0] - seed_x) < seed_tolerance):
-                    # Loop over element edges to find sign changes in PSILSM
-                    n_edges = len(elem_nodes)
-                    for i in range(n_edges):
-                        n1 = elem_nodes[i]
-                        n2 = elem_nodes[(i+1)%n_edges]
-                        psi1 = instance_nodes[inst_name][n1].data
-                        psi2 = instance_nodes[inst_name][n2].data
-                        if psi1 * psi2 < 0:  # Sign change -> crack tip crosses edge
-                            coord1 = np.array(elem.instance.nodes[n1-1].coordinates)
-                            coord2 = np.array(elem.instance.nodes[n2-1].coordinates)
-                            alpha = psi1 / (psi1 - psi2)
-                            tip_coord = coord1 + alpha * (coord2 - coord1)
-                            candidate_tips.append(tip_coord)
-
-            if candidate_tips:
-                # Pick tip furthest along crack growth direction
-                tip_node = max(candidate_tips, key=lambda c: c[crack_direction])
-                tip_records.append([step_name, time, crack_index, tip_node[0], tip_node[1], tip_node[2]])
-            else:
-                tip_records.append([step_name, time, crack_index, np.nan, np.nan, np.nan])
-
-odb.close()
-
-# Write results to CSV
-with open(output_csv, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['Step', 'Time', 'CrackIndex', 'X', 'Y', 'Z'])
-    for row in tip_records:
-        writer.writerow(row)
-
-print(f'Crack tip coordinates exported to {output_csv}')
+close(v);
+disp(['Done! Video saved as ', outputFile]);
