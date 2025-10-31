@@ -1,3 +1,2 @@
-Ti (specifically Ti64) heat treatment:
-1. Solution: heat to 30-50C below beta transus, cool. Before heating, it normally mill annealed to equax alpha phase. Since below BT, some alpha will not transfer to beta. The alpha approach curve can be used to determine volume fracture of alpha. It will remain after cooling and called primary alpha. During cooling, if cooling rate is high (>410C/s from 900C), it form martensite (Ms around 575), normally call alpha prime. If cooling rate between 20-410C/s, it forms massive alpha (some grain boundary alpha too). Both alpha prime and massive alpha is hcp. beta is bcc. If lower than 20C/s, it will form Widmanstätten alpha (some grain boundary alpha too). CCT diagram will show this. SInce the volume of different phase are similar, normally transformation related volume change are not considered during modeling. Only property change need to be considered. 
-2. annealing/tempering/aging: heat up to 700C to decompose alpha prime and massive alpha. This will reduce hardenss but increase ductulity. 
+Could not extract any node coordinates from node set "TGOSET".
+('Type of nodeSet.nodes:', <type 'tuple'>)
