@@ -1,399 +1,125 @@
-# band_centerline_stress.py
-# Run with: abaqus python band_centerline_stress.py
-
 from odbAccess import openOdb
-from abaqusConstants import NODAL
 import numpy as np
-import csv
-import sys
-import math
+import math, sys, csv
 
-# --------------------- USER INPUT ---------------------
-odb_path = 'your_model.odb'             # <-- change
-step_name = 'Step-1'                   # <-- change
-frame_num = -1                         # last frame
-node_set_name = 'NSET-MYBAND'          # <-- change: should contain edge nodes for the band
-output_csv = 'band_centerline_stress.csv'
+# ---------------------------------------------------------------------
+# USER INPUT
+odb_path = 'yourfile.odb'        # path to your ODB
+tgonode_file = 'tgonodes.txt'    # file with comma/space separated node labels
+output_csv = 'band_stress.csv'   # output file
+element_set_name = 'TGOELEM'     # element set of the band
+stress_component = 'S11'         # choose the component (S11, S22, etc.)
+step_name = 'Step-1'             # step name to read from
+frame_number = -1                # last frame
+# ---------------------------------------------------------------------
 
-# algorithm parameters (tune if needed)
-sample_count = None    # None => auto (see below), otherwise integer number of centerline sample points
-window_factor = 1.5    # how wide the sliding window is relative to sample spacing
-k_interp = 8           # number of nearest nodes used to interpolate stress to centerline
-power_idw = 2.0        # inverse-distance weighting power
-# ------------------------------------------------------
-
-print('Opening ODB:', odb_path)
+print('Opening ODB: %s' % odb_path)
 odb = openOdb(path=odb_path)
 root_assembly = odb.rootAssembly
+step = odb.steps[step_name]
+frame = step.frames[frame_number]
 
-# --- ultra-robust node set extraction ---
-def get_node_set(assembly, name):
-    if name in assembly.nodeSets:
-        return assembly.nodeSets[name]
-    for instName, inst in assembly.instances.items():
-        if name in inst.nodeSets:
-            return inst.nodeSets[name]
-    return None
-
-nodeSet = get_node_set(root_assembly, node_set_name)
-if nodeSet is None:
-    print('Node set "%s" not found in assembly or instances.' % node_set_name)
-    print('Available root-level node sets:', list(root_assembly.nodeSets.keys()))
-    odb.close()
-    sys.exit(1)
-
-nodes_coords = {}
+# --- read node labels from file ---
 node_labels = set()
-
-def add_nodes(node_sequence):
-    """Helper: add Abaqus node objects to nodes_coords dict."""
-    for n in node_sequence:
-        try:
-            xy = np.array(n.coordinates[:2])
-            nodes_coords[n.label] = xy
-            node_labels.add(n.label)
-        except Exception:
-            pass
-
-# try several known data structures
-try:
-    # 1️⃣ direct list of MeshNode objects
-    if hasattr(nodeSet, 'nodes') and isinstance(nodeSet.nodes, (list, tuple)):
-        # sometimes nested tuple like ((node1,node2,...),)
-        if len(nodeSet.nodes) > 0 and isinstance(nodeSet.nodes[0], (list, tuple)):
-            for sub in nodeSet.nodes:
-                add_nodes(sub)
-        else:
-            add_nodes(nodeSet.nodes)
-
-    # 2️⃣ dictionary of instanceName → node sequence
-    elif hasattr(nodeSet, 'nodes') and isinstance(nodeSet.nodes, dict):
-        for instName, seq in nodeSet.nodes.items():
-            add_nodes(seq)
-
-    # 3️⃣ some CAE node sets store ((instance, nodeList), ...)
-    elif hasattr(nodeSet, 'nodes'):
-        maybe_tuple = nodeSet.nodes
-        try:
-            for entry in maybe_tuple:
-                if isinstance(entry, tuple) and len(entry) == 2:
-                    _, nodeSeq = entry
-                    add_nodes(nodeSeq)
-        except Exception:
-            pass
-
-    # 4️⃣ fallback using nodeLabels
-    if not nodes_coords and hasattr(nodeSet, 'nodeLabels'):
-        labels = []
-        # nodeLabels may be dict or list
-        if isinstance(nodeSet.nodeLabels, dict):
-            for instName, lbls in nodeSet.nodeLabels.items():
-                labels += list(lbls)
-                inst = root_assembly.instances[instName]
-                for n in inst.nodes:
-                    if n.label in lbls:
-                        add_nodes([n])
-        elif isinstance(nodeSet.nodeLabels, (list, tuple)):
-            labels += list(nodeSet.nodeLabels)
-            for instName, inst in root_assembly.instances.items():
-                for n in inst.nodes:
-                    if n.label in labels:
-                        add_nodes([n])
-except Exception as e:
-    print("Error while extracting nodes:", e)
-
-if len(nodes_coords) == 0:
-    print('❌ Could not extract any node coordinates from node set "%s".' % node_set_name)
-    print('Type of nodeSet.nodes:', type(nodeSet.nodes))
-    odb.close()
-    sys.exit(1)
-
-print('✅ Collected %d nodes from node set "%s".' % (len(nodes_coords), node_set_name))
-
-
-
-# 1) collect node coords and labels from the node set
-# prefer nodeLabels attribute if present
-node_labels = set()
-if hasattr(nodeSet, 'nodeLabels') and nodeSet.nodeLabels:
-    node_labels = set(nodeSet.nodeLabels)
-else:
-    # fallback: if nodeSet.nodes exist, collect (these may be MeshNode objects)
-    if hasattr(nodeSet, 'nodes') and nodeSet.nodes:
-        # MeshNode objects have .label and .coordinates (or .instanceName + .label)
-        for n in nodeSet.nodes:
+with open(tgonode_file, 'r') as f:
+    for line in f:
+        for tok in line.replace(',', ' ').split():
             try:
-                node_labels.add(n.label)
-            except Exception:
-                # some versions: each element is (instanceName, nodeLabel) tuple - skip here
+                node_labels.add(int(tok))
+            except:
                 pass
+print('Read %d node labels from %s' % (len(node_labels), tgonode_file))
 
-# if still empty, try alternative attribute
-if not node_labels:
-    # try element with .nodes tuples if any
-    try:
-        for n in nodeSet.sequenceFromLabels:
-            node_labels.add(n)
-    except Exception:
-        pass
-
-if not node_labels:
-    print('Could not find node labels in node set. Exiting.')
-    odb.close()
-    sys.exit(1)
-
-# collect coordinates for those labels by scanning instances
-nodes_coords = {}   # label -> [x,y]
+# --- get coordinates for these nodes from ODB ---
+nodes_coords = {}
 for instName, inst in root_assembly.instances.items():
     for n in inst.nodes:
         if n.label in node_labels:
-            nodes_coords[n.label] = np.array(n.coordinates[:2], dtype=float)
+            nodes_coords[n.label] = np.array(n.coordinates[:2])
 
 if len(nodes_coords) == 0:
-    print('No node coordinates found for labels in node set. Exiting.')
+    print('Could not match any nodes from file in the ODB.')
     odb.close()
     sys.exit(1)
+print('Collected %d nodes from ODB.' % len(nodes_coords))
 
-# assemble arrays
-node_labels_list = sorted(nodes_coords.keys())
-coords = np.array([nodes_coords[l] for l in node_labels_list])  # Nx2
-
-Nnodes = coords.shape[0]
-print('Collected %d nodes from node set.' % Nnodes)
-
-# 2) compute principal axis of band (PCA) and parameter t along main axis
-mean_coords = coords.mean(axis=0)
-# covariance and eigen decomposition
-C = np.cov((coords - mean_coords).T)
-eigvals, eigvecs = np.linalg.eigh(C)
-# largest eigenvector (principal direction)
-idx_max = np.argmax(eigvals)
-u = eigvecs[:, idx_max]  # unit (maybe not exactly unit)
-u = u / np.linalg.norm(u)
-# perpendicular direction (2D)
-n = np.array([-u[1], u[0]])
-
-# project coords onto axis to get scalar parameter t
-tvals = np.dot(coords - mean_coords, u)
-t_min, t_max = tvals.min(), tvals.max()
-t_range = t_max - t_min
-if t_range <= 0:
-    print('Zero length along principal axis, abort.')
-    odb.close()
-    sys.exit(1)
-
-# decide sample_count if not provided
-if sample_count is None:
-    sample_count = min(300, max(50, int(max(30, Nnodes // 4))))
-print('Using sample_count =', sample_count)
-
-# build sample positions evenly in t
-t_samples = np.linspace(t_min, t_max, sample_count)
-
-# sliding window width
-if sample_count > 1:
-    sample_spacing = (t_max - t_min) / (sample_count - 1)
+# --- extract stress field for element set ---
+if element_set_name in root_assembly.elementSets:
+    elemSet = root_assembly.elementSets[element_set_name]
 else:
-    sample_spacing = t_range
-window_half = window_factor * sample_spacing
-
-center_pts = []       # list of centerline points (x,y)
-center_t = []         # t parameter for each center point
-widths = []           # local width (distance between two edge centroids)
-valid_sample_count = 0
-
-# For each sample t0, take nodes within window, split by sign of projection onto n (perp direction)
-for t0 in t_samples:
-    # nodes where |t - t0| <= window_half
-    idx = np.where(np.abs(tvals - t0) <= window_half)[0]
-    if idx.size < 6:
-        # too few nodes in window; optionally expand window or skip
-        idx = np.where(np.abs(tvals - t0) <= 2.5 * window_half)[0]
-    if idx.size < 6:
-        # still too few nodes; skip this sample
-        continue
-    local_coords = coords[idx]
-    local_mean = local_coords.mean(axis=0)
-    # project local nodes onto perpendicular direction n
-    perp_proj = np.dot(local_coords - local_mean, n)
-    # split by sign
-    sideA_idx = np.where(perp_proj >= 0)[0]
-    sideB_idx = np.where(perp_proj < 0)[0]
-    if sideA_idx.size == 0 or sideB_idx.size == 0:
-        # fallback: attempt k-means-ish split by sorting along perp_proj and split half-half
-        order = np.argsort(perp_proj)
-        half = order.size // 2
-        sideA_idx = order[:half]
-        sideB_idx = order[half:]
-        if sideA_idx.size == 0 or sideB_idx.size == 0:
-            continue
-    # centroids of sides (in global coords)
-    cA = local_coords[sideA_idx].mean(axis=0)
-    cB = local_coords[sideB_idx].mean(axis=0)
-    center = 0.5 * (cA + cB)
-    width = np.linalg.norm(cA - cB)
-    center_pts.append(center)
-    center_t.append(t0)
-    widths.append(width)
-    valid_sample_count += 1
-
-if valid_sample_count < 4:
-    print('Could not build enough centerline points (%d). Try increasing window or check node set.' % valid_sample_count)
-    odb.close()
-    sys.exit(1)
-
-center_pts = np.array(center_pts)   # Mx2
-center_t = np.array(center_t)
-widths = np.array(widths)
-
-# sort center points by their projection along u (since t_samples are ordered, this usually already ordered)
-proj_center = np.dot(center_pts - mean_coords, u)
-order = np.argsort(proj_center)
-center_pts = center_pts[order]
-proj_center = proj_center[order]
-widths = widths[order]
-
-# compute arclength along centerline by cumulative distance
-M = center_pts.shape[0]
-dists = np.zeros(M)
-for i in range(1, M):
-    dists[i] = np.linalg.norm(center_pts[i] - center_pts[i-1])
-arclength = np.cumsum(dists)
-# normalize arclength to start at zero
-arclength = arclength - arclength[0]
-
-# 3) read nodal stresses (extrapolated nodal S)
-step = odb.steps.get(step_name, None)
-if step is None:
-    print('Step not found:', step_name)
-    odb.close()
-    sys.exit(1)
-frame = step.frames[frame_num]
-
-if 'S' not in frame.fieldOutputs.keys():
-    print('Stress field S not found in frame. Available fields:', frame.fieldOutputs.keys())
-    odb.close()
-    sys.exit(1)
-Sfield = frame.fieldOutputs['S']
-
-# ask for nodal subset for the node set
-S_nodal_subset = Sfield.getSubset(region=nodeSet, position=NODAL)
-
-# build node_label -> stress tensor (2x2) mapping (average if multiple values)
-stress_by_node = {}
-count_by_node = {}
-for v in S_nodal_subset.values:
-    lab = v.nodeLabel
-    data = v.data  # (S11,S22,S33,S12,S13,S23)
-    s11 = data[0]
-    s22 = data[1]
-    s12 = data[3]
-    Smat = np.array([[s11, s12],
-                     [s12, s22]], dtype=float)
-    if lab in stress_by_node:
-        stress_by_node[lab] += Smat
-        count_by_node[lab] += 1
+    for instName, inst in root_assembly.instances.items():
+        if element_set_name in inst.elementSets:
+            elemSet = inst.elementSets[element_set_name]
+            break
     else:
-        stress_by_node[lab] = Smat.copy()
-        count_by_node[lab] = 1
+        print('Element set "%s" not found.' % element_set_name)
+        odb.close()
+        sys.exit(1)
 
-# finalize average
-for lab in list(stress_by_node.keys()):
-    stress_by_node[lab] /= float(count_by_node[lab])
+stress_field = frame.fieldOutputs['S']
+stress_subfield = stress_field.getSubset(region=elemSet, position=ELEMENT_NODAL)
 
-# map final node coords and stresses to arrays
-node_coords_list = []
-node_stress_list = []
-node_label_for_array = []
-for lab in node_labels_list:
-    if lab in nodes_coords and lab in stress_by_node:
-        node_coords_list.append(nodes_coords[lab])
-        node_stress_list.append(stress_by_node[lab])
-        node_label_for_array.append(lab)
-node_coords_arr = np.array(node_coords_list)   # Kx2
-node_stress_arr = np.array(node_stress_list)  # Kx2x2
+# --- collect stresses at node labels ---
+node_stress = {}
+for v in stress_subfield.values:
+    if v.nodeLabel in node_labels:
+        node_stress.setdefault(v.nodeLabel, []).append(v.data)
 
-K = node_coords_arr.shape[0]
-if K == 0:
-    print('No nodes had both coords and nodal stress data. Exiting.')
+# average duplicates if needed
+for lbl in node_stress:
+    node_stress[lbl] = np.mean(node_stress[lbl], axis=0)
+
+if len(node_stress) == 0:
+    print('No matching node stresses found in the element set.')
     odb.close()
     sys.exit(1)
-print('Using %d nodal stress points for interpolation.' % K)
 
-# helper: interpolate stress at a query point using inverse-distance weighted average of nearest k nodes
-def interp_stress_at_point(qpt, k=k_interp, power=power_idw):
-    # compute distances
-    d = np.linalg.norm(node_coords_arr - qpt.reshape((1,2)), axis=1)
-    # if any distance is zero -> return that node's stress
-    zero_idx = np.where(d < 1e-12)[0]
-    if zero_idx.size > 0:
-        return node_stress_arr[int(zero_idx[0])]
-    # find k nearest
-    k_use = min(k, K)
-    idxs = np.argsort(d)[:k_use]
-    ds = d[idxs]
-    # weights
-    with np.errstate(divide='ignore'):
-        w = 1.0 / (ds**power)
-    # normalize
-    w_sum = np.sum(w)
-    if w_sum <= 0:
-        # fallback: simple average
-        return node_stress_arr[idxs].mean(axis=0)
-    w = w / w_sum
-    # weighted sum of stress tensors
-    S_interp = np.tensordot(w, node_stress_arr[idxs], axes=(0,0))
-    return S_interp
+# --- build coordinate and stress arrays ---
+coords = []
+stresses = []
+for lbl in node_stress:
+    coords.append(nodes_coords[lbl])
+    sdata = node_stress[lbl]
+    # pick S11, S22, S33, etc.
+    comp_map = {'S11':0, 'S22':1, 'S33':2, 'S12':3, 'S13':4, 'S23':5}
+    scomp = sdata[comp_map[stress_component]]
+    stresses.append(scomp)
 
-# 4) for each centerline point, interpolate stress, compute tangent and longitudinal stress
-sigma_long = np.zeros(M)
-tangents = np.zeros((M,2))
+coords = np.array(coords)
+stresses = np.array(stresses)
 
-for i in range(M):
-    # tangent via finite difference on center_pts
-    if i == 0:
-        vec = center_pts[1] - center_pts[0]
-    elif i == M-1:
-        vec = center_pts[-1] - center_pts[-2]
-    else:
-        vec = center_pts[i+1] - center_pts[i-1]
-    norm = np.linalg.norm(vec)
-    if norm < 1e-12:
-        t = np.array([1.0, 0.0])
-    else:
-        t = vec / norm
-    tangents[i] = t
-    # interpolate stress at center point
-    S_interp = interp_stress_at_point(center_pts[i])
-    # compute longitudinal stress t^T S t
-    tcol = t.reshape((2,1))
-    sigma_long[i] = float(np.dot(tcol.T, np.dot(S_interp, tcol)))
+# --- find centerline of band ---
+# Here we approximate centerline by smoothing coordinates
+# sort by x, then use running average to get approximate line
+order = np.argsort(coords[:,0])
+coords_sorted = coords[order]
+stresses_sorted = stresses[order]
 
-# find midpoint along arclength (mid-length center)
-total_length = arclength[-1]
-mid_s = 0.5 * total_length
-idx_mid = int(np.argmin(np.abs(arclength - mid_s)))
-center_mid_info = {
-    'index': idx_mid,
-    'x': float(center_pts[idx_mid,0]),
-    'y': float(center_pts[idx_mid,1]),
-    'arclength': float(arclength[idx_mid]),
-    'sigma_long': float(sigma_long[idx_mid]),
-    'width': float(widths[idx_mid])
-}
+# optionally smooth coordinates (if noisy)
+window = 5
+smooth_x, smooth_y = [], []
+for i in range(len(coords_sorted)):
+    i1 = max(0, i - window)
+    i2 = min(len(coords_sorted), i + window)
+    smooth_x.append(np.mean(coords_sorted[i1:i2,0]))
+    smooth_y.append(np.mean(coords_sorted[i1:i2,1]))
 
-# write CSV
-with open(output_csv, 'w', newline='') as csvfile:
-    writer = csv.writer(csvfile)
-    writer.writerow(['idx','x','y','arclength','width','t_x','t_y','sigma_long'])
-    for i in range(M):
-        writer.writerow([i, float(center_pts[i,0]), float(center_pts[i,1]), float(arclength[i]), float(widths[i]), float(tangents[i,0]), float(tangents[i,1]), float(sigma_long[i])])
+centerline = np.column_stack((smooth_x, smooth_y))
+stresses_center = stresses_sorted
 
-print('Wrote CSV:', output_csv)
-print('Number of centerline sample points:', M)
-print('Total centerline arclength:', total_length)
-print('Center-at-mid-length:')
-for k,v in center_mid_info.items():
-    print('  %s: %s' % (k,v))
+# --- compute arc length ---
+arc = np.zeros(len(centerline))
+for i in range(1, len(centerline)):
+    dx = centerline[i,0] - centerline[i-1,0]
+    dy = centerline[i,1] - centerline[i-1,1]
+    arc[i] = arc[i-1] + math.sqrt(dx*dx + dy*dy)
 
+# --- save to CSV ---
+with open(output_csv, 'w') as f:
+    writer = csv.writer(f)
+    writer.writerow(['ArcLength', stress_component])
+    for s, val in zip(arc, stresses_center):
+        writer.writerow([s, val])
+
+print('Wrote stress along band to %s' % output_csv)
 odb.close()
