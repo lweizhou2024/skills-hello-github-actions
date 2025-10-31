@@ -26,13 +26,10 @@ print('Opening ODB:', odb_path)
 odb = openOdb(path=odb_path)
 root_assembly = odb.rootAssembly
 
-# --- robust node set extraction (handles instance-level node sets) ---
-
-# find the node set (could be at root or in instance)
+# --- ultra-robust node set extraction ---
 def get_node_set(assembly, name):
     if name in assembly.nodeSets:
         return assembly.nodeSets[name]
-    # search inside instances
     for instName, inst in assembly.instances.items():
         if name in inst.nodeSets:
             return inst.nodeSets[name]
@@ -45,52 +42,74 @@ if nodeSet is None:
     odb.close()
     sys.exit(1)
 
-# collect coordinates and labels
-nodes_coords = {}   # nodeLabel -> np.array([x,y])
+nodes_coords = {}
 node_labels = set()
 
-# nodeSet.nodes may exist (list of MeshNode objects)
-if hasattr(nodeSet, 'nodes') and nodeSet.nodes:
-    for n in nodeSet.nodes:
+def add_nodes(node_sequence):
+    """Helper: add Abaqus node objects to nodes_coords dict."""
+    for n in node_sequence:
         try:
+            xy = np.array(n.coordinates[:2])
+            nodes_coords[n.label] = xy
             node_labels.add(n.label)
-            nodes_coords[n.label] = np.array(n.coordinates[:2])
         except Exception:
             pass
 
-# otherwise, nodeSet may store data per instance
-if hasattr(nodeSet, 'nodes') and not nodes_coords:
-    # some Abaqus versions store dict of instanceName -> sequence of nodes
-    try:
-        for instName, nodeSeq in nodeSet.nodes.items():
-            inst = root_assembly.instances[instName]
-            for n in nodeSeq:
-                node_labels.add(n.label)
-                nodes_coords[n.label] = np.array(n.coordinates[:2])
-    except Exception:
-        pass
+# try several known data structures
+try:
+    # 1️⃣ direct list of MeshNode objects
+    if hasattr(nodeSet, 'nodes') and isinstance(nodeSet.nodes, (list, tuple)):
+        # sometimes nested tuple like ((node1,node2,...),)
+        if len(nodeSet.nodes) > 0 and isinstance(nodeSet.nodes[0], (list, tuple)):
+            for sub in nodeSet.nodes:
+                add_nodes(sub)
+        else:
+            add_nodes(nodeSet.nodes)
 
-# fallback: instance-level sets sometimes only have labels
-if not nodes_coords:
-    # iterate over all instances to collect coordinates by label in set
-    if hasattr(nodeSet, 'nodeLabels') and nodeSet.nodeLabels:
-        node_labels = set(nodeSet.nodeLabels)
+    # 2️⃣ dictionary of instanceName → node sequence
     elif hasattr(nodeSet, 'nodes') and isinstance(nodeSet.nodes, dict):
         for instName, seq in nodeSet.nodes.items():
-            for n in seq:
-                node_labels.add(n.label)
-    if node_labels:
-        for instName, inst in root_assembly.instances.items():
-            for n in inst.nodes:
-                if n.label in node_labels:
-                    nodes_coords[n.label] = np.array(n.coordinates[:2])
+            add_nodes(seq)
+
+    # 3️⃣ some CAE node sets store ((instance, nodeList), ...)
+    elif hasattr(nodeSet, 'nodes'):
+        maybe_tuple = nodeSet.nodes
+        try:
+            for entry in maybe_tuple:
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    _, nodeSeq = entry
+                    add_nodes(nodeSeq)
+        except Exception:
+            pass
+
+    # 4️⃣ fallback using nodeLabels
+    if not nodes_coords and hasattr(nodeSet, 'nodeLabels'):
+        labels = []
+        # nodeLabels may be dict or list
+        if isinstance(nodeSet.nodeLabels, dict):
+            for instName, lbls in nodeSet.nodeLabels.items():
+                labels += list(lbls)
+                inst = root_assembly.instances[instName]
+                for n in inst.nodes:
+                    if n.label in lbls:
+                        add_nodes([n])
+        elif isinstance(nodeSet.nodeLabels, (list, tuple)):
+            labels += list(nodeSet.nodeLabels)
+            for instName, inst in root_assembly.instances.items():
+                for n in inst.nodes:
+                    if n.label in labels:
+                        add_nodes([n])
+except Exception as e:
+    print("Error while extracting nodes:", e)
 
 if len(nodes_coords) == 0:
-    print('Could not extract any node coordinates from set "%s".' % node_set_name)
+    print('❌ Could not extract any node coordinates from node set "%s".' % node_set_name)
+    print('Type of nodeSet.nodes:', type(nodeSet.nodes))
     odb.close()
     sys.exit(1)
 
-print('Collected %d nodes from node set "%s".' % (len(nodes_coords), node_set_name))
+print('✅ Collected %d nodes from node set "%s".' % (len(nodes_coords), node_set_name))
+
 
 
 # 1) collect node coords and labels from the node set
