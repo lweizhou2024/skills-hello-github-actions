@@ -1,295 +1,112 @@
-# band_centerline_stress.py
-# Run with: abaqus python band_centerline_stress.py
+%% ---------- INPUT ----------
+% Your five arrays (each n×2)
+% A1, A2, A3, A4, A5
 
-from odbAccess import openOdb
-from abaqusConstants import NODAL
-import numpy as np
-import csv
-import sys
-import math
+arrays = {A1, A2, A3, A4, A5};
 
-# --------------------- USER INPUT ---------------------
-odb_path = 'TGO_on_si_uniform_1_vert.odb'             # <-- change
-step_name = 'Step-1'                   # <-- change
-frame_num = -1                         # last frame
-node_set_name = 'TGOSET'          # <-- change: should contain edge nodes for the band
-output_csv = 'band_centerline_stress.csv'
-tgonode_file = 'tgonodes.txt'
+% Column names (10 names for X1,Y1, ..., X5,Y5)
+colNames = {'X1','Y1','X2','Y2','X3','Y3','X4','Y4','X5','Y5'};
 
-# algorithm parameters (tune if needed)
-sample_count = None    # None => auto (see below), otherwise integer number of centerline sample points
-window_factor = 1.5    # how wide the sliding window is relative to sample spacing
-k_interp = 8           # number of nearest nodes used to interpolate stress to centerline
-power_idw = 2.0        # inverse-distance weighting power
-# ------------------------------------------------------
+file  = 'test.xlsx';
+sheet = 'Sheet1';
 
-print('Opening ODB:', odb_path)
-odb = openOdb(path=odb_path)
-root_assembly = odb.rootAssembly
-nodeSet=root_assembly.nodeSets[node_set_name]
-
-# --- read node labels from file ---
-node_labels = set()
-with open(tgonode_file, 'r') as f:
-    for line in f:
-        for tok in line.replace(',', ' ').split():
-            try:
-                node_labels.add(int(tok))
-            except:
-                pass
-print('Read %d node labels from %s' % (len(node_labels), tgonode_file))
-
-# --- get coordinates for these nodes from ODB ---
-nodes_coords = {}
-for instName, inst in root_assembly.instances.items():
-    for n in inst.nodes:
-        if n.label in node_labels:
-            nodes_coords[n.label] = np.array(n.coordinates[:2])
-
-if len(nodes_coords) == 0:
-    print('Could not match any nodes from file in the ODB.')
-    odb.close()
-    sys.exit(1)
-print('Collected %d nodes from ODB.' % len(nodes_coords))
+%% ---------- WRITE HEADER ROW ----------
+% Write header names starting at column A row 1
+xlswrite(file, colNames, sheet, 'A1');
 
 
+%% ---------- WRITE THE FIVE ARRAYS ----------
+% A1 → columns 1–2  (A:B)
+% A2 → columns 4–5  (D:E)
+% A3 → columns 7–8  (G:H)
+% A4 → columns 10–11 (J:K)
+% A5 → columns 13–14 (M:N)
 
-# assemble arrays
-node_labels_list = sorted(nodes_coords.keys())
-coords = np.array([nodes_coords[l] for l in node_labels_list])  # Nx2
+colStarts = [1 4 7 10 13];   % starting columns for each array
 
-Nnodes = coords.shape[0]
-print('Collected %d nodes from node set.' % Nnodes)
+for i = 1:5
+    C = arrays{i};
+    r0 = 2;  % row to start writing numbers (leave row 1 for headers)
 
-# 2) compute principal axis of band (PCA) and parameter t along main axis
-mean_coords = coords.mean(axis=0)
-# covariance and eigen decomposition
-C = np.cov((coords - mean_coords).T)
-eigvals, eigvecs = np.linalg.eigh(C)
-# largest eigenvector (principal direction)
-idx_max = np.argmax(eigvals)
-u = eigvecs[:, idx_max]  # unit (maybe not exactly unit)
-u = u / np.linalg.norm(u)
-# perpendicular direction (2D)
-n = np.array([-u[1], u[0]])
+    % Convert numeric column to Excel letter using your function
+    col1 = num2xlcol(colStarts(i));       % X column
+    col2 = num2xlcol(colStarts(i)+1);     % Y column
 
-# project coords onto axis to get scalar parameter t
-tvals = np.dot(coords - mean_coords, u)
-t_min, t_max = tvals.min(), tvals.max()
-t_range = t_max - t_min
-if t_range <= 0:
-    print('Zero length along principal axis, abort.')
-    odb.close()
-    sys.exit(1)
+    range1 = sprintf('%s%d', col1, r0);
+    range2 = sprintf('%s%d', col2, r0);
 
-# decide sample_count if not provided
-if sample_count is None:
-    sample_count = min(300, max(50, int(max(30, Nnodes // 4))))
-print('Using sample_count =', sample_count)
+    % Write both columns together (n×2)
+    xlswrite(file, C, sheet, range1);
+end
 
-# build sample positions evenly in t
-t_samples = np.linspace(t_min, t_max, sample_count)
 
-# sliding window width
-if sample_count > 1:
-    sample_spacing = (t_max - t_min) / (sample_count - 1)
-else:
-    sample_spacing = t_range
-window_half = window_factor * sample_spacing
+%% ---------- CREATE THE EXCEL CHART ----------
+Excel = actxserver('Excel.Application');
+Excel.Visible = false;   % optional
+WB = Excel.Workbooks.Open(fullfile(pwd, file));
+WS = WB.Worksheets.Item(sheet);
 
-center_pts = []       # list of centerline points (x,y)
-center_t = []         # t parameter for each center point
-widths = []           # local width (distance between two edge centroids)
-valid_sample_count = 0
+% Add scatter chart
+shape = WS.Shapes.AddChart2(240, 'xlXYScatter');
+chart = shape.Chart;
 
-# For each sample t0, take nodes within window, split by sign of projection onto n (perp direction)
-for t0 in t_samples:
-    # nodes where |t - t0| <= window_half
-    idx = np.where(np.abs(tvals - t0) <= window_half)[0]
-    if idx.size < 6:
-        # too few nodes in window; optionally expand window or skip
-        idx = np.where(np.abs(tvals - t0) <= 2.5 * window_half)[0]
-    if idx.size < 6:
-        # still too few nodes; skip this sample
-        continue
-    local_coords = coords[idx]
-    local_mean = local_coords.mean(axis=0)
-    # project local nodes onto perpendicular direction n
-    perp_proj = np.dot(local_coords - local_mean, n)
-    # split by sign
-    sideA_idx = np.where(perp_proj >= 0)[0]
-    sideB_idx = np.where(perp_proj < 0)[0]
-    if sideA_idx.size == 0 or sideB_idx.size == 0:
-        # fallback: attempt k-means-ish split by sorting along perp_proj and split half-half
-        order = np.argsort(perp_proj)
-        half = order.size // 2
-        sideA_idx = order[:half]
-        sideB_idx = order[half:]
-        if sideA_idx.size == 0 or sideB_idx.size == 0:
-            continue
-    # centroids of sides (in global coords)
-    cA = local_coords[sideA_idx].mean(axis=0)
-    cB = local_coords[sideB_idx].mean(axis=0)
-    center = 0.5 * (cA + cB)
-    width = np.linalg.norm(cA - cB)
-    center_pts.append(center)
-    center_t.append(t0)
-    widths.append(width)
-    valid_sample_count += 1
 
-if valid_sample_count < 4:
-    print('Could not build enough centerline points (%d). Try increasing window or check node set.' % valid_sample_count)
-    odb.close()
-    sys.exit(1)
+%% ---------- SCATTER SERIES FOR ARRAYS 1–4 ----------
+for i = 1:4
+    c1 = colStarts(i);
+    c2 = colStarts(i)+1;
 
-center_pts = np.array(center_pts)   # Mx2
-center_t = np.array(center_t)
-widths = np.array(widths)
+    Xcol = num2xlcol(c1);
+    Ycol = num2xlcol(c2);
 
-# sort center points by their projection along u (since t_samples are ordered, this usually already ordered)
-proj_center = np.dot(center_pts - mean_coords, u)
-order = np.argsort(proj_center)
-center_pts = center_pts[order]
-proj_center = proj_center[order]
-widths = widths[order]
+    % Excel ranges for entire column below row 2
+    Xrng = sprintf('%s2:%s1048576', Xcol, Xcol);
+    Yrng = sprintf('%s2:%s1048576', Ycol, Ycol);
 
-# compute arclength along centerline by cumulative distance
-M = center_pts.shape[0]
-dists = np.zeros(M)
-for i in range(1, M):
-    dists[i] = np.linalg.norm(center_pts[i] - center_pts[i-1])
-arclength = np.cumsum(dists)
-# normalize arclength to start at zero
-arclength = arclength - arclength[0]
+    series = chart.SeriesCollection.NewSeries;
+    series.XValues = WS.Range(Xrng);
+    series.Values  = WS.Range(Yrng);
+    series.ChartType = 'xlXYScatter';
+    series.Name = sprintf('Array %d', i);
+end
 
-# 3) read nodal stresses (extrapolated nodal S)
-step=odb.steps[step_name]
-frame = step.frames[frame_num]
 
-if 'S' not in frame.fieldOutputs.keys():
-    print('Stress field S not found in frame. Available fields:', frame.fieldOutputs.keys())
-    odb.close()
-    sys.exit(1)
-Sfield = frame.fieldOutputs['S']
+%% ---------- LINE SERIES FOR ARRAY 5 (SECONDARY AXIS) ----------
+c1 = colStarts(5);
+c2 = colStarts(5)+1;
 
-# ask for nodal subset for the node set
-S_nodal_subset = Sfield.getSubset(region=nodeSet, position=NODAL)
+Xcol = num2xlcol(c1);
+Ycol = num2xlcol(c2);
 
-# build node_label -> stress tensor (2x2) mapping (average if multiple values)
-stress_by_node = {}
-count_by_node = {}
-for v in S_nodal_subset.values:
-    lab = v.nodeLabel
-    data = v.data  # (S11,S22,S33,S12,S13,S23)
-    s11 = data[0]
-    s22 = data[1]
-    s12 = data[3]
-    Smat = np.array([[s11, s12],
-                     [s12, s22]], dtype=float)
-    if lab in stress_by_node:
-        stress_by_node[lab] += Smat
-        count_by_node[lab] += 1
-    else:
-        stress_by_node[lab] = Smat.copy()
-        count_by_node[lab] = 1
+Xrng = sprintf('%s2:%s1048576', Xcol, Xcol);
+Yrng = sprintf('%s2:%s1048576', Ycol, Ycol);
 
-# finalize average
-for lab in list(stress_by_node.keys()):
-    stress_by_node[lab] /= float(count_by_node[lab])
+series5 = chart.SeriesCollection.NewSeries;
+series5.XValues = WS.Range(Xrng);
+series5.Values  = WS.Range(Yrng);
+series5.ChartType = 'xlLine';
+series5.AxisGroup = 2;       % secondary axis
+series5.Name = 'Array 5';
 
-# map final node coords and stresses to arrays
-node_coords_list = []
-node_stress_list = []
-node_label_for_array = []
-for lab in node_labels_list:
-    if lab in nodes_coords and lab in stress_by_node:
-        node_coords_list.append(nodes_coords[lab])
-        node_stress_list.append(stress_by_node[lab])
-        node_label_for_array.append(lab)
-node_coords_arr = np.array(node_coords_list)   # Kx2
-node_stress_arr = np.array(node_stress_list)  # Kx2x2
 
-K = node_coords_arr.shape[0]
-if K == 0:
-    print('No nodes had both coords and nodal stress data. Exiting.')
-    odb.close()
-    sys.exit(1)
-print('Using %d nodal stress points for interpolation.' % K)
+%% ---------- TITLES & LEGEND ----------
+chart.HasTitle = true;
+chart.ChartTitle.Text = 'Scatter + Line Combined Chart';
 
-# helper: interpolate stress at a query point using inverse-distance weighted average of nearest k nodes
-def interp_stress_at_point(qpt, k=k_interp, power=power_idw):
-    # compute distances
-    d = np.linalg.norm(node_coords_arr - qpt.reshape((1,2)), axis=1)
-    # if any distance is zero -> return that node's stress
-    zero_idx = np.where(d < 1e-12)[0]
-    if zero_idx.size > 0:
-        return node_stress_arr[int(zero_idx[0])]
-    # find k nearest
-    k_use = min(k, K)
-    idxs = np.argsort(d)[:k_use]
-    ds = d[idxs]
-    # weights
-    with np.errstate(divide='ignore'):
-        w = 1.0 / (ds**power)
-    # normalize
-    w_sum = np.sum(w)
-    if w_sum <= 0:
-        # fallback: simple average
-        return node_stress_arr[idxs].mean(axis=0)
-    w = w / w_sum
-    # weighted sum of stress tensors
-    S_interp = np.tensordot(w, node_stress_arr[idxs], axes=(0,0))
-    return S_interp
+chart.Axes(1).HasTitle = true;
+chart.Axes(1).AxisTitle.Text = 'X Axis';
 
-# 4) for each centerline point, interpolate stress, compute tangent and longitudinal stress
-sigma_long = np.zeros(M)
-tangents = np.zeros((M,2))
+chart.Axes(2).HasTitle = true;
+chart.Axes(2).AxisTitle.Text = 'Left Y (Scatter)';
 
-for i in range(M):
-    # tangent via finite difference on center_pts
-    if i == 0:
-        vec = center_pts[1] - center_pts[0]
-    elif i == M-1:
-        vec = center_pts[-1] - center_pts[-2]
-    else:
-        vec = center_pts[i+1] - center_pts[i-1]
-    norm = np.linalg.norm(vec)
-    if norm < 1e-12:
-        t = np.array([1.0, 0.0])
-    else:
-        t = vec / norm
-    tangents[i] = t
-    # interpolate stress at center point
-    S_interp = interp_stress_at_point(center_pts[i])
-    # compute longitudinal stress t^T S t
-    tcol = t.reshape((2,1))
-    sigma_long[i] = float(np.dot(tcol.T, np.dot(S_interp, tcol)))
+chart.Axes(2,2).HasTitle = true;
+chart.Axes(2,2).AxisTitle.Text = 'Right Y (Array 5)';
 
-# find midpoint along arclength (mid-length center)
-total_length = arclength[-1]
-mid_s = 0.5 * total_length
-idx_mid = int(np.argmin(np.abs(arclength - mid_s)))
-center_mid_info = {
-    'index': idx_mid,
-    'x': float(center_pts[idx_mid,0]),
-    'y': float(center_pts[idx_mid,1]),
-    'arclength': float(arclength[idx_mid]),
-    'sigma_long': float(sigma_long[idx_mid]),
-    'width': float(widths[idx_mid])
-}
+chart.HasLegend = true;
 
-# write CSV
-with open(output_csv, 'w', newline='') as csvfile:
-    writer = csv.writer(csvfile)
-    writer.writerow(['idx','x','y','arclength','width','t_x','t_y','sigma_long'])
-    for i in range(M):
-        writer.writerow([i, float(center_pts[i,0]), float(center_pts[i,1]), float(arclength[i]), float(widths[i]), float(tangents[i,0]), float(tangents[i,1]), float(sigma_long[i])])
 
-print('Wrote CSV:', output_csv)
-print('Number of centerline sample points:', M)
-print('Total centerline arclength:', total_length)
-print('Center-at-mid-length:')
-for k,v in center_mid_info.items():
-    print('  %s: %s' % (k,v))
-
-odb.close()
+%% ---------- SAVE AND CLOSE ----------
+WB.Save;
+WB.Close;
+Excel.Quit;
+delete(Excel);
