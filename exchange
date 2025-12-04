@@ -1,112 +1,50 @@
-%% ---------- INPUT ----------
-% Your five arrays (each n×2)
-% A1, A2, A3, A4, A5
+numLevels = 40;
+cmin = 300;
+cmax = 1400;
 
-arrays = {A1, A2, A3, A4, A5};
+edges = linspace(cmin, cmax, numLevels+1);
 
-% Column names (10 names for X1,Y1, ..., X5,Y5)
-colNames = {'X1','Y1','X2','Y2','X3','Y3','X4','Y4','X5','Y5'};
+% Quantize the data
+data_q = discretize(data, edges);
 
-file  = 'test.xlsx';
-sheet = 'Sheet1';
+% Display quantized image
+imagesc(data_q);
+colormap(jet(numLevels));
+caxis([1 numLevels]);
+colorbar('Ticks', linspace(1,numLevels,5), ...
+         'TickLabels', round(linspace(cmin,cmax,5)));
+axis image off;
 
-%% ---------- WRITE HEADER ROW ----------
-% Write header names starting at column A row 1
-xlswrite(file, colNames, sheet, 'A1');
 
+v = VideoWriter('temp.avi');
+open(v);
 
-%% ---------- WRITE THE FIVE ARRAYS ----------
-% A1 → columns 1–2  (A:B)
-% A2 → columns 4–5  (D:E)
-% A3 → columns 7–8  (G:H)
-% A4 → columns 10–11 (J:K)
-% A5 → columns 13–14 (M:N)
+cmin = 300;
+cmax = 1400;
 
-colStarts = [1 4 7 10 13];   % starting columns for each array
+fig = figure('Units','pixels','Position',[100 100 700 525],'Resize','off');
+ax = axes('Parent',fig);
 
-for i = 1:5
-    C = arrays{i};
-    r0 = 2;  % row to start writing numbers (leave row 1 for headers)
+% read first frame
+data = dlmread(files{1});
+im = imagesc(ax, data);
+colormap(jet);
+caxis([cmin cmax]);
+colorbar;
+axis image off;
 
-    % Convert numeric column to Excel letter using your function
-    col1 = num2xlcol(colStarts(i));       % X column
-    col2 = num2xlcol(colStarts(i)+1);     % Y column
+tt = title('');
 
-    range1 = sprintf('%s%d', col1, r0);
-    range2 = sprintf('%s%d', col2, r0);
+for i = 1:N
+    data = dlmread(files{i});
 
-    % Write both columns together (n×2)
-    xlswrite(file, C, sheet, range1);
+    % only update the image data
+    im.CData = data;
+
+    tt.String = sprintf('Frame %d', i);
+
+    drawnow limitrate nocallbacks; % fastest
+    writeVideo(v, getframe(fig));
 end
 
-
-%% ---------- CREATE THE EXCEL CHART ----------
-Excel = actxserver('Excel.Application');
-Excel.Visible = false;   % optional
-WB = Excel.Workbooks.Open(fullfile(pwd, file));
-WS = WB.Worksheets.Item(sheet);
-
-% Add scatter chart
-shape = WS.Shapes.AddChart2(240, 'xlXYScatter');
-chart = shape.Chart;
-
-
-%% ---------- SCATTER SERIES FOR ARRAYS 1–4 ----------
-for i = 1:4
-    c1 = colStarts(i);
-    c2 = colStarts(i)+1;
-
-    Xcol = num2xlcol(c1);
-    Ycol = num2xlcol(c2);
-
-    % Excel ranges for entire column below row 2
-    Xrng = sprintf('%s2:%s1048576', Xcol, Xcol);
-    Yrng = sprintf('%s2:%s1048576', Ycol, Ycol);
-
-    series = chart.SeriesCollection.NewSeries;
-    series.XValues = WS.Range(Xrng);
-    series.Values  = WS.Range(Yrng);
-    series.ChartType = 'xlXYScatter';
-    series.Name = sprintf('Array %d', i);
-end
-
-
-%% ---------- LINE SERIES FOR ARRAY 5 (SECONDARY AXIS) ----------
-c1 = colStarts(5);
-c2 = colStarts(5)+1;
-
-Xcol = num2xlcol(c1);
-Ycol = num2xlcol(c2);
-
-Xrng = sprintf('%s2:%s1048576', Xcol, Xcol);
-Yrng = sprintf('%s2:%s1048576', Ycol, Ycol);
-
-series5 = chart.SeriesCollection.NewSeries;
-series5.XValues = WS.Range(Xrng);
-series5.Values  = WS.Range(Yrng);
-series5.ChartType = 'xlLine';
-series5.AxisGroup = 2;       % secondary axis
-series5.Name = 'Array 5';
-
-
-%% ---------- TITLES & LEGEND ----------
-chart.HasTitle = true;
-chart.ChartTitle.Text = 'Scatter + Line Combined Chart';
-
-chart.Axes(1).HasTitle = true;
-chart.Axes(1).AxisTitle.Text = 'X Axis';
-
-chart.Axes(2).HasTitle = true;
-chart.Axes(2).AxisTitle.Text = 'Left Y (Scatter)';
-
-chart.Axes(2,2).HasTitle = true;
-chart.Axes(2,2).AxisTitle.Text = 'Right Y (Array 5)';
-
-chart.HasLegend = true;
-
-
-%% ---------- SAVE AND CLOSE ----------
-WB.Save;
-WB.Close;
-Excel.Quit;
-delete(Excel);
+close(v);
