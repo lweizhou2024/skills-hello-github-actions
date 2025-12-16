@@ -1,50 +1,14 @@
-numLevels = 40;
-cmin = 300;
-cmax = 1400;
+import ast
 
-edges = linspace(cmin, cmax, numLevels+1);
+def safe_load_like_yaml(filehandler):
+    lines = [line.strip() for line in filehandler if line.strip()]
 
-% Quantize the data
-data_q = discretize(data, edges);
+    title = lines[0]
+    result = {}
 
-% Display quantized image
-imagesc(data_q);
-colormap(jet(numLevels));
-caxis([1 numLevels]);
-colorbar('Ticks', linspace(1,numLevels,5), ...
-         'TickLabels', round(linspace(cmin,cmax,5)));
-axis image off;
+    for line in lines[1:]:
+        key, body = line.split(":", 1)
+        result[key.strip()] = ast.literal_eval(body.strip())
 
-
-v = VideoWriter('temp.avi');
-open(v);
-
-cmin = 300;
-cmax = 1400;
-
-fig = figure('Units','pixels','Position',[100 100 700 525],'Resize','off');
-ax = axes('Parent',fig);
-
-% read first frame
-data = dlmread(files{1});
-im = imagesc(ax, data);
-colormap(jet);
-caxis([cmin cmax]);
-colorbar;
-axis image off;
-
-tt = title('');
-
-for i = 1:N
-    data = dlmread(files{i});
-
-    % only update the image data
-    im.CData = data;
-
-    tt.String = sprintf('Frame %d', i);
-
-    drawnow limitrate nocallbacks; % fastest
-    writeVideo(v, getframe(fig));
-end
-
-close(v);
+    # mimic yaml.safe_load(...)[titlestring]
+    return {title: result}
