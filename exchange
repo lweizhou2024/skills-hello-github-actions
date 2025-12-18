@@ -70,3 +70,33 @@ for k = 1:numel(curves)
 end
 axis equal
 
+
+
+
+
+%%%%%%%%%%%%%%%%%
+tol = 1e-6;
+
+P = reshape(segments, [], 3);  % all endpoints
+N = size(P,1);
+
+% Distance matrix (sparse)
+A = sparse(N,N);
+for i = 1:N
+    for j = i+1:N
+        if norm(P(i,:) - P(j,:)) < tol
+            A(i,j) = 1;
+            A(j,i) = 1;
+        end
+    end
+end
+
+% Graph and connected components
+G = graph(A);
+bins = conncomp(G);
+
+% Group points by component
+curves = cell(max(bins),1);
+for k = 1:max(bins)
+    curves{k} = P(bins==k,:);
+end
