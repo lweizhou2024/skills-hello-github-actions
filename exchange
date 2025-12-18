@@ -1,14 +1,53 @@
-import ast
+% Point cloud
+pc = load('pointcloud.txt');   % [x y z value]
+X = pc(:,1);
+Y = pc(:,2);
+Z = pc(:,3);
+V = pc(:,4);
 
-def safe_load_like_yaml(filehandler):
-    lines = [line.strip() for line in filehandler if line.strip()]
+% Polyline vertices
+pl = load('polyline.txt');     % [x y z]
+XP = pl(:,1);
+YP = pl(:,2);
+ZP = pl(:,3);
 
-    title = lines[0]
-    result = {}
+nFill = 10;    % number of points BETWEEN vertices
+F = scatteredInterpolant(X, Y, Z, V, 'linear', 'nearest');
+dist = 0;          % cumulative distance
+D = [];            % distance array
+VAL = [];          % value array
 
-    for line in lines[1:]:
-        key, body = line.split(":", 1)
-        result[key.strip()] = ast.literal_eval(body.strip())
+for i = 1:length(XP)-1
+    % Start and end of segment
+    p0 = [XP(i),   YP(i),   ZP(i)];
+    p1 = [XP(i+1), YP(i+1), ZP(i+1)];
 
-    # mimic yaml.safe_load(...)[titlestring]
-    return {title: result}
+    % Generate points (exclude first point to avoid duplicates)
+    t = linspace(0, 1, nFill+2);
+    t = t(2:end);
+
+    for k = 1:length(t)
+        % Interpolated point
+        p = p0 + t(k)*(p1 - p0);
+
+        % Distance increment
+        if isempty(D)
+            ds = 0;
+        else
+            ds = norm(p - p_prev);
+        end
+
+        dist = dist + ds;
+
+        % Interpolated value
+        val = F(p(1), p(2), p(3));
+
+        % Store
+        D(end+1,1) = dist;
+        VAL(end+1,1) = val;
+
+        p_prev = p;
+    end
+end
+result = table(D, VAL, 'VariableNames', {'Distance', 'Value'});
+writetable(result, 'distance_vs_value.txt');
