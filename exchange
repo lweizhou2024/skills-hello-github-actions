@@ -1,102 +1,19 @@
-z0 = 10.0;
-n = [0 0 1];
-p0 = [0 0 z0];
-n = n / norm(n);   % normal
-p0 = [x0 y0 z0];   % point on plane
-d = -dot(n, p0);
-segments = [];
+dcm = datacursormode(gcf);
+set(dcm,'Enable','on');
+set(dcm,'UpdateFcn',@(src,evt) myDataTipFcn(src,evt,Vs,TR));
+function txt = myDataTipFcn(~, event_obj, Vs, TR)
 
-for i = 1:size(F,1)
-    tri = V(F(i,:),:);   % 3x3 triangle vertices
-    
-    % signed distances to plane
-    sd = tri*n' + d;
+    pos = event_obj.Position;   % [x y z]
 
-    % check if plane intersects triangle
-    if max(sd) >= 0 && min(sd) <= 0
-        % find edges that cross the plane
-        pts = [];
-        for e = [1 2; 2 3; 3 1]'
-            s1 = sd(e(1));
-            s2 = sd(e(2));
-            if s1*s2 < 0 || s1 == 0
-                t = s1 / (s1 - s2);
-                p = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
-                pts(end+1,:) = p;
-            end
-        end
+    % Find nearest vertex
+    idx = nearestNeighbor(TR, pos);
 
-        if size(pts,1) == 2
-            segments(end+1,:,:) = pts;
-        end
-    end
-end
-tol = 1e-6;
-curves = {};
-used = false(size(segments,1),1);
+    value = Vs(idx);
 
-for i = 1:size(segments,1)
-    if used(i), continue; end
-    curve = squeeze(segments(i,:,:));
-    used(i) = true;
-
-    changed = true;
-    while changed
-        changed = false;
-        for j = 1:size(segments,1)
-            if used(j), continue; end
-            s = squeeze(segments(j,:,:));
-
-            if norm(curve(end,:) - s(1,:)) < tol
-                curve = [curve; s(2,:)];
-            elseif norm(curve(end,:) - s(2,:)) < tol
-                curve = [curve; s(1,:)];
-            else
-                continue;
-            end
-
-            used(j) = true;
-            changed = true;
-        end
-    end
-
-    curves{end+1} = curve;
-end
-figure
-trisurf(TR,'FaceAlpha',0.2,'EdgeColor','none')
-hold on
-for k = 1:numel(curves)
-    plot3(curves{k}(:,1),curves{k}(:,2),curves{k}(:,3),'r','LineWidth',2)
-end
-axis equal
-
-
-
-
-
-%%%%%%%%%%%%%%%%%
-tol = 1e-6;
-
-P = reshape(segments, [], 3);  % all endpoints
-N = size(P,1);
-
-% Distance matrix (sparse)
-A = sparse(N,N);
-for i = 1:N
-    for j = i+1:N
-        if norm(P(i,:) - P(j,:)) < tol
-            A(i,j) = 1;
-            A(j,i) = 1;
-        end
-    end
-end
-
-% Graph and connected components
-G = graph(A);
-bins = conncomp(G);
-
-% Group points by component
-curves = cell(max(bins),1);
-for k = 1:max(bins)
-    curves{k} = P(bins==k,:);
+    txt = {
+        ['X: ', num2str(pos(1))]
+        ['Y: ', num2str(pos(2))]
+        ['Z: ', num2str(pos(3))]
+        ['Value: ', num2str(value)]
+    };
 end
