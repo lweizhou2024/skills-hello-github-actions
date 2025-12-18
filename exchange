@@ -1,53 +1,72 @@
-% Point cloud
-pc = load('pointcloud.txt');   % [x y z value]
-X = pc(:,1);
-Y = pc(:,2);
-Z = pc(:,3);
-V = pc(:,4);
+z0 = 10.0;
+n = [0 0 1];
+p0 = [0 0 z0];
+n = n / norm(n);   % normal
+p0 = [x0 y0 z0];   % point on plane
+d = -dot(n, p0);
+segments = [];
 
-% Polyline vertices
-pl = load('polyline.txt');     % [x y z]
-XP = pl(:,1);
-YP = pl(:,2);
-ZP = pl(:,3);
+for i = 1:size(F,1)
+    tri = V(F(i,:),:);   % 3x3 triangle vertices
+    
+    % signed distances to plane
+    sd = tri*n' + d;
 
-nFill = 10;    % number of points BETWEEN vertices
-F = scatteredInterpolant(X, Y, Z, V, 'linear', 'nearest');
-dist = 0;          % cumulative distance
-D = [];            % distance array
-VAL = [];          % value array
-
-for i = 1:length(XP)-1
-    % Start and end of segment
-    p0 = [XP(i),   YP(i),   ZP(i)];
-    p1 = [XP(i+1), YP(i+1), ZP(i+1)];
-
-    % Generate points (exclude first point to avoid duplicates)
-    t = linspace(0, 1, nFill+2);
-    t = t(2:end);
-
-    for k = 1:length(t)
-        % Interpolated point
-        p = p0 + t(k)*(p1 - p0);
-
-        % Distance increment
-        if isempty(D)
-            ds = 0;
-        else
-            ds = norm(p - p_prev);
+    % check if plane intersects triangle
+    if max(sd) >= 0 && min(sd) <= 0
+        % find edges that cross the plane
+        pts = [];
+        for e = [1 2; 2 3; 3 1]'
+            s1 = sd(e(1));
+            s2 = sd(e(2));
+            if s1*s2 < 0 || s1 == 0
+                t = s1 / (s1 - s2);
+                p = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
+                pts(end+1,:) = p;
+            end
         end
 
-        dist = dist + ds;
-
-        % Interpolated value
-        val = F(p(1), p(2), p(3));
-
-        % Store
-        D(end+1,1) = dist;
-        VAL(end+1,1) = val;
-
-        p_prev = p;
+        if size(pts,1) == 2
+            segments(end+1,:,:) = pts;
+        end
     end
 end
-result = table(D, VAL, 'VariableNames', {'Distance', 'Value'});
-writetable(result, 'distance_vs_value.txt');
+tol = 1e-6;
+curves = {};
+used = false(size(segments,1),1);
+
+for i = 1:size(segments,1)
+    if used(i), continue; end
+    curve = squeeze(segments(i,:,:));
+    used(i) = true;
+
+    changed = true;
+    while changed
+        changed = false;
+        for j = 1:size(segments,1)
+            if used(j), continue; end
+            s = squeeze(segments(j,:,:));
+
+            if norm(curve(end,:) - s(1,:)) < tol
+                curve = [curve; s(2,:)];
+            elseif norm(curve(end,:) - s(2,:)) < tol
+                curve = [curve; s(1,:)];
+            else
+                continue;
+            end
+
+            used(j) = true;
+            changed = true;
+        end
+    end
+
+    curves{end+1} = curve;
+end
+figure
+trisurf(TR,'FaceAlpha',0.2,'EdgeColor','none')
+hold on
+for k = 1:numel(curves)
+    plot3(curves{k}(:,1),curves{k}(:,2),curves{k}(:,3),'r','LineWidth',2)
+end
+axis equal
+
