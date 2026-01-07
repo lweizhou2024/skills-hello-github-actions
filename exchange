@@ -56,3 +56,21 @@ freq(freq < 1e-6) = [];
 
 disp('Natural frequencies (Hz):');
 disp(freq(1:5))
+%% -----------------------------
+% 8. Plot first bending mode
+% -----------------------------
+xplot = linspace(0,L,400);
+w1 = zeros(size(xplot));
+
+mode = 1;  % first bending mode
+for i = 1:N
+    w1 = w1 + vec(i,idx(mode))*phi(i,xplot);
+end
+
+w1 = w1/max(abs(w1));
+
+figure;
+plot(xplot,w1,'LineWidth',2)
+xlabel('x'); ylabel('Mode shape')
+title('First bending mode (free–free)')
+grid on
