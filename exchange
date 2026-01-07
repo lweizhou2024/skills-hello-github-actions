@@ -1,70 +1,82 @@
-%% Non-dimensional free–free Euler–Bernoulli beam
+%% Non-dimensional free-free Euler-Bernoulli beam
 clear; clc;
 
 %% -----------------------------
-% Physical parameters (mm–MPa–ton)
-% -----------------------------
-L   = 100;                  % length [mm]
-b   = 10;                   % width [mm]
-E   = 210000;               % MPa = N/mm^2
-rho = 7.8e-9;               % ton/mm^3
-
-% Thickness polynomial h(x) = a3 x^3 + a2 x^2 + a1 x + a0
-a0 = 1.0;  a1 = 0;  a2 = 0;  a3 = 0;
-p  = [a3 a2 a1 a0];
+% Beam geometry & material
+%% -----------------------------
+L = 100;           % mm
+b = 10;            % mm
+h0 = 1;            % mm, uniform thickness
+E = 210e3;         % MPa
+rho = 7.8e-9;      % ton/mm^3 (steel)
 
 %% -----------------------------
-% Reference section (for scaling)
-% -----------------------------
-h0 = a0;
+% Total mass
+%% -----------------------------
 A0 = b*h0;
-I0 = b*h0^3/12;
+V = L*A0;                  % volume
+M_actual = rho * V;        % total mass in tons
+
+% Mass per unit width for code (since Abar = hbar)
+M_tot = M_actual / b;
 
 %% -----------------------------
-% Non-dimensional coordinate
-% -----------------------------
-hbar = @(xi) polyval(p,xi*L)/h0;
-Abar = @(xi) hbar(xi);
-Ibar = @(xi) hbar(xi).^3;
+% Thickness polynomial (uniform)
+%% -----------------------------
+a0 = h0; a1 = 0; a2 = 0; a3 = 0;
+p = [a3 a2 a1 a0];
+
+% Non-dimensional thickness
+hbar = @(xi) polyval(p, xi*L)/h0;
+Abar = @(xi) hbar(xi);    % b included via M_tot
 
 %% -----------------------------
-% Ritz basis (free–free)
-% -----------------------------
+% Non-dimensional Ritz basis (free-free)
+%% -----------------------------
 N = 8;
-
 phi   = @(i,xi) xi.^(i-1);
 d2phi = @(i,xi) (i>=3).*(i-1).*(i-2).*xi.^(i-3);
 
 %% -----------------------------
-% Assemble non-dimensional matrices
-% -----------------------------
+% Assemble stiffness matrix K
+%% -----------------------------
 K = zeros(N,N);
-M = zeros(N,N);
-
-for i = 1:N
-    for j = 1:N
-        K(i,j) = integral(@(xi) ...
-            Ibar(xi).*d2phi(i,xi).*d2phi(j,xi), 0,1);
-
-        M(i,j) = integral(@(xi) ...
-            Abar(xi).*phi(i,xi).*phi(j,xi), 0,1);
+for i=1:N
+    for j=1:N
+        K(i,j) = integral(@(xi) hbar(xi).^3 .* d2phi(i,xi).*d2phi(j,xi)/12, 0,1) * E * b; 
+        % EI(x) = E*b*h^3/12
     end
 end
 
 %% -----------------------------
-% Eigenproblem
-% -----------------------------
-[vec,val] = eig(K,M);
-lambda = real(diag(val));
+% Assemble mass matrix M
+%% -----------------------------
+M = zeros(N,N);
+Abar_int = integral(@(xi) Abar(xi), 0,1);
+for i=1:N
+    for j=1:N
+        M(i,j) = M_tot * integral(@(xi) Abar(xi).*phi(i,xi).*phi(j,xi),0,1)/Abar_int;
+    end
+end
 
-lambda = sort(lambda);
-lambda(lambda < 1e-8) = [];   % remove rigid modes
+%% -----------------------------
+% Solve generalized eigenproblem
+%% -----------------------------
+[vec,val] = eig(K,M);
+lambda = sort(real(diag(val)));
+
+% Remove rigid-body modes
+lambda(lambda < 1e-8) = [];
 
 %% -----------------------------
 % Recover physical frequencies
-% -----------------------------
-omega = sqrt(E*I0/(rho*A0*L^4)) * sqrt(lambda);
-freq  = omega/(2*pi);
+%% -----------------------------
+omega = sqrt(lambda); % Already dimensionless
+% Physical scaling factor
+scale = sqrt(E*I0/(M_actual*L^4)); % Check: we used M_tot in matrix, b included
+I0 = b*h0^3/12;
+omega = omega * sqrt(E*I0/(M_actual*L^4));
+freq = omega/(2*pi);
 
-disp('First bending frequency (Hz):');
-disp(freq(1))
+disp('First 5 bending frequencies (Hz):');
+disp(freq(1:5));
