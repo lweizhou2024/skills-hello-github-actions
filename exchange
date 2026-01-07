@@ -33,8 +33,15 @@ I  = @(x) b*h(x).^3/12;
 % 4. Ritz basis functions
 %    Free–free: no essential BCs
 % -----------------------------
-phi   = @(i,x) cos((i-1)*pi*x/L);
-d2phi = @(i,x) -((i-1)*pi/L)^2 * cos((i-1)*pi*x/L);
+%phi   = @(i,x) cos((i-1)*pi*x/L);
+%d2phi = @(i,x) -((i-1)*pi/L)^2 * cos((i-1)*pi*x/L);
+phi = @(i,x) ...
+    (i==1).*ones(size(x)) + ...
+    (i==2).*x + ...
+    (i>=3).*cos((i-2)*pi*x/L);
+
+d2phi = @(i,x) ...
+    (i>=3).*(-((i-2)*pi/L)^2 .* cos((i-2)*pi*x/L));
 
 %% -----------------------------
 % 5. Assemble mass and stiffness matrices
