@@ -1,76 +1,70 @@
-%% Free–Free Euler–Bernoulli Beam (Correct Ritz Formulation)
-
+%% Non-dimensional free–free Euler–Bernoulli beam
 clear; clc;
 
-%% Beam parameters
-L   = 1.0;
-b   = 0.05;
-E   = 210e9;
-rho = 7800;
+%% -----------------------------
+% Physical parameters (mm–MPa–ton)
+% -----------------------------
+L   = 100;                  % length [mm]
+b   = 10;                   % width [mm]
+E   = 210000;               % MPa = N/mm^2
+rho = 7.8e-9;               % ton/mm^3
 
-% Thickness h(x) = a0 + a1 x + a2 x^2 + a3 x^3
-a0 = 0.01;
-a1 = 0.0;
-a2 = 0.0;
-a3 = 0.0;
+% Thickness polynomial h(x) = a3 x^3 + a2 x^2 + a1 x + a0
+a0 = 1.0;  a1 = 0;  a2 = 0;  a3 = 0;
+p  = [a3 a2 a1 a0];
 
-%% Section properties
-h = @(x) a0 + a1*x + a2*x.^2 + a3*x.^3;
-A = @(x) b*h(x);
-I = @(x) b*h(x).^3/12;
+%% -----------------------------
+% Reference section (for scaling)
+% -----------------------------
+h0 = a0;
+A0 = b*h0;
+I0 = b*h0^3/12;
 
-%% Ritz parameters
-N = 8;    % >= 6 recommended
+%% -----------------------------
+% Non-dimensional coordinate
+% -----------------------------
+hbar = @(xi) polyval(p,xi*L)/h0;
+Abar = @(xi) hbar(xi);
+Ibar = @(xi) hbar(xi).^3;
 
-%% Polynomial Ritz basis (free–free)
-phi   = @(i,x) x.^(i-1);
-d2phi = @(i,x) (i>=3).*(i-1).*(i-2).*x.^(i-3);
+%% -----------------------------
+% Ritz basis (free–free)
+% -----------------------------
+N = 8;
 
-%% Assemble matrices
+phi   = @(i,xi) xi.^(i-1);
+d2phi = @(i,xi) (i>=3).*(i-1).*(i-2).*xi.^(i-3);
+
+%% -----------------------------
+% Assemble non-dimensional matrices
+% -----------------------------
 K = zeros(N,N);
 M = zeros(N,N);
 
 for i = 1:N
     for j = 1:N
-        K(i,j) = integral(@(x) ...
-            E*I(x).*d2phi(i,x).*d2phi(j,x), ...
-            0,L,'RelTol',1e-10);
+        K(i,j) = integral(@(xi) ...
+            Ibar(xi).*d2phi(i,xi).*d2phi(j,xi), 0,1);
 
-        M(i,j) = integral(@(x) ...
-            rho*A(x).*phi(i,x).*phi(j,x), ...
-            0,L,'RelTol',1e-10);
+        M(i,j) = integral(@(xi) ...
+            Abar(xi).*phi(i,xi).*phi(j,xi), 0,1);
     end
 end
 
-%% Solve eigenproblem
+%% -----------------------------
+% Eigenproblem
+% -----------------------------
 [vec,val] = eig(K,M);
-omega = sqrt(real(diag(val)));
+lambda = real(diag(val));
+
+lambda = sort(lambda);
+lambda(lambda < 1e-8) = [];   % remove rigid modes
+
+%% -----------------------------
+% Recover physical frequencies
+% -----------------------------
+omega = sqrt(E*I0/(rho*A0*L^4)) * sqrt(lambda);
 freq  = omega/(2*pi);
 
-% Sort
-[freq,idx] = sort(freq);
-vec = vec(:,idx);
-
-%% Remove rigid-body modes
-freq(freq < 1e-6) = [];
-
-disp('Natural frequencies (Hz):');
-disp(freq(1:5))
-%% -----------------------------
-% 8. Plot first bending mode
-% -----------------------------
-xplot = linspace(0,L,400);
-w1 = zeros(size(xplot));
-
-mode = 1;  % first bending mode
-for i = 1:N
-    w1 = w1 + vec(i,idx(mode))*phi(i,xplot);
-end
-
-w1 = w1/max(abs(w1));
-
-figure;
-plot(xplot,w1,'LineWidth',2)
-xlabel('x'); ylabel('Mode shape')
-title('First bending mode (free–free)')
-grid on
+disp('First bending frequency (Hz):');
+disp(freq(1))
