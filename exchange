@@ -1,19 +1,94 @@
-dcm = datacursormode(gcf);
-set(dcm,'Enable','on');
-set(dcm,'UpdateFcn',@(src,evt) myDataTipFcn(src,evt,Vs,TR));
-function txt = myDataTipFcn(~, event_obj, Vs, TR)
+%% Free–Free Euler–Bernoulli Beam with Variable Thickness
+% Rayleigh–Ritz formulation
 
-    pos = event_obj.Position;   % [x y z]
+clear; clc;
 
-    % Find nearest vertex
-    idx = nearestNeighbor(TR, pos);
+%% -----------------------------
+% 1. Beam parameters
+% -----------------------------
+L   = 1.0;            % beam length [m]
+b   = 0.05;           % width [m]
+E   = 210e9;          % Young's modulus [Pa]
+rho = 7800;           % density [kg/m^3]
 
-    value = Vs(idx);
+% Thickness polynomial h(x) = a0 + a1 x + a2 x^2 + a3 x^3
+a0 = 0.01;
+a1 = 0.00;
+a2 = 0.00;
+a3 = 0.00;
 
-    txt = {
-        ['X: ', num2str(pos(1))]
-        ['Y: ', num2str(pos(2))]
-        ['Z: ', num2str(pos(3))]
-        ['Value: ', num2str(value)]
-    };
+%% -----------------------------
+% 2. Discretization parameters
+% -----------------------------
+N = 8;   % number of Ritz functions (increase for convergence)
+
+%% -----------------------------
+% 3. Thickness and section properties
+% -----------------------------
+h  = @(x) a0 + a1*x + a2*x.^2 + a3*x.^3;
+A  = @(x) b*h(x);
+I  = @(x) b*h(x).^3/12;
+
+%% -----------------------------
+% 4. Ritz basis functions
+%    Free–free: no essential BCs
+% -----------------------------
+phi   = @(i,x) cos((i-1)*pi*x/L);
+d2phi = @(i,x) -((i-1)*pi/L)^2 * cos((i-1)*pi*x/L);
+
+%% -----------------------------
+% 5. Assemble mass and stiffness matrices
+% -----------------------------
+K = zeros(N,N);
+M = zeros(N,N);
+
+for i = 1:N
+    for j = 1:N
+        K(i,j) = integral(@(x) ...
+            E*I(x).*d2phi(i,x).*d2phi(j,x), ...
+            0, L, 'RelTol',1e-10,'AbsTol',1e-12);
+
+        M(i,j) = integral(@(x) ...
+            rho*A(x).*phi(i,x).*phi(j,x), ...
+            0, L, 'RelTol',1e-10,'AbsTol',1e-12);
+    end
 end
+
+%% -----------------------------
+% 6. Solve generalized eigenvalue problem
+% -----------------------------
+[vec,val] = eig(K,M);
+omega = sqrt(diag(val));          % rad/s
+freq  = omega/(2*pi);             % Hz
+
+% Sort
+[freq,idx] = sort(real(freq));
+vec = vec(:,idx);
+
+%% -----------------------------
+% 7. Remove rigid-body modes
+% -----------------------------
+tol = 1e-6;
+freq(freq < tol) = [];
+
+disp('Natural frequencies (Hz):');
+disp(freq);
+
+%% -----------------------------
+% 8. Plot first bending mode
+% -----------------------------
+xplot = linspace(0,L,400);
+w1 = zeros(size(xplot));
+
+mode = 1;  % first bending mode
+for i = 1:N
+    w1 = w1 + vec(i,idx(mode))*phi(i,xplot);
+end
+
+w1 = w1/max(abs(w1));
+
+figure;
+plot(xplot,w1,'LineWidth',2)
+xlabel('x'); ylabel('Mode shape')
+title('First bending mode (free–free)')
+grid on
