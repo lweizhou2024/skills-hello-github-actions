@@ -1,51 +1,32 @@
-%% Free–Free Euler–Bernoulli Beam with Variable Thickness
-% Rayleigh–Ritz formulation
+%% Free–Free Euler–Bernoulli Beam (Correct Ritz Formulation)
 
 clear; clc;
 
-%% -----------------------------
-% 1. Beam parameters
-% -----------------------------
-L   = 1.0;            % beam length [m]
-b   = 0.05;           % width [m]
-E   = 210e9;          % Young's modulus [Pa]
-rho = 7800;           % density [kg/m^3]
+%% Beam parameters
+L   = 1.0;
+b   = 0.05;
+E   = 210e9;
+rho = 7800;
 
-% Thickness polynomial h(x) = a0 + a1 x + a2 x^2 + a3 x^3
+% Thickness h(x) = a0 + a1 x + a2 x^2 + a3 x^3
 a0 = 0.01;
-a1 = 0.00;
-a2 = 0.00;
-a3 = 0.00;
+a1 = 0.0;
+a2 = 0.0;
+a3 = 0.0;
 
-%% -----------------------------
-% 2. Discretization parameters
-% -----------------------------
-N = 8;   % number of Ritz functions (increase for convergence)
+%% Section properties
+h = @(x) a0 + a1*x + a2*x.^2 + a3*x.^3;
+A = @(x) b*h(x);
+I = @(x) b*h(x).^3/12;
 
-%% -----------------------------
-% 3. Thickness and section properties
-% -----------------------------
-h  = @(x) a0 + a1*x + a2*x.^2 + a3*x.^3;
-A  = @(x) b*h(x);
-I  = @(x) b*h(x).^3/12;
+%% Ritz parameters
+N = 8;    % >= 6 recommended
 
-%% -----------------------------
-% 4. Ritz basis functions
-%    Free–free: no essential BCs
-% -----------------------------
-%phi   = @(i,x) cos((i-1)*pi*x/L);
-%d2phi = @(i,x) -((i-1)*pi/L)^2 * cos((i-1)*pi*x/L);
-phi = @(i,x) ...
-    (i==1).*ones(size(x)) + ...
-    (i==2).*x + ...
-    (i>=3).*cos((i-2)*pi*x/L);
+%% Polynomial Ritz basis (free–free)
+phi   = @(i,x) x.^(i-1);
+d2phi = @(i,x) (i>=3).*(i-1).*(i-2).*x.^(i-3);
 
-d2phi = @(i,x) ...
-    (i>=3).*(-((i-2)*pi/L)^2 .* cos((i-2)*pi*x/L));
-
-%% -----------------------------
-% 5. Assemble mass and stiffness matrices
-% -----------------------------
+%% Assemble matrices
 K = zeros(N,N);
 M = zeros(N,N);
 
@@ -53,49 +34,25 @@ for i = 1:N
     for j = 1:N
         K(i,j) = integral(@(x) ...
             E*I(x).*d2phi(i,x).*d2phi(j,x), ...
-            0, L, 'RelTol',1e-10,'AbsTol',1e-12);
+            0,L,'RelTol',1e-10);
 
         M(i,j) = integral(@(x) ...
             rho*A(x).*phi(i,x).*phi(j,x), ...
-            0, L, 'RelTol',1e-10,'AbsTol',1e-12);
+            0,L,'RelTol',1e-10);
     end
 end
 
-%% -----------------------------
-% 6. Solve generalized eigenvalue problem
-% -----------------------------
+%% Solve eigenproblem
 [vec,val] = eig(K,M);
-omega = sqrt(diag(val));          % rad/s
-freq  = omega/(2*pi);             % Hz
+omega = sqrt(real(diag(val)));
+freq  = omega/(2*pi);
 
 % Sort
-[freq,idx] = sort(real(freq));
+[freq,idx] = sort(freq);
 vec = vec(:,idx);
 
-%% -----------------------------
-% 7. Remove rigid-body modes
-% -----------------------------
-tol = 1e-6;
-freq(freq < tol) = [];
+%% Remove rigid-body modes
+freq(freq < 1e-6) = [];
 
 disp('Natural frequencies (Hz):');
-disp(freq);
-
-%% -----------------------------
-% 8. Plot first bending mode
-% -----------------------------
-xplot = linspace(0,L,400);
-w1 = zeros(size(xplot));
-
-mode = 1;  % first bending mode
-for i = 1:N
-    w1 = w1 + vec(i,idx(mode))*phi(i,xplot);
-end
-
-w1 = w1/max(abs(w1));
-
-figure;
-plot(xplot,w1,'LineWidth',2)
-xlabel('x'); ylabel('Mode shape')
-title('First bending mode (free–free)')
-grid on
+disp(freq(1:5))
