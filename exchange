@@ -1,82 +1,98 @@
-%% Non-dimensional free-free Euler-Bernoulli beam
-clear; clc;
+file1 = 'nodes.txt';
+file2 = 'temperature.txt';
 
-%% -----------------------------
-% Beam geometry & material
-%% -----------------------------
-L = 100;           % mm
-b = 10;            % mm
-h0 = 1;            % mm, uniform thickness
-E = 210e3;         % MPa
-rho = 7.8e-9;      % ton/mm^3 (steel)
+kw1 = 'NODES';        % keyword in file 1
+kw2 = 'TEMPERATURE';  % keyword in file 2
 
-%% -----------------------------
-% Total mass
-%% -----------------------------
-A0 = b*h0;
-V = L*A0;                  % volume
-M_actual = rho * V;        % total mass in tons
+% Read geometry
+[nodeID1, xyz] = read_nodes(file1, kw1);
 
-% Mass per unit width for code (since Abar = hbar)
-M_tot = M_actual / b;
+% Read temperature
+[nodeID2, temp] = read_temperature(file2, kw2);
 
-%% -----------------------------
-% Thickness polynomial (uniform)
-%% -----------------------------
-a0 = h0; a1 = 0; a2 = 0; a3 = 0;
-p = [a3 a2 a1 a0];
+% Join by node number
+[commonID, ia, ib] = intersect(nodeID1, nodeID2);
 
-% Non-dimensional thickness
-hbar = @(xi) polyval(p, xi*L)/h0;
-Abar = @(xi) hbar(xi);    % b included via M_tot
+xyz = xyz(ia, :);
+temp = temp(ib);
 
-%% -----------------------------
-% Non-dimensional Ritz basis (free-free)
-%% -----------------------------
-N = 8;
-phi   = @(i,xi) xi.^(i-1);
-d2phi = @(i,xi) (i>=3).*(i-1).*(i-2).*xi.^(i-3);
+% Final point cloud
+pointCloud = [xyz, temp];
 
-%% -----------------------------
-% Assemble stiffness matrix K
-%% -----------------------------
-K = zeros(N,N);
-for i=1:N
-    for j=1:N
-        K(i,j) = integral(@(xi) hbar(xi).^3 .* d2phi(i,xi).*d2phi(j,xi)/12, 0,1) * E * b; 
-        % EI(x) = E*b*h^3/12
+% Optional: MATLAB pointCloud object
+pc = pointCloud(pointCloud(:,1:3), 'Intensity', pointCloud(:,4));
+
+
+function [nodeID, xyz] = read_nodes(filename, keyword)
+
+fid = fopen(filename,'r');
+
+% Move to keyword
+while ~feof(fid)
+    line = fgetl(fid);
+    if contains(line, keyword)
+        break;
     end
 end
 
-%% -----------------------------
-% Assemble mass matrix M
-%% -----------------------------
-M = zeros(N,N);
-Abar_int = integral(@(xi) Abar(xi), 0,1);
-for i=1:N
-    for j=1:N
-        M(i,j) = M_tot * integral(@(xi) Abar(xi).*phi(i,xi).*phi(j,xi),0,1)/Abar_int;
+nodeID = [];
+xyz = [];
+
+while ~feof(fid)
+    pos = ftell(fid);
+    line = fgetl(fid);
+
+    % Stop if line is empty or non-numeric
+    if isempty(line) || ~isstrprop(strtrim(line(1)),'digit')
+        break;
+    end
+
+    % Fixed-width reading: 3 integers (8 chars), 6 floats (16 chars)
+    ints   = sscanf(line(1:24), '%8d');
+    floats = sscanf(line(25:end), '%16e');
+
+    if numel(ints) >= 1 && numel(floats) >= 3
+        nodeID(end+1,1) = ints(1);
+        xyz(end+1,:) = floats(end-2:end).';
+    else
+        fseek(fid, pos, 'bof');
+        break;
     end
 end
 
-%% -----------------------------
-% Solve generalized eigenproblem
-%% -----------------------------
-[vec,val] = eig(K,M);
-lambda = sort(real(diag(val)));
+fclose(fid);
+end
 
-% Remove rigid-body modes
-lambda(lambda < 1e-8) = [];
 
-%% -----------------------------
-% Recover physical frequencies
-%% -----------------------------
-omega = sqrt(lambda); % Already dimensionless
-% Physical scaling factor
-scale = sqrt(E*I0/(M_actual*L^4)); % Check: we used M_tot in matrix, b included
-I0 = b*h0^3/12;
-omega = omega * sqrt(E*I0/(M_actual*L^4));
-freq = omega/(2*pi);
+function [nodeID, temp] = read_temperature(filename, keyword)
 
-disp('First 5 bending frequencies (Hz):');
-disp(freq(1:5));
+fid = fopen(filename,'r');
+
+% Move to keyword
+while ~feof(fid)
+    line = fgetl(fid);
+    if contains(line, keyword)
+        break;
+    end
+end
+
+nodeID = [];
+temp = [];
+
+while ~feof(fid)
+    line = strtrim(fgetl(fid));
+    if ~startsWith(line, 'BF')
+        break;
+    end
+
+    % Parse: BF, node, TEMP, value
+    data = textscan(line, 'BF,%d,TEMP,%f', 'Delimiter', ',');
+
+    if ~isempty(data{1})
+        nodeID(end+1,1) = data{1};
+        temp(end+1,1)   = data{2};
+    end
+end
+
+fclose(fid);
+end
