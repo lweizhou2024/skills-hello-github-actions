@@ -1,6 +1,69 @@
-dcm = datacursormode(gcf);
-dcm.Enable = 'on';
-dcm.UpdateFcn = @(obj,event) {
-    sprintf('X: %.12g', event.Position(1)), ...
-    sprintf('Y: %.12g', event.Position(2))
-};
+function [TR,curves]=tripointcloud(pc,n,p0)
+shp=alphaShape(pc);
+[F,V]=boundaryFacets(shp);
+
+TR=triangulation(F,V);
+
+% n = [0 1 0];
+% p0 = [0 0 1];
+
+d = -dot(n, p0);
+segments = [];
+
+for i = 1:size(F,1)
+    tri = V(F(i,:),:);   % 3x3 triangle vertices
+    
+    % signed distances to plane
+    sd = tri*n' + d;
+
+    % check if plane intersects triangle
+    if max(sd) >= 0 && min(sd) <= 0
+        % find edges that cross the plane
+        pts = [];
+        for e = [1 2; 2 3; 3 1]'
+            s1 = sd(e(1));
+            s2 = sd(e(2));
+            if s1*s2 < 0 || s1 == 0
+                t = s1 / (s1 - s2);
+                p = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
+                pts(end+1,:) = p;
+            end
+        end
+
+        if size(pts,1) == 2
+            segments(end+1,:,:) = pts;
+        end
+    end
+end
+tol = 1e-6;
+curves = {};
+used = false(size(segments,1),1);
+
+for i = 1:size(segments,1)
+    if used(i), continue; end
+    curve = squeeze(segments(i,:,:));
+    used(i) = true;
+
+    changed = true;
+    while changed
+        changed = false;
+        for j = 1:size(segments,1)
+            if used(j), continue; end
+            s = squeeze(segments(j,:,:));
+
+            if norm(curve(end,:) - s(1,:)) < tol
+                curve = [curve; s(2,:)];
+            elseif norm(curve(end,:) - s(2,:)) < tol
+                curve = [curve; s(1,:)];
+            else
+                continue;
+            end
+
+            used(j) = true;
+            changed = true;
+        end
+    end
+
+    curves{end+1} = curve;
+end
+end
