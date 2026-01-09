@@ -1,111 +1,64 @@
-function [TR, curves] = tripointcloud(pc, n, p0)
-    % 1. Mesh Generation
-    shp = alphaShape(pc);
-    [F, V] = boundaryFacets(shp);
-    TR = triangulation(F, V);
+% --- Sample Data Setup ---
+dataCell = {[1, 22; 2, 23; 3, 24], [1, 25; 1.5, 27; 2, 29; 2.5, 30], [0, 15; 5, 40]};
+names = ["Sensor_A", "Sensor_B", "Reference"];
+filename = fullfile(pwd, 'DataExport.xlsx');
 
-    % 2. Plane Intersection
-    n = n / norm(n); % Ensure normal is unit vector
-    d = -dot(n, p0);
-    segments = [];
-
-    for i = 1:size(F, 1)
-        tri = V(F(i, :), :);
-        sd = tri * n' + d;
-
-        % Check for intersection
-        if max(sd) >= 0 && min(sd) <= 0
-            pts = [];
-            % Check all 3 edges of the triangle
-            edges = [1 2; 2 3; 3 1];
-            for k = 1:3
-                e = edges(k,:);
-                s1 = sd(e(1));
-                s2 = sd(e(2));
-                
-                % Intersection calculation
-                if (s1 * s2 < 0) % Plane crosses the edge
-                    t = s1 / (s1 - s2);
-                    pts(end+1, :) = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
-                elseif s1 == 0 % Plane hits vertex 1
-                    pts(end+1, :) = tri(e(1),:);
-                end
-            end
-            
-            % Unique points only (handles cases where plane hits a vertex)
-            pts = unique(pts, 'rows', 'stable');
-
-            if size(pts, 1) == 2
-                segments(end+1, :, :) = pts;
-            end
-        end
-    end
-
-    % 3. Linking Segments into Curves
-    tol = 1e-6;
-    curves = {};
-    if isempty(segments), return; end
+% --- 1. Write Data to Excel ---
+for i = 1:length(dataCell)
+    % Calculate starting column (Each item takes 3 columns: 1, 4, 7...)
+    startCol = (i-1)*3 + 1;
+    colLetter = char(64 + startCol); % Converts 1 to 'A', 4 to 'D', etc.
     
-    used = false(size(segments, 1), 1);
+    % Prepare Headers
+    header = {names{i}, '', '' ; 'x(mm)', 'temperature C', ''};
     
-    while any(~used)
-        % Start a new curve with the first available segment
-        first_idx = find(~used, 1);
-        curr_seg = squeeze(segments(first_idx, :, :));
-        curve = curr_seg;
-        used(first_idx) = true;
-        
-        found_match = true;
-        while found_match
-            found_match = false;
-            for j = 1:size(segments, 1)
-                if used(j), continue; end
-                s = squeeze(segments(j, :, :));
-                
-                % Check curve END against segment ends
-                if norm(curve(end, :) - s(1, :)) < tol
-                    curve = [curve; s(2, :)];
-                    used(j) = true; found_match = true; break;
-                elseif norm(curve(end, :) - s(2, :)) < tol
-                    curve = [curve; s(1, :)];
-                    used(j) = true; found_match = true; break;
-                % Check curve START against segment ends (Important for branching)
-                elseif norm(curve(1, :) - s(1, :)) < tol
-                    curve = [s(2, :); curve];
-                    used(j) = true; found_match = true; break;
-                elseif norm(curve(1, :) - s(2, :)) < tol
-                    curve = [s(1, :); curve];
-                    used(j) = true; found_match = true; break;
-                end
-            end
-        end
-        curves{end+1} = curve;
-    end
-% After the linking loop finishes and you have the 'curves' cell array:
-if ~isempty(curves)
-    unique_curves = {};
-    centroids = [];
-    tol_overlap = 1e-3; % Adjust based on your data scale
-
-    for i = 1:length(curves)
-        c = curves{i};
-        % Calculate centroid of this loop
-        current_centroid = mean(c, 1);
-        
-        % Check if we already have a curve with a similar centroid
-        is_duplicate = false;
-        if ~isempty(centroids)
-            dists = sqrt(sum((centroids - current_centroid).^2, 2));
-            if any(dists < tol_overlap)
-                is_duplicate = true;
-            end
-        end
-        
-        if ~is_duplicate
-            unique_curves{end+1} = c;
-            centroids(end+1, :) = current_centroid;
-        end
-    end
-    curves = unique_curves;
+    % Write Headers (Row 1 and 2)
+    writecell(header, filename, 'Sheet', 1, 'Range', [colLetter, '1']);
+    
+    % Write Data (Starting Row 3)
+    writematrix(dataCell{i}, filename, 'Sheet', 1, 'Range', [colLetter, '3']);
 end
+
+% --- 2. Create the Plot via COM Interface ---
+% This part automates Excel to create the chart
+try
+    e = actxserver('Excel.Application');
+    e.Visible = true; % Set to true to see Excel working
+    wb = e.Workbooks.Open(filename);
+    sheet = wb.Sheets.Item(1);
+    
+    % Create a Chart Object
+    chartObj = sheet.ChartObjects.Add(300, 50, 600, 400); % Left, Top, Width, Height
+    chart = chartObj.Chart;
+    chart.ChartType = 'xlXYScatterLines';
+    
+    % Loop to add each series to the same plot
+    for i = 1:length(dataCell)
+        series = chart.SeriesCollection.NewSeries;
+        numRows = size(dataCell{i}, 1);
+        
+        % Define ranges for X and Y
+        startCol = (i-1)*3 + 1;
+        xCol = char(64 + startCol);
+        yCol = char(64 + startCol + 1);
+        
+        series.XValues = sprintf('=%s!$%s$3:$%s$%d', sheet.Name, xCol, xCol, numRows + 2);
+        series.Values = sprintf('=%s!$%s$3:$%s$%d', sheet.Name, yCol, yCol, numRows + 2);
+        series.Name = names{i};
+    end
+    
+    % Formatting labels
+    chart.HasTitle = true;
+    chart.ChartTitle.Text = 'Temperature Profile';
+    chart.Axes(1).HasTitle = true;
+    chart.Axes(1).AxisTitle.Text = 'x (mm)';
+    chart.Axes(2).HasTitle = true;
+    chart.Axes(2).AxisTitle.Text = 'Temperature C';
+    
+    wb.Save;
+    % wb.Close; % Uncomment to close automatically
+    % e.Quit;
+catch ME
+    fprintf('An error occurred: %s\n', ME.message);
+    if exist('e', 'var'); e.Quit; end
 end
