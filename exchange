@@ -1,69 +1,84 @@
-function [TR,curves]=tripointcloud(pc,n,p0)
-shp=alphaShape(pc);
-[F,V]=boundaryFacets(shp);
+function [TR, curves] = tripointcloud(pc, n, p0)
+    % 1. Mesh Generation
+    shp = alphaShape(pc);
+    [F, V] = boundaryFacets(shp);
+    TR = triangulation(F, V);
 
-TR=triangulation(F,V);
+    % 2. Plane Intersection
+    n = n / norm(n); % Ensure normal is unit vector
+    d = -dot(n, p0);
+    segments = [];
 
-% n = [0 1 0];
-% p0 = [0 0 1];
+    for i = 1:size(F, 1)
+        tri = V(F(i, :), :);
+        sd = tri * n' + d;
 
-d = -dot(n, p0);
-segments = [];
+        % Check for intersection
+        if max(sd) >= 0 && min(sd) <= 0
+            pts = [];
+            % Check all 3 edges of the triangle
+            edges = [1 2; 2 3; 3 1];
+            for k = 1:3
+                e = edges(k,:);
+                s1 = sd(e(1));
+                s2 = sd(e(2));
+                
+                % Intersection calculation
+                if (s1 * s2 < 0) % Plane crosses the edge
+                    t = s1 / (s1 - s2);
+                    pts(end+1, :) = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
+                elseif s1 == 0 % Plane hits vertex 1
+                    pts(end+1, :) = tri(e(1),:);
+                end
+            end
+            
+            % Unique points only (handles cases where plane hits a vertex)
+            pts = unique(pts, 'rows', 'stable');
 
-for i = 1:size(F,1)
-    tri = V(F(i,:),:);   % 3x3 triangle vertices
+            if size(pts, 1) == 2
+                segments(end+1, :, :) = pts;
+            end
+        end
+    end
+
+    % 3. Linking Segments into Curves
+    tol = 1e-6;
+    curves = {};
+    if isempty(segments), return; end
     
-    % signed distances to plane
-    sd = tri*n' + d;
-
-    % check if plane intersects triangle
-    if max(sd) >= 0 && min(sd) <= 0
-        % find edges that cross the plane
-        pts = [];
-        for e = [1 2; 2 3; 3 1]'
-            s1 = sd(e(1));
-            s2 = sd(e(2));
-            if s1*s2 < 0 || s1 == 0
-                t = s1 / (s1 - s2);
-                p = tri(e(1),:) + t*(tri(e(2),:) - tri(e(1),:));
-                pts(end+1,:) = p;
+    used = false(size(segments, 1), 1);
+    
+    while any(~used)
+        % Start a new curve with the first available segment
+        first_idx = find(~used, 1);
+        curr_seg = squeeze(segments(first_idx, :, :));
+        curve = curr_seg;
+        used(first_idx) = true;
+        
+        found_match = true;
+        while found_match
+            found_match = false;
+            for j = 1:size(segments, 1)
+                if used(j), continue; end
+                s = squeeze(segments(j, :, :));
+                
+                % Check curve END against segment ends
+                if norm(curve(end, :) - s(1, :)) < tol
+                    curve = [curve; s(2, :)];
+                    used(j) = true; found_match = true; break;
+                elseif norm(curve(end, :) - s(2, :)) < tol
+                    curve = [curve; s(1, :)];
+                    used(j) = true; found_match = true; break;
+                % Check curve START against segment ends (Important for branching)
+                elseif norm(curve(1, :) - s(1, :)) < tol
+                    curve = [s(2, :); curve];
+                    used(j) = true; found_match = true; break;
+                elseif norm(curve(1, :) - s(2, :)) < tol
+                    curve = [s(1, :); curve];
+                    used(j) = true; found_match = true; break;
+                end
             end
         end
-
-        if size(pts,1) == 2
-            segments(end+1,:,:) = pts;
-        end
+        curves{end+1} = curve;
     end
-end
-tol = 1e-6;
-curves = {};
-used = false(size(segments,1),1);
-
-for i = 1:size(segments,1)
-    if used(i), continue; end
-    curve = squeeze(segments(i,:,:));
-    used(i) = true;
-
-    changed = true;
-    while changed
-        changed = false;
-        for j = 1:size(segments,1)
-            if used(j), continue; end
-            s = squeeze(segments(j,:,:));
-
-            if norm(curve(end,:) - s(1,:)) < tol
-                curve = [curve; s(2,:)];
-            elseif norm(curve(end,:) - s(2,:)) < tol
-                curve = [curve; s(1,:)];
-            else
-                continue;
-            end
-
-            used(j) = true;
-            changed = true;
-        end
-    end
-
-    curves{end+1} = curve;
-end
 end
