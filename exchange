@@ -1,64 +1,78 @@
 % --- Sample Data Setup ---
+% A cell where each item is a float array with different rows
 dataCell = {[1, 22; 2, 23; 3, 24], [1, 25; 1.5, 27; 2, 29; 2.5, 30], [0, 15; 5, 40]};
-names = ["Sensor_A", "Sensor_B", "Reference"];
+names = {'Sensor_A', 'Sensor_B', 'Reference'};
 filename = fullfile(pwd, 'DataExport.xlsx');
+sheetName = 'Results';
 
-% --- 1. Write Data to Excel ---
+% Delete file if it exists to start fresh
+if exist(filename, 'file'); delete(filename); end
+
+% --- 1. Write Data to Excel using xlswrite ---
 for i = 1:length(dataCell)
-    % Calculate starting column (Each item takes 3 columns: 1, 4, 7...)
-    startCol = (i-1)*3 + 1;
-    colLetter = char(64 + startCol); % Converts 1 to 'A', 4 to 'D', etc.
+    % Each item occupies 3 columns (Data, Data, Blank)
+    startColNum = (i-1)*3 + 1;
     
-    % Prepare Headers
-    header = {names{i}, '', '' ; 'x(mm)', 'temperature C', ''};
+    % Convert column number to Excel letter (e.g., 1 -> 'A', 4 -> 'D')
+    colLetter = getExcelCol(startColNum);
     
-    % Write Headers (Row 1 and 2)
-    writecell(header, filename, 'Sheet', 1, 'Range', [colLetter, '1']);
+    % A. Write the Name (Row 1)
+    xlswrite(filename, {names{i}}, sheetName, [colLetter, '1']);
     
-    % Write Data (Starting Row 3)
-    writematrix(dataCell{i}, filename, 'Sheet', 1, 'Range', [colLetter, '3']);
+    % B. Write the Secondary Header (Row 2)
+    xlswrite(filename, {'x(mm)', 'temperature C'}, sheetName, [colLetter, '2']);
+    
+    % C. Write the Data (Starting Row 3)
+    xlswrite(filename, dataCell{i}, sheetName, [colLetter, '3']);
 end
 
 % --- 2. Create the Plot via COM Interface ---
-% This part automates Excel to create the chart
 try
     e = actxserver('Excel.Application');
-    e.Visible = true; % Set to true to see Excel working
+    e.Visible = true; % Set to true to see the result
     wb = e.Workbooks.Open(filename);
-    sheet = wb.Sheets.Item(1);
+    sheet = wb.Sheets.Item(sheetName);
     
-    % Create a Chart Object
-    chartObj = sheet.ChartObjects.Add(300, 50, 600, 400); % Left, Top, Width, Height
+    % Add a Chart Object
+    chartObj = sheet.ChartObjects.Add(400, 50, 600, 400); % Left, Top, Width, Height
     chart = chartObj.Chart;
-    chart.ChartType = 'xlXYScatterLines';
+    chart.ChartType = 'xlXYScatterLines'; % 74 is the enum for XY Scatter with Lines
     
-    % Loop to add each series to the same plot
+    % Loop to add each series to the plot
     for i = 1:length(dataCell)
         series = chart.SeriesCollection.NewSeries;
         numRows = size(dataCell{i}, 1);
         
-        % Define ranges for X and Y
-        startCol = (i-1)*3 + 1;
-        xCol = char(64 + startCol);
-        yCol = char(64 + startCol + 1);
+        % Calculate X and Y range strings
+        xCol = getExcelCol((i-1)*3 + 1);
+        yCol = getExcelCol((i-1)*3 + 2);
         
-        series.XValues = sprintf('=%s!$%s$3:$%s$%d', sheet.Name, xCol, xCol, numRows + 2);
-        series.Values = sprintf('=%s!$%s$3:$%s$%d', sheet.Name, yCol, yCol, numRows + 2);
+        % Excel ranges for X and Y (e.g., 'Sheet1!$A$3:$A$5')
+        series.XValues = sprintf('=%s!$%s$3:$%s$%d', sheetName, xCol, xCol, numRows + 2);
+        series.Values = sprintf('=%s!$%s$3:$%s$%d', sheetName, yCol, yCol, numRows + 2);
         series.Name = names{i};
     end
     
-    % Formatting labels
+    % Format Labels
     chart.HasTitle = true;
-    chart.ChartTitle.Text = 'Temperature Profile';
+    chart.ChartTitle.Text = 'Temperature Data Comparison';
     chart.Axes(1).HasTitle = true;
-    chart.Axes(1).AxisTitle.Text = 'x (mm)';
+    chart.Axes(1).AxisTitle.Text = 'x(mm)';
     chart.Axes(2).HasTitle = true;
     chart.Axes(2).AxisTitle.Text = 'Temperature C';
-    
+    chart.HasLegend = true;
+
     wb.Save;
-    % wb.Close; % Uncomment to close automatically
-    % e.Quit;
 catch ME
-    fprintf('An error occurred: %s\n', ME.message);
-    if exist('e', 'var'); e.Quit; end
+    fprintf('Error: %s\n', ME.message);
+end
+
+% --- Helper Function for Column Letters ---
+function col = getExcelCol(n)
+    % Simple helper to convert 1->A, 2->B... 27->AA
+    if n <= 26
+        col = char(64 + n);
+    else
+        col = [char(64 + floor((n-1)/26)), char(64 + mod(n-1, 26) + 1)];
+    end
 end
