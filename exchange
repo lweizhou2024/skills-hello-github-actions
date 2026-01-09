@@ -81,4 +81,31 @@ function [TR, curves] = tripointcloud(pc, n, p0)
         end
         curves{end+1} = curve;
     end
+% After the linking loop finishes and you have the 'curves' cell array:
+if ~isempty(curves)
+    unique_curves = {};
+    centroids = [];
+    tol_overlap = 1e-3; % Adjust based on your data scale
+
+    for i = 1:length(curves)
+        c = curves{i};
+        % Calculate centroid of this loop
+        current_centroid = mean(c, 1);
+        
+        % Check if we already have a curve with a similar centroid
+        is_duplicate = false;
+        if ~isempty(centroids)
+            dists = sqrt(sum((centroids - current_centroid).^2, 2));
+            if any(dists < tol_overlap)
+                is_duplicate = true;
+            end
+        end
+        
+        if ~is_duplicate
+            unique_curves{end+1} = c;
+            centroids(end+1, :) = current_centroid;
+        end
+    end
+    curves = unique_curves;
+end
 end
