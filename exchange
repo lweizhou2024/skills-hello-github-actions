@@ -1,5 +1,9 @@
-options = optimoptions('fsolve', ...
-                       'Algorithm','levenberg-marquardt', ...
-                       'Display','iter', ...
-                       'StepTolerance',1e-12, ...
-                       'FunctionTolerance',1e-12);
+                                       First-Order                    Norm of 
+ Iteration  Func-count    Residual       optimality      Lambda           step
+     0           2         214.216           0.745         0.01
+     1           8         214.213            4.48          100     0.00745213
+     2          10         214.207            5.98           10      0.0448069
+     3          14         214.205            5.98         1000     0.00597745
+     4          18         214.202            0.75       100000    5.97526e-05
+     5          21         214.198            4.48        1e+06    7.50424e-07
+     6          25         214.197            4.48        1e+08    4.48039e-08
