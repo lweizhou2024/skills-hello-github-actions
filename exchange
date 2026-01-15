@@ -1,1 +1,111 @@
-5.83176 − 2.99646 X + 0.94088 X2 − 0.17734 X3 + 0.0183885 X4 − 0.000790018 X5
+      SUBROUTINE USERMAT(
+     & STRESS, STATEV, DDSDDE, SSE, SPD,
+     & SCD, RPL, DDSDDT, DRPLDE, DRPLDT,
+     & STRAN, DSTRAN, TIME, DTIME, TEMP,
+     & DTEMP, PREDEF, DPRED, CMNAME,
+     & NDI, NSHR, NTENS, NSTATV,
+     & PROPS, NPROPS, COORDS,
+     & DROT, PNEWDT, CELENT,
+     & DFGRD0, DFGRD1,
+     & NOEL, NPT, LAYER, KSPT, KSTEP, KINC)
+
+      IMPLICIT NONE
+
+C     Arguments
+      INTEGER NDI, NSHR, NTENS, NSTATV, NPROPS
+      INTEGER NOEL, NPT, LAYER, KSPT, KSTEP, KINC
+      DOUBLE PRECISION STRESS(NTENS), STRAN(NTENS), DSTRAN(NTENS)
+      DOUBLE PRECISION DDSDDE(NTENS,NTENS)
+      DOUBLE PRECISION STATEV(NSTATV)
+      DOUBLE PRECISION PROPS(NPROPS)
+      DOUBLE PRECISION TIME(2), DTIME
+      DOUBLE PRECISION SSE, SPD, SCD, RPL
+      DOUBLE PRECISION DDSDDT, DRPLDE, DRPLDT
+      DOUBLE PRECISION TEMP, DTEMP
+      DOUBLE PRECISION PREDEF(*), DPRED(*)
+      DOUBLE PRECISION COORDS(*), DROT(3,3)
+      DOUBLE PRECISION CELENT
+      DOUBLE PRECISION DFGRD0(3,3), DFGRD1(3,3)
+      CHARACTER*80 CMNAME
+
+C     Local variables
+      DOUBLE PRECISION E, NU, LAMBDA, MU
+      INTEGER I, J
+
+C     Read properties
+      E  = PROPS(1)
+      NU = PROPS(2)
+
+      MU     = E / (2.0D0*(1.0D0+NU))
+      LAMBDA = E*NU / ((1.0D0+NU)*(1.0D0-2.0D0*NU))
+
+C     Initialize stiffness
+      DO I = 1, NTENS
+         DO J = 1, NTENS
+            DDSDDE(I,J) = 0.0D0
+         END DO
+      END DO
+
+C     3D isotropic stiffness (Voigt)
+      DDSDDE(1,1) = LAMBDA + 2.0D0*MU
+      DDSDDE(2,2) = LAMBDA + 2.0D0*MU
+      DDSDDE(3,3) = LAMBDA + 2.0D0*MU
+
+      DDSDDE(1,2) = LAMBDA
+      DDSDDE(1,3) = LAMBDA
+      DDSDDE(2,1) = LAMBDA
+      DDSDDE(2,3) = LAMBDA
+      DDSDDE(3,1) = LAMBDA
+      DDSDDE(3,2) = LAMBDA
+
+      DDSDDE(4,4) = MU
+      DDSDDE(5,5) = MU
+      DDSDDE(6,6) = MU
+
+C     Stress update: σ = C : ε
+      DO I = 1, NTENS
+         STRESS(I) = 0.0D0
+         DO J = 1, NTENS
+            STRESS(I) = STRESS(I) + DDSDDE(I,J)*STRAN(J)
+         END DO
+      END DO
+
+      RETURN
+      END
+
+
+
+
+/prep7
+
+! ----- Element and material
+et,1,185
+
+tb,user,1,,,2
+tbdata,1,210000,0.3     ! E=210000 MPa, nu=0.3
+mp,dens,1,7850
+
+! ----- Geometry: unit cube
+block,0,1,0,1,0,1
+vmesh,all
+
+! ----- Boundary conditions
+nsel,s,loc,x,0
+d,all,ux,0
+d,all,uy,0
+d,all,uz,0
+
+nsel,s,loc,x,1
+d,all,ux,0.001           ! 0.1% strain
+
+allsel,all
+
+/solu
+antype,static
+solve
+finish
+
+/post1
+set,last
+etab,sx,s,x
+prtab,sx
