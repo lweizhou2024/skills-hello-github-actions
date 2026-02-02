@@ -1,33 +1,30 @@
-/prep7
+% x, y, z are Nx1 vectors
 
-! ----- Element and material
-et,1,185
+% ---- 1. Estimate center (robust) ----
+xc = median(x);
+yc = median(y);
 
-tb,user,1,,,2
-tbdata,1,210000,0.3     ! E=210000 MPa, nu=0.3
-mp,dens,1,7850
+% ---- 2. Radial distance ----
+r = sqrt((x - xc).^2 + (y - yc).^2);
 
-! ----- Geometry: unit cube
-block,0,1,0,1,0,1
-vmesh,all
+% ---- 3. Estimate button radius ----
+R = prctile(r, 95);   % robust radius estimate
 
-! ----- Boundary conditions
-nsel,s,loc,x,0
-d,all,ux,0
-d,all,uy,0
-d,all,uz,0
+% ---- 4. Inner region mask ----
+mask = r < 0.7 * R;   % keep inner 70% (adjust if needed)
 
-nsel,s,loc,x,1
-d,all,ux,0.001           ! 0.1% strain
+% ---- 5. Fit plane ----
+A = [x(mask), y(mask), ones(nnz(mask),1)];
+coeff = A \ z(mask);
+a = coeff(1); b = coeff(2); c = coeff(3);
 
-allsel,all
+% ---- 6. Remove tilt ----
+z_corr = z - (a*x + b*y + c);
 
-/solu
-antype,static
-solve
-finish
-
-/post1
-set,last
-etab,sx,s,x
-prtab,sx
+% ---- 7. Plot ----
+figure
+scatter3(x, y, z_corr, 6, z_corr, 'filled')
+axis equal
+view(2)
+colorbar
+title('Tilt-corrected top surface (radial mask)')
