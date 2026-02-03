@@ -1,43 +1,171 @@
-% x,y,z already tilt-corrected
-P = [x y z_corr];
-N = size(P,1);
+hex_faces = [...
+    1 2 3 4;...
+    5 6 7 8;...
+    1 2 6 5;...
+    2 3 7 6;...
+    3 4 8 7;...
+    4 1 5 8;...
+];
 
-% Neighborhood radius (controls cutoff wavelength)
-rf = 0.5;   % mm  (choose > roughness scale)
+faceMap = containers.Map('KeyType','char','ValueType','any');
 
-z_rough = zeros(N,1);
-
-% KD-tree for speed
-Mdl = KDTreeSearcher(P(:,1:2));
-
-for i = 1:N
-    idx = rangesearch(Mdl, P(i,1:2), rf);
-    idx = idx{1};
-
-    if numel(idx) < 10
-        z_rough(i) = 0;
-        continue
+elemIDs = elems.keys;
+for k = 1:numel(elemIDs)
+    cn = elems(elemIDs{k});
+    for f = 1:6
+        face = cn(hex_faces(f,:));
+        key = sprintf('%d_', sort(face));  % order-independent
+        if isKey(faceMap,key)
+            faceMap(key).count = faceMap(key).count + 1;
+        else
+            faceMap(key) = struct('nodes',face,'count',1);
+        end
     end
-
-    Xi = P(idx,1);
-    Yi = P(idx,2);
-    Zi = P(idx,3);
-
-    % Local plane fit
-    A = [Xi, Yi, ones(size(Xi))];
-    c = A \ Zi;
-
-    % Evaluate plane at point i
-    zi_form = [P(i,1), P(i,2), 1] * c;
-
-    % High-pass result
-    z_rough(i) = P(i,3) - zi_form;
 end
 
-% Visualization
-figure
-scatter3(x, y, z_rough, 6, z_rough, 'filled')
-axis equal
-view(2)
-colorbar
-title('Local-detrended roughness (MLS)')
+surfaceFaces = {};
+keysF = faceMap.keys;
+for k = 1:numel(keysF)
+    f = faceMap(keysF{k});
+    if f.count == 1
+        surfaceFaces{end+1} = f.nodes; 
+    end
+end
+
+P0 = [x0 y0 z0];       % point on plane
+n  = n / norm(n);     % unit normal
+tol = 1e-10;
+
+phi = @(x) dot(n, x - P0);
+segments = [];
+
+edges = [1 2; 2 3; 3 4; 4 1];
+
+for i = 1:numel(surfaceFaces)
+    fnodes = surfaceFaces{i};
+    pts = zeros(4,3);
+    val = zeros(4,1);
+
+    for j = 1:4
+        pts(j,:) = nodes(fnodes(j));
+        val(j) = phi(pts(j,:));
+    end
+
+    ip = [];
+    for e = 1:4
+        a = edges(e,1); b = edges(e,2);
+        if val(a)*val(b) < 0
+            t = val(a)/(val(a)-val(b));
+            ip(end+1,:) = pts(a,:) + t*(pts(b,:)-pts(a,:)); %#ok<SAGROW>
+        end
+    end
+
+    if size(ip,1) == 2
+        segments(end+1,:,:) = ip; %#ok<SAGROW>
+    end
+end
+% Build plane basis
+tmp = [1 0 0];
+if abs(dot(tmp,n)) > 0.9
+    tmp = [0 1 0];
+end
+e1 = cross(n,tmp); e1 = e1/norm(e1);
+e2 = cross(n,e1);
+
+proj = @(x) [dot(x-P0,e1), dot(x-P0,e2)];
+S = size(segments,1);
+seg2 = zeros(S,4);
+for i = 1:S
+    p1 = proj(squeeze(segments(i,1,:))');
+    p2 = proj(squeeze(segments(i,2,:))');
+    seg2(i,:) = [p1 p2];
+end
+tol = 1e-6;
+P = seg2(:,[1 2; 3 4]);
+P = reshape(P,[],2);
+
+[idx, pts] = uniquetol(P,tol,'ByRows',true);
+
+edges2 = reshape(idx,[],2);
+used = false(size(edges2,1),1);
+loops = {};
+
+for i = 1:size(edges2,1)
+    if used(i), continue; end
+    loop = edges2(i,:);
+    used(i) = true;
+    curr = loop(end);
+
+    while true
+        j = find(~used & any(edges2==curr,2),1);
+        if isempty(j), break; end
+        e = edges2(j,:);
+        curr = e(e~=curr);
+        loop(end+1) = curr; %#ok<SAGROW>
+        used(j) = true;
+        if curr == loop(1), break; end
+    end
+    loops{end+1} = pts(loop,:); %#ok<SAGROW>
+end
+
+
+
+
+function nodes = read_nblock(fid)
+
+nodes = containers.Map('KeyType','int32','ValueType','any');
+
+while true
+    line = fgetl(fid);
+    if ~ischar(line) || startsWith(strtrim(line),'NBLOCK')
+        break
+    end
+end
+
+fmt = '(3i8,6e16.9)';
+while true
+    pos = ftell(fid);
+    line = fgetl(fid);
+    if ~ischar(line) || startsWith(strtrim(line),'EBLOCK')
+        fseek(fid,pos,'bof');
+        break
+    end
+
+    data = sscanf(line, '%8d%8d%8d%16f%16f%16f');
+    if numel(data) >= 6
+        nid = data(1);
+        nodes(nid) = data(4:6)';
+    end
+end
+end
+
+
+function elems = read_eblock(fid)
+
+elems = containers.Map('KeyType','int32','ValueType','any');
+
+while true
+    line = fgetl(fid);
+    if ~ischar(line) || startsWith(strtrim(line),'EBLOCK')
+        break
+    end
+end
+
+while true
+    pos = ftell(fid);
+    line = fgetl(fid);
+    if ~ischar(line) || startsWith(strtrim(line),'CMBLOCK')
+        fseek(fid,pos,'bof');
+        break
+    end
+
+    data = sscanf(line,'%7d');
+    if numel(data) >= 18
+        eid = data(4);
+        corner = data(11:18);
+        elems(eid) = corner(:)';
+    end
+end
+end
+
+
