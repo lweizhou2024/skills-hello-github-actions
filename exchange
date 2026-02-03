@@ -1,30 +1,43 @@
-% x, y, z are Nx1 vectors
+% x,y,z already tilt-corrected
+P = [x y z_corr];
+N = size(P,1);
 
-% ---- 1. Estimate center (robust) ----
-xc = median(x);
-yc = median(y);
+% Neighborhood radius (controls cutoff wavelength)
+rf = 0.5;   % mm  (choose > roughness scale)
 
-% ---- 2. Radial distance ----
-r = sqrt((x - xc).^2 + (y - yc).^2);
+z_rough = zeros(N,1);
 
-% ---- 3. Estimate button radius ----
-R = prctile(r, 95);   % robust radius estimate
+% KD-tree for speed
+Mdl = KDTreeSearcher(P(:,1:2));
 
-% ---- 4. Inner region mask ----
-mask = r < 0.7 * R;   % keep inner 70% (adjust if needed)
+for i = 1:N
+    idx = rangesearch(Mdl, P(i,1:2), rf);
+    idx = idx{1};
 
-% ---- 5. Fit plane ----
-A = [x(mask), y(mask), ones(nnz(mask),1)];
-coeff = A \ z(mask);
-a = coeff(1); b = coeff(2); c = coeff(3);
+    if numel(idx) < 10
+        z_rough(i) = 0;
+        continue
+    end
 
-% ---- 6. Remove tilt ----
-z_corr = z - (a*x + b*y + c);
+    Xi = P(idx,1);
+    Yi = P(idx,2);
+    Zi = P(idx,3);
 
-% ---- 7. Plot ----
+    % Local plane fit
+    A = [Xi, Yi, ones(size(Xi))];
+    c = A \ Zi;
+
+    % Evaluate plane at point i
+    zi_form = [P(i,1), P(i,2), 1] * c;
+
+    % High-pass result
+    z_rough(i) = P(i,3) - zi_form;
+end
+
+% Visualization
 figure
-scatter3(x, y, z_corr, 6, z_corr, 'filled')
+scatter3(x, y, z_rough, 6, z_rough, 'filled')
 axis equal
 view(2)
 colorbar
-title('Tilt-corrected top surface (radial mask)')
+title('Local-detrended roughness (MLS)')
