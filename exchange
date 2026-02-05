@@ -1,33 +1,64 @@
-function [axisPoint, radius] = fitWithDirection(points, v_guess)
-    % 1. Normalize the direction guess
-    v = v_guess(:) / norm(v_guess);
+function [center, direction, radius] = refineCylinder(points, v_guess)
+    % 1. Normalize and convert initial guess to spherical coordinates
+    v_guess = v_guess(:) / norm(v_guess);
+    % phi is angle from z-axis, theta is angle in xy-plane
+    phi0 = acos(v_guess(3));
+    theta0 = atan2(v_guess(2), v_guess(1));
     
-    % 2. Create a 2D coordinate system on the plane perpendicular to v
-    % Find any vector 'nullV' such that nullV is perpendicular to v
-    basis = null(v'); 
-    e1 = basis(:,1);
-    e2 = basis(:,2);
+    % 2. Get initial center point using your current guess
+    % We use the projection trick from the previous step to get a good p0
+    [p0, r0] = initialAxisPoint(points, v_guess);
     
-    % 3. Project 3D points onto this 2D plane
-    % (Subtract mean first to keep numbers small and stable)
+    % Initial parameters: [px, py, pz, theta, phi]
+    % We leave radius out of the optimizer to make it more stable; 
+    % we calculate the optimal r for every iteration.
+    x0 = [p0, theta0, phi0];
+    
+    % 3. Optimization
+    options = optimoptions('lsqnonlin', 'Display', 'iter', 'StepTolerance', 1e-8);
+    
+    fitFunc = @(x) objective(x, points);
+    x_best = lsqnonlin(fitFunc, x0, [], [], options);
+    
+    % 4. Extract Results
+    center = x_best(1:3);
+    final_theta = x_best(4);
+    final_phi = x_best(5);
+    direction = [cos(final_theta)*sin(final_phi), ...
+                 sin(final_theta)*sin(final_phi), ...
+                 cos(final_phi)];
+             
+    % Final radius calculation
+    diff = points - center;
+    distToAxis = sqrt(sum(cross(diff, repmat(direction, size(points,1), 1)).^2, 2));
+    radius = mean(distToAxis);
+end
+
+function res = objective(x, points)
+    p = x(1:3);
+    theta = x(4);
+    phi = x(5);
+    v = [cos(theta)*sin(phi), sin(theta)*sin(phi), cos(phi)];
+    
+    % Calculate distances from points to the axis
+    diff = points - p;
+    % d = |(q-p) x v| / |v| (v is unit length)
+    distances = sqrt(sum(cross(diff, repmat(v, size(points,1), 1)).^2, 2));
+    
+    % The residual is how much each distance differs from the average radius
+    res = distances - mean(distances);
+end
+
+function [p0, r0] = initialAxisPoint(points, v)
+    % Helper to find a point on the axis given a direction
+    basis = null(v');
     centroid = mean(points);
-    shiftedPoints = points - centroid;
-    
-    xp = shiftedPoints * e1;
-    yp = shiftedPoints * e2;
-    
-    % 4. Fit a circle to (xp, yp) using a linear least squares approach
-    % Equation: (x-xc)^2 + (y-yc)^2 = r^2  => x^2 - 2x*xc + xc^2 + y^2 - 2y*yc + yc^2 = r^2
-    % Rearranged: 2x*xc + 2y*yc + C = x^2 + y^2  where C = r^2 - xc^2 - yc^2
+    shifted = points - centroid;
+    xp = shifted * basis(:,1);
+    yp = shifted * basis(:,2);
     A = [2*xp, 2*yp, ones(size(xp))];
     b = xp.^2 + yp.^2;
-    params = A\b;
-    
-    xc = params(1);
-    yc = params(2);
-    radius = sqrt(params(3) + xc^2 + yc^2);
-    
-    % 5. Convert 2D center back to 3D
-    % The axis point is the centroid + the 2D offsets along the basis vectors
-    axisPoint = centroid + xc*e1' + yc*e2';
+    sol = A\b;
+    p0 = centroid + sol(1)*basis(:,1)' + sol(2)*basis(:,2)';
+    r0 = sqrt(sol(3) + sol(1)^2 + sol(2)^2);
 end
