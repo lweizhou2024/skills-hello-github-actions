@@ -9,77 +9,101 @@ N = cross(v2-v1, v3-v1, 2);
 N = N ./ vecnorm(N,2,2);       % triangle normals
 
 
-ang = acosd(abs(N * mean(N,1)'));
-idx = ang > 15;     % keep curved regions
+z = [0 0 1];
+nz = abs(N*z');
+
+idx = nz < 0.25;     % normals nearly horizontal
 C = C(idx,:);
 N = N(idx,:);
 
-
-numIter = 3000;
-axes = zeros(numIter,3);
+numIter = 5000;
+centers = zeros(numIter,2);
 
 for k = 1:numIter
-    id = randperm(size(N,1),2);
-    d = cross(N(id(1),:), N(id(2),:));
-    if norm(d) > 1e-3
-        axes(k,:) = d / norm(d);
+    id = randperm(size(C,1),2);
+    n1 = N(id(1),1:2);
+    n2 = N(id(2),1:2);
+    
+    if abs(det([n1; n2])) < 1e-3
+        continue
+    end
+    
+    p1 = C(id(1),1:2);
+    p2 = C(id(2),1:2);
+    
+    % solve for center in XY
+    A = [n1; n2];
+    b = [dot(n1,p1); dot(n2,p2)];
+    centers(k,:) = A\b;
+end
+
+centers = centers(any(centers,2),:);
+
+
+[idxC, ctrs] = kmeans(centers,4,'Replicates',10);
+holeCentersXY = ctrs;
+
+
+XY = C(:,1:2);
+D = pdist2(XY, holeCentersXY);
+[~,hid] = min(D,[],2);
+
+good = false(4,1);
+
+for i = 1:4
+    Ci = C(hid==i,:);
+    
+    xc = holeCentersXY(i,1);
+    yc = holeCentersXY(i,2);
+    
+    theta = atan2(Ci(:,2)-yc, Ci(:,1)-xc);
+    
+    % angular coverage
+    edges = linspace(-pi,pi,36);
+    occ = histcounts(theta,edges) > 0;
+    coverage = sum(occ)/numel(occ);
+    
+    % Z span (through-hole)
+    zspan = max(Ci(:,3)) - min(Ci(:,3));
+    
+    if coverage > 0.6 && zspan > 0.3*range(C(:,3))
+        good(i) = true;
     end
 end
 
+holes = struct;
+k = 0;
 
-axes = axes(any(axes,2),:);
-
-% Use absolute direction (d and -d same)
-axes = abs(axes);
-
-[idx, centers] = kmeans(axes, 4, ...
-    'Replicates',10,'MaxIter',1000);
-
-holeAxes = centers ./ vecnorm(centers,2,2);
-
-
-holeID = zeros(size(N,1),1);
-
-for i = 1:4
-    holeID(:,i) = abs(N * holeAxes(i,:)');
+for i = find(good)'
+    Ci = C(hid==i,:);
+    k = k+1;
+    
+    % Axis direction
+    d = [0 0 1];
+    
+    % Axis point
+    xc = holeCentersXY(i,1);
+    yc = holeCentersXY(i,2);
+    zc = mean(Ci(:,3));
+    
+    % Radius
+    r = sqrt((Ci(:,1)-xc).^2 + (Ci(:,2)-yc).^2);
+    
+    holes(k).axis = d;
+    holes(k).point = [xc yc zc];
+    holes(k).radius = median(r);
 end
 
-[~,holeID] = min(holeID,[],2);   % smallest dot → most perpendicular
+P = reshape([holes.point],3,[])';
+[idxPair,~] = kmeans(P(:,1:2),2);
 
-
-cyl = struct;
-
-for i = 1:4
-    Ci = C(holeID==i,:);
-    
-    % Axis refinement using PCA
-    [coeff,~,~] = pca(Ci);
-    d = coeff(:,1)';
-    
-    p = mean(Ci,1);
-    r = vecnorm(cross(Ci-p,d),2,2);
-    
-    cyl(i).axis = d / norm(d);
-    cyl(i).point = p;
-    cyl(i).radius = median(r);   % median is robust to scan noise
+for i = 1:2
+    pair{i} = find(idxPair==i);
 end
-
-
-for i = 1:4
-    fprintf('Hole %d: R = %.3f mm, spread = %.3f mm\n', ...
-        i, cyl(i).radius, std(r));
-end
-
-
-trisurf(F,V(:,1),V(:,2),V(:,3), ...
-    'FaceAlpha',0.2,'EdgeColor','none');
+trisurf(F,V(:,1),V(:,2),V(:,3),'FaceAlpha',0.15,'EdgeColor','none');
 hold on
-
-for i = 1:4
-    p = cyl(i).point;
-    d = cyl(i).axis;
-    t = linspace(-50,50,2);
-    plot3(p(1)+t*d(1), p(2)+t*d(2), p(3)+t*d(3), ...
-        'LineWidth',3);
+for i = 1:numel(holes)
+    p = holes(i).point;
+    plot3(p(1),p(2),p(3),'ro','MarkerSize',8,'LineWidth',2)
 end
 axis equal
