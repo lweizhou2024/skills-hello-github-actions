@@ -1,97 +1,43 @@
-stlIn  = 'scan.stl';
-stlOut = 'scan_aligned.stl';
-
-% ---- supplied by you ----
-yzPairCenter = [ ...
-     12.3   5.1 ;    % pair 1 Y Z
-    -25.4   5.0 ];   % pair 2 Y Z
-
-R = 5.0;                      % hole radius
-
-% nominal data (same axis direction for both holes)
-axis_nom = [1 0 0];           % unit vector
-center_nom = [ ...
-     10  5  0 ;               % nominal center for pair 1 (smaller X hole)
-    -20  5  0 ];              % nominal center for pair 2
-%% Read STL (correct triangulation form)
-TR = stlread(stlIn);
-V  = TR.Points;
-F  = TR.ConnectivityList;
-
-%% Triangle centroids and normals
-v1 = V(F(:,1),:);
-v2 = V(F(:,2),:);
-v3 = V(F(:,3),:);
-
-C = (v1 + v2 + v3)/3;
-
-N = cross(v2-v1, v3-v1, 2);
-N = N ./ vecnorm(N,2,2);
-
-%% Remove surfaces perpendicular to X
-xdir = [1 0 0];
-keep = abs(N*xdir') < 0.3;
-C = C(keep,:);
-F = F(keep,:);
-
-%% Storage
-axis_act = zeros(2,3);
-center_act = zeros(2,3);
-
-%% ---- LOOP OVER TWO COAXIAL PAIRS ----
-for p = 1:2
+function [center, direction, radius] = fitCylinder(points)
+    % points: Nx3 matrix of (x, y, z)
     
-    %% 1) Keep points near supplied YZ center
-    dy = C(:,2) - yzPairCenter(p,1);
-    dz = C(:,3) - yzPairCenter(p,2);
-    idx = (dy.^2 + dz.^2) < (2*R)^2;
+    % 1. Initial Guess
+    % Use PCA to find the primary orientation (the cylinder axis)
+    avg = mean(points);
+    [coeff, ~] = pca(points);
+    v0 = coeff(:, 1); % First principal component is a good start for the axis
+    p0 = avg;         % Centroid as a point on the axis
+    r0 = mean(sqrt(sum((points - avg).^2, 2))) / 2; % Rough guess for radius
     
-    Cp = C(idx,:);
+    % Initial parameter vector: [px, py, pz, vx, vy, vz, r]
+    initial_params = [p0, v0', r0];
     
-    %% 2) Separate coaxial holes by X
-    xvals = Cp(:,1);
-    [idxX,~] = kmeans(xvals,2,'Replicates',5);
+    % 2. Optimization
+    options = optimoptions('lsqnonlin', 'Display', 'off', 'FunctionTolerance', 1e-6);
     
-    % choose cluster with smaller X
-    if mean(xvals(idxX==1)) < mean(xvals(idxX==2))
-        Ci = Cp(idxX==1,:);
-    else
-        Ci = Cp(idxX==2,:);
-    end
+    % Define the objective function (residuals)
+    objFunc = @(params) cylinderResiduals(params, points);
     
-    %% 3) Fit axis for this hole (PCA)
-    Ci_mean = mean(Ci,1);
-    [coeff,~,~] = pca(Ci - Ci_mean);
+    % Run optimization
+    best_params = lsqnonlin(objFunc, initial_params, [], [], options);
     
-    axis_act(p,:) = coeff(:,1)' / norm(coeff(:,1));
-    center_act(p,:) = Ci_mean;
+    % 3. Extract results
+    center = best_params(1:3);
+    direction = best_params(4:6) / norm(best_params(4:6)); % Normalize
+    radius = abs(best_params(7));
 end
 
-%% ---- BEST-FIT ROTATION TO NOMINAL ----
-% Stack directions for Wahba problem
-A = axis_act';
-B = repmat(axis_nom(:),1,2);
-
-% SVD-based optimal rotation
-H = A*B';
-[U,~,Vt] = svd(H);
-Rmat = Vt*U';
-
-if det(Rmat) < 0
-    Vt(:,3) = -Vt(:,3);
-    Rmat = Vt*U';
+function res = cylinderResiduals(params, points)
+    p = params(1:3);      % Point on axis
+    v = params(4:6);      % Axis direction
+    v = v / norm(v);      % Ensure unit vector
+    r = params(7);        % Radius
+    
+    % Distance from each point to the axis
+    % Formula: ||(q - p) x v||
+    diff = points - p;
+    distToAxis = sqrt(sum(cross(diff, repmat(v, size(points, 1), 1)).^2, 2));
+    
+    % Residual is (distance to axis - radius)
+    res = distToAxis - r;
 end
-
-%% ---- TRANSLATION (use first hole as reference) ----
-V_rot = (Rmat * V')';
-t = center_nom(1,:) - (Rmat * center_act(1,:)')';
-V_rot = V_rot + t;
-
-%% Write aligned STL
-TRout = triangulation(TR.ConnectivityList, V_rot);
-stlwrite(TRout, stlOut);
-
-%% Report
-disp('Actual axes:'); disp(axis_act)
-disp('Nominal axis:'); disp(axis_nom)
-fprintf('Aligned STL written to %s\n', stlOut);
