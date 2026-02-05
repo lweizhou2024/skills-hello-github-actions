@@ -1,43 +1,33 @@
-function [center, direction, radius] = fitCylinder(points)
-    % points: Nx3 matrix of (x, y, z)
+function [axisPoint, radius] = fitWithDirection(points, v_guess)
+    % 1. Normalize the direction guess
+    v = v_guess(:) / norm(v_guess);
     
-    % 1. Initial Guess
-    % Use PCA to find the primary orientation (the cylinder axis)
-    avg = mean(points);
-    [coeff, ~] = pca(points);
-    v0 = coeff(:, 1); % First principal component is a good start for the axis
-    p0 = avg;         % Centroid as a point on the axis
-    r0 = mean(sqrt(sum((points - avg).^2, 2))) / 2; % Rough guess for radius
+    % 2. Create a 2D coordinate system on the plane perpendicular to v
+    % Find any vector 'nullV' such that nullV is perpendicular to v
+    basis = null(v'); 
+    e1 = basis(:,1);
+    e2 = basis(:,2);
     
-    % Initial parameter vector: [px, py, pz, vx, vy, vz, r]
-    initial_params = [p0, v0', r0];
+    % 3. Project 3D points onto this 2D plane
+    % (Subtract mean first to keep numbers small and stable)
+    centroid = mean(points);
+    shiftedPoints = points - centroid;
     
-    % 2. Optimization
-    options = optimoptions('lsqnonlin', 'Display', 'off', 'FunctionTolerance', 1e-6);
+    xp = shiftedPoints * e1;
+    yp = shiftedPoints * e2;
     
-    % Define the objective function (residuals)
-    objFunc = @(params) cylinderResiduals(params, points);
+    % 4. Fit a circle to (xp, yp) using a linear least squares approach
+    % Equation: (x-xc)^2 + (y-yc)^2 = r^2  => x^2 - 2x*xc + xc^2 + y^2 - 2y*yc + yc^2 = r^2
+    % Rearranged: 2x*xc + 2y*yc + C = x^2 + y^2  where C = r^2 - xc^2 - yc^2
+    A = [2*xp, 2*yp, ones(size(xp))];
+    b = xp.^2 + yp.^2;
+    params = A\b;
     
-    % Run optimization
-    best_params = lsqnonlin(objFunc, initial_params, [], [], options);
+    xc = params(1);
+    yc = params(2);
+    radius = sqrt(params(3) + xc^2 + yc^2);
     
-    % 3. Extract results
-    center = best_params(1:3);
-    direction = best_params(4:6) / norm(best_params(4:6)); % Normalize
-    radius = abs(best_params(7));
-end
-
-function res = cylinderResiduals(params, points)
-    p = params(1:3);      % Point on axis
-    v = params(4:6);      % Axis direction
-    v = v / norm(v);      % Ensure unit vector
-    r = params(7);        % Radius
-    
-    % Distance from each point to the axis
-    % Formula: ||(q - p) x v||
-    diff = points - p;
-    distToAxis = sqrt(sum(cross(diff, repmat(v, size(points, 1), 1)).^2, 2));
-    
-    % Residual is (distance to axis - radius)
-    res = distToAxis - r;
+    % 5. Convert 2D center back to 3D
+    % The axis point is the centroid + the 2D offsets along the basis vectors
+    axisPoint = centroid + xc*e1' + yc*e2';
 end
