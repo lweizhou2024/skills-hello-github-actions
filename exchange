@@ -1,109 +1,97 @@
-[F,V] = stlread('scan.stl');   % F: faces, V: vertices
+stlIn  = 'scan.stl';
+stlOut = 'scan_aligned.stl';
 
+% ---- supplied by you ----
+yzPairCenter = [ ...
+     12.3   5.1 ;    % pair 1 Y Z
+    -25.4   5.0 ];   % pair 2 Y Z
+
+R = 5.0;                      % hole radius
+
+% nominal data (same axis direction for both holes)
+axis_nom = [1 0 0];           % unit vector
+center_nom = [ ...
+     10  5  0 ;               % nominal center for pair 1 (smaller X hole)
+    -20  5  0 ];              % nominal center for pair 2
+%% Read STL (correct triangulation form)
+TR = stlread(stlIn);
+V  = TR.Points;
+F  = TR.ConnectivityList;
+
+%% Triangle centroids and normals
 v1 = V(F(:,1),:);
 v2 = V(F(:,2),:);
 v3 = V(F(:,3),:);
 
-C = (v1 + v2 + v3)/3;          % triangle centroids
+C = (v1 + v2 + v3)/3;
+
 N = cross(v2-v1, v3-v1, 2);
-N = N ./ vecnorm(N,2,2);       % triangle normals
+N = N ./ vecnorm(N,2,2);
 
+%% Remove surfaces perpendicular to X
+xdir = [1 0 0];
+keep = abs(N*xdir') < 0.3;
+C = C(keep,:);
+F = F(keep,:);
 
-z = [0 0 1];
-nz = abs(N*z');
+%% Storage
+axis_act = zeros(2,3);
+center_act = zeros(2,3);
 
-idx = nz < 0.25;     % normals nearly horizontal
-C = C(idx,:);
-N = N(idx,:);
-
-numIter = 5000;
-centers = zeros(numIter,2);
-
-for k = 1:numIter
-    id = randperm(size(C,1),2);
-    n1 = N(id(1),1:2);
-    n2 = N(id(2),1:2);
+%% ---- LOOP OVER TWO COAXIAL PAIRS ----
+for p = 1:2
     
-    if abs(det([n1; n2])) < 1e-3
-        continue
+    %% 1) Keep points near supplied YZ center
+    dy = C(:,2) - yzPairCenter(p,1);
+    dz = C(:,3) - yzPairCenter(p,2);
+    idx = (dy.^2 + dz.^2) < (2*R)^2;
+    
+    Cp = C(idx,:);
+    
+    %% 2) Separate coaxial holes by X
+    xvals = Cp(:,1);
+    [idxX,~] = kmeans(xvals,2,'Replicates',5);
+    
+    % choose cluster with smaller X
+    if mean(xvals(idxX==1)) < mean(xvals(idxX==2))
+        Ci = Cp(idxX==1,:);
+    else
+        Ci = Cp(idxX==2,:);
     end
     
-    p1 = C(id(1),1:2);
-    p2 = C(id(2),1:2);
+    %% 3) Fit axis for this hole (PCA)
+    Ci_mean = mean(Ci,1);
+    [coeff,~,~] = pca(Ci - Ci_mean);
     
-    % solve for center in XY
-    A = [n1; n2];
-    b = [dot(n1,p1); dot(n2,p2)];
-    centers(k,:) = A\b;
+    axis_act(p,:) = coeff(:,1)' / norm(coeff(:,1));
+    center_act(p,:) = Ci_mean;
 end
 
-centers = centers(any(centers,2),:);
+%% ---- BEST-FIT ROTATION TO NOMINAL ----
+% Stack directions for Wahba problem
+A = axis_act';
+B = repmat(axis_nom(:),1,2);
 
+% SVD-based optimal rotation
+H = A*B';
+[U,~,Vt] = svd(H);
+Rmat = Vt*U';
 
-[idxC, ctrs] = kmeans(centers,4,'Replicates',10);
-holeCentersXY = ctrs;
-
-
-XY = C(:,1:2);
-D = pdist2(XY, holeCentersXY);
-[~,hid] = min(D,[],2);
-
-good = false(4,1);
-
-for i = 1:4
-    Ci = C(hid==i,:);
-    
-    xc = holeCentersXY(i,1);
-    yc = holeCentersXY(i,2);
-    
-    theta = atan2(Ci(:,2)-yc, Ci(:,1)-xc);
-    
-    % angular coverage
-    edges = linspace(-pi,pi,36);
-    occ = histcounts(theta,edges) > 0;
-    coverage = sum(occ)/numel(occ);
-    
-    % Z span (through-hole)
-    zspan = max(Ci(:,3)) - min(Ci(:,3));
-    
-    if coverage > 0.6 && zspan > 0.3*range(C(:,3))
-        good(i) = true;
-    end
+if det(Rmat) < 0
+    Vt(:,3) = -Vt(:,3);
+    Rmat = Vt*U';
 end
 
-holes = struct;
-k = 0;
+%% ---- TRANSLATION (use first hole as reference) ----
+V_rot = (Rmat * V')';
+t = center_nom(1,:) - (Rmat * center_act(1,:)')';
+V_rot = V_rot + t;
 
-for i = find(good)'
-    Ci = C(hid==i,:);
-    k = k+1;
-    
-    % Axis direction
-    d = [0 0 1];
-    
-    % Axis point
-    xc = holeCentersXY(i,1);
-    yc = holeCentersXY(i,2);
-    zc = mean(Ci(:,3));
-    
-    % Radius
-    r = sqrt((Ci(:,1)-xc).^2 + (Ci(:,2)-yc).^2);
-    
-    holes(k).axis = d;
-    holes(k).point = [xc yc zc];
-    holes(k).radius = median(r);
-end
+%% Write aligned STL
+TRout = triangulation(TR.ConnectivityList, V_rot);
+stlwrite(TRout, stlOut);
 
-P = reshape([holes.point],3,[])';
-[idxPair,~] = kmeans(P(:,1:2),2);
-
-for i = 1:2
-    pair{i} = find(idxPair==i);
-end
-trisurf(F,V(:,1),V(:,2),V(:,3),'FaceAlpha',0.15,'EdgeColor','none');
-hold on
-for i = 1:numel(holes)
-    p = holes(i).point;
-    plot3(p(1),p(2),p(3),'ro','MarkerSize',8,'LineWidth',2)
-end
-axis equal
+%% Report
+disp('Actual axes:'); disp(axis_act)
+disp('Nominal axis:'); disp(axis_nom)
+fprintf('Aligned STL written to %s\n', stlOut);
