@@ -1,23 +1,38 @@
-% Simple approach: interpolate onto a grid, filter, then sample back
+% Step 1: figure out grid spacing (use a small sample, not all points)
+dx = median(diff(xv(1:10000)));  % fast, no unique needed
+dy = median(diff(yv(1:10000)));  % assumes data is roughly row/col ordered
+% OR if not ordered:
+dx = median(diff(sort(xv(1:50000))));  % sample only
+dy = median(diff(sort(yv(1:50000))));
 
-% 1. Make a grid covering your data extent
-nx = 1000; ny = 1000;  % resolution, adjust as needed
-xg = linspace(min(xv), max(xv), nx);
-yg = linspace(min(yv), max(yv), ny);
-[Xg, Yg] = meshgrid(xg, yg);
+fprintf('dx=%.6f, dy=%.6f\n', dx, dy);
+% Step 2: map x,y to integer indices
+ix = round((xv - min(xv)) / dx) + 1;
+iy = round((yv - min(yv)) / dy) + 1;
 
-% 2. Interpolate scattered roughness onto grid
-F = scatteredInterpolant(xv, yv, roughness, 'linear', 'none');
-Zg = F(Xg, Yg);  % NaN outside data boundary naturally
+nx = max(ix);
+ny = max(iy);
+fprintf('Grid size: %d x %d = %d, have %d points\n', nx, ny, nx*ny, numel(xv));
+% Step 3: fill grid
+Zgrid = nan(ny, nx);  % or zeros(ny,nx) for fixed value
+idx = sub2ind([ny, nx], iy, ix);
+Zgrid(idx) = roughness_final;  % or zv, or whatever z array you have
+% Step 4: build full X,Y grids if needed
+xg = min(xv) + (0:nx-1) * dx;
+yg = min(yv) + (0:ny-1) * dy;
+[Xgrid, Ygrid] = meshgrid(xg, yg);
 
-% 3. Gaussian filter to get waviness on grid
-sigma = 30;  % tune this
-waviness_g = imgaussfilt(Zg, sigma, 'FilterDomain', 'spatial');  
-% 'spatial' handles NaNs better, but not perfectly
+fprintf('Missing points: %d / %d (%.1f%%)\n', ...
+    sum(isnan(Zgrid(:))), numel(Zgrid), ...
+    100*mean(isnan(Zgrid(:))));
 
-% 4. Sample waviness back at original scattered points
-Fw = scatteredInterpolant(Xg(~isnan(Zg)), Yg(~isnan(Zg)), ...
-     waviness_g(~isnan(Zg)), 'linear', 'none');
-waviness_pts = Fw(xv, yv);
+imagesc(Zgrid); axis equal tight; colorbar;
+title('Gridded data (NaN = missing)');
 
-roughness_final = roughness - waviness_pts;
+% Should be all 1s if no duplicates
+counts = accumarray(idx, 1, [ny*nx, 1]);
+fprintf('Max points per cell: %d\n', max(counts));
+fprintf('Duplicate cells: %d\n', sum(counts > 1));
+
+Zgrid_flat = accumarray(idx, zv, [ny*nx, 1], @mean, NaN);
+Zgrid = reshape(Zgrid_flat, ny, nx);
