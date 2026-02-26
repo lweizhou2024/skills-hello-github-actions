@@ -1,6 +1,23 @@
-img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    
-    # 5. Write to video
-    video_writer.write(img)
+% Simple approach: interpolate onto a grid, filter, then sample back
+
+% 1. Make a grid covering your data extent
+nx = 1000; ny = 1000;  % resolution, adjust as needed
+xg = linspace(min(xv), max(xv), nx);
+yg = linspace(min(yv), max(yv), ny);
+[Xg, Yg] = meshgrid(xg, yg);
+
+% 2. Interpolate scattered roughness onto grid
+F = scatteredInterpolant(xv, yv, roughness, 'linear', 'none');
+Zg = F(Xg, Yg);  % NaN outside data boundary naturally
+
+% 3. Gaussian filter to get waviness on grid
+sigma = 30;  % tune this
+waviness_g = imgaussfilt(Zg, sigma, 'FilterDomain', 'spatial');  
+% 'spatial' handles NaNs better, but not perfectly
+
+% 4. Sample waviness back at original scattered points
+Fw = scatteredInterpolant(Xg(~isnan(Zg)), Yg(~isnan(Zg)), ...
+     waviness_g(~isnan(Zg)), 'linear', 'none');
+waviness_pts = Fw(xv, yv);
+
+roughness_final = roughness - waviness_pts;
