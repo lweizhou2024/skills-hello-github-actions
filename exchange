@@ -1,38 +1,33 @@
-% Step 1: figure out grid spacing (use a small sample, not all points)
-dx = median(diff(xv(1:10000)));  % fast, no unique needed
-dy = median(diff(yv(1:10000)));  % assumes data is roughly row/col ordered
-% OR if not ordered:
-dx = median(diff(sort(xv(1:50000))));  % sample only
-dy = median(diff(sort(yv(1:50000))));
+import ctypes
+from ctypes import wintypes
+import os
+import time
+from PIL import ImageGrab
 
-fprintf('dx=%.6f, dy=%.6f\n', dx, dy);
-% Step 2: map x,y to integer indices
-ix = round((xv - min(xv)) / dx) + 1;
-iy = round((yv - min(yv)) / dy) + 1;
+folder = r"C:\screenshots"
+os.makedirs(folder, exist_ok=True)
 
-nx = max(ix);
-ny = max(iy);
-fprintf('Grid size: %d x %d = %d, have %d points\n', nx, ny, nx*ny, numel(xv));
-% Step 3: fill grid
-Zgrid = nan(ny, nx);  % or zeros(ny,nx) for fixed value
-idx = sub2ind([ny, nx], iy, ix);
-Zgrid(idx) = roughness_final;  % or zv, or whatever z array you have
-% Step 4: build full X,Y grids if needed
-xg = min(xv) + (0:nx-1) * dx;
-yg = min(yv) + (0:ny-1) * dy;
-[Xgrid, Ygrid] = meshgrid(xg, yg);
+user32 = ctypes.windll.user32
 
-fprintf('Missing points: %d / %d (%.1f%%)\n', ...
-    sum(isnan(Zgrid(:))), numel(Zgrid), ...
-    100*mean(isnan(Zgrid(:))));
+MOD_NONE = 0
+VK_F8 = 0x77
 
-imagesc(Zgrid); axis equal tight; colorbar;
-title('Gridded data (NaN = missing)');
+if not user32.RegisterHotKey(None, 1, MOD_NONE, VK_F8):
+    raise RuntimeError("Failed to register hotkey")
 
-% Should be all 1s if no duplicates
-counts = accumarray(idx, 1, [ny*nx, 1]);
-fprintf('Max points per cell: %d\n', max(counts));
-fprintf('Duplicate cells: %d\n', sum(counts > 1));
+print("Press F8 to take screenshot, ESC to exit")
 
-Zgrid_flat = accumarray(idx, zv, [ny*nx, 1], @mean, NaN);
-Zgrid = reshape(Zgrid_flat, ny, nx);
+i = 1
+
+msg = wintypes.MSG()
+
+while True:
+    if user32.GetMessageA(ctypes.byref(msg), None, 0, 0) != 0:
+        if msg.message == 0x0312:  # WM_HOTKEY
+            img = ImageGrab.grab()
+            filename = os.path.join(folder, f"a{i}.png")
+            img.save(filename)
+            print("Saved", filename)
+            i += 1
+        elif msg.message == 0x0100 and msg.wParam == 0x1B:  # ESC
+            break
