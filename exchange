@@ -1,7 +1,6 @@
 import ctypes
 from ctypes import wintypes
 import os
-import time
 from PIL import ImageGrab
 
 folder = r"C:\screenshots"
@@ -11,23 +10,38 @@ user32 = ctypes.windll.user32
 
 MOD_NONE = 0
 VK_F8 = 0x77
+VK_ESC = 0x1B
 
-if not user32.RegisterHotKey(None, 1, MOD_NONE, VK_F8):
-    raise RuntimeError("Failed to register hotkey")
+HOTKEY_SCREENSHOT = 1
+HOTKEY_EXIT = 2
 
-print("Press F8 to take screenshot, ESC to exit")
+# Register hotkeys
+if not user32.RegisterHotKey(None, HOTKEY_SCREENSHOT, MOD_NONE, VK_F8):
+    raise RuntimeError("Failed to register F8")
+
+if not user32.RegisterHotKey(None, HOTKEY_EXIT, MOD_NONE, VK_ESC):
+    raise RuntimeError("Failed to register ESC")
+
+print("Press F8 to take screenshot")
+print("Press ESC to exit")
 
 i = 1
-
 msg = wintypes.MSG()
 
 while True:
-    if user32.GetMessageA(ctypes.byref(msg), None, 0, 0) != 0:
-        if msg.message == 0x0312:  # WM_HOTKEY
+    user32.GetMessageA(ctypes.byref(msg), None, 0, 0)
+
+    if msg.message == 0x0312:  # WM_HOTKEY
+        if msg.wParam == HOTKEY_SCREENSHOT:
             img = ImageGrab.grab()
             filename = os.path.join(folder, f"a{i}.png")
             img.save(filename)
             print("Saved", filename)
             i += 1
-        elif msg.message == 0x0100 and msg.wParam == 0x1B:  # ESC
+
+        elif msg.wParam == HOTKEY_EXIT:
             break
+
+user32.UnregisterHotKey(None, HOTKEY_SCREENSHOT)
+user32.UnregisterHotKey(None, HOTKEY_EXIT)
+print("Program exited")
