@@ -1,35 +1,54 @@
-% Define your line segment (e.g., from origin along Z)
-P1 = [0, 0, 0]; 
-P2 = [0, 0, 1000]; 
+%% 1. Read in the Image
+img = imread('your_image.jpg'); % Replace with your filename
 
-% Get vertex data from your triangulation
-V1 = V(F(:,1), :); % Coordinates of first vertices
-V2 = V(F(:,2), :); % Coordinates of second vertices
-V3 = V(F(:,3), :); % Coordinates of third vertices
+%% 2. Define Corner Points (Non-Integer allowed)
+% Order: [Top-Left; Top-Right; Bottom-Right; Bottom-Left]
+movingPoints = [152.4, 80.1; 
+                450.8, 120.3; 
+                430.2, 500.9; 
+                100.5, 460.2]; 
 
-% Vector directions
-D = P2 - P1;
-edge1 = V2 - V1;
-edge2 = V3 - V1;
-pvec = cross(repmat(D, size(edge1,1), 1), edge2, 2);
-det = sum(edge1 .* pvec, 2);
+% Define Target Rectangular Dimensions (after stretching/scaling)
+targetWidth  = 500.5; 
+targetHeight = 750.2;
 
-% Check for intersections (Möller-Trumbore algorithm)
-inv_det = 1 ./ det;
-tvec = repmat(P1, size(V1,1), 1) - V1;
-u = sum(tvec .* pvec, 2) .* inv_det;
-qvec = cross(tvec, edge1, 2);
-v = sum(repmat(D, size(edge1,1), 1) .* qvec, 2) .* inv_det;
-t = sum(edge2 .* qvec, 2) .* inv_det;
+fixedPoints = [0, 0; 
+               targetWidth, 0; 
+               targetWidth, targetHeight; 
+               0, targetHeight];
 
-% logical mask for hits: 
-% u, v are barycentric coordinates; t is the distance along the line
-hit_mask = (abs(det) > 1e-6) & (u >= 0) & (v >= 0) & (u + v <= 1) & (t >= 0 & t <= 1);
+% Compute the Projective Transformation (Homography)
+tform = fitgeotrans(movingPoints, fixedPoints, 'projective');
 
-% Extract the coordinates of the intersection
-intersection_points = P1 + t(hit_mask) .* D;
+% Define the output spatial reference (handling the non-integer scale)
+% we round the size for the pixel grid, but coordinates remain precise
+Rout = imref2d([round(targetHeight), round(targetWidth)], ...
+               [0, targetWidth], [0, targetHeight]);
 
+% Perform the Transformation
+% 'cubic' interpolation is best for maintaining quality during stretches
+undistortedImg = imwarp(img, tform, 'OutputView', Rout, 'Interp', 'cubic');
 
+%% 3. Plot the Result
+figure;
+imshow(undistortedImg);
 hold on;
-plot3(intersection_points(:,1), intersection_points(:,2), intersection_points(:,3), ...
-    'yp', 'MarkerSize', 15, 'MarkerFaceColor', 'y'); % Yellow Pentagram for the hit
+title('Perspective Corrected with Circle Overlay');
+
+%% 4. Overlay 8 Circles
+% Define 8 center points [x, y]
+centers = [100.5, 150.2; 200.1, 150.2; 300.7, 150.2; 400.3, 150.2;
+           100.5, 400.8; 200.1, 400.8; 300.7, 400.8; 400.3, 400.8];
+
+radius = 35.5; % Same radius for all circles
+
+% Use viscircles for easy dashed-line formatting
+% 'LineStyle', '--' creates the dashed effect
+h = viscircles(centers, repmat(radius, 8, 1), ...
+               'Color', 'r', ...
+               'LineStyle', '--', ...
+               'LineWidth', 1.5);
+
+% Optional: Add a legend or labels
+plot(centers(:,1), centers(:,2), 'r+', 'MarkerSize', 5); % Mark centers
+hold off;
