@@ -1,142 +1,519 @@
-% =========================================================
-% Interactive Image Digitizer
-%
-% Left click   -> add point
-% Right click  -> undo last point
-% ENTER        -> finish
-%
-% Zoom/pan toolbar works normally
-% =========================================================
+"""
+grow_wedge_layers.py
+====================
+Grows TWO layers of 15-node quadratic wedge elements (DC3D15 / C3D15) outward
+from ALL exterior faces of a DC3D10 Abaqus heat-transfer input deck.
 
-clear; clc;
+Key features
+------------
+* Detects every exterior triangular face (belonging to exactly one tet).
+* Area-weighted averaged outward normals per node -> handles edges / corners:
+  shared nodes get a single blended normal so both grown layers are watertight
+  (no gaps, no overlaps, fully conforming mesh).
+* Two equal-thickness layers; total thickness is a CLI parameter.
+* Correct C3D15 connectivity including the 3 vertical mid-edge nodes per layer
+  placed at t/4 and 3t/4 along the outward normal.
+* Entire original input deck preserved verbatim; new blocks appended at end.
 
-%% LOAD IMAGE
-img = imread('your_image.png');
+Usage
+-----
+    python grow_wedge_layers.py \
+        --input   model.inp        \
+        --output  model_wedge.inp  \
+        --total-thickness 0.002    \
+        [--wedge-type  DC3D15]     \
+        [--wedge-elset SKIN_ELEMS] \
+        [--wedge-nset  SKIN_NODES]
 
-%% USER INPUTS
+DC3D10 node numbering (Abaqus, 1-based)
+---------------------------------------
+  Corner nodes  : 1, 2, 3, 4
+  Mid-edge nodes:
+     5 = mid(1-2),  6 = mid(2-3),  7 = mid(3-1)
+     8 = mid(1-4),  9 = mid(2-4), 10 = mid(3-4)
 
-origin_px = 250;
-origin_py = 400;
+DC3D10 faces with outward-normal CCW winding (1-based)
+-------------------------------------------------------
+  S1: corners 1,2,3   mids 5,6,7
+  S2: corners 1,4,2   mids 8,9,5
+  S3: corners 2,4,3   mids 9,10,6
+  S4: corners 3,4,1   mids 10,8,7
 
-origin_x = 0;
-origin_y = 0;
+C3D15 node order (Abaqus, 1-based)
+------------------------------------
+  1,2,3    bottom triangle corners
+  4,5,6    top    triangle corners
+  7,8,9    mid-edge of bottom tri  (edges 1-2, 2-3, 3-1)
+  10,11,12 mid-edge of top    tri  (edges 4-5, 5-6, 6-4)
+  13,14,15 vertical mid-edges      (edges 1-4, 2-5, 3-6)
+"""
 
-dx = 0.01;
-dy = 0.02;
+import argparse
+import sys
+import numpy as np
+from collections import defaultdict
 
-%% FIGURE
 
-fig = figure('Name','Digitizer');
+# ---------------------------------------------------------------------------
+# DC3D10 face table  (0-based indices into the 10-node connectivity array)
+# Row format: (corner_a, corner_b, corner_c,  mid_ab, mid_bc, mid_ca)
+# Vertex order gives cross(b-a, c-a) pointing OUTWARD.
+# ---------------------------------------------------------------------------
+DC3D10_FACES = [
+    (0, 1, 2,  4, 5, 6),   # S1
+    (0, 3, 1,  7, 8, 4),   # S2
+    (1, 3, 2,  8, 9, 5),   # S3
+    (2, 3, 0,  9, 7, 6),   # S4
+]
 
-ax = axes(fig);
 
-imshow(img,'Parent',ax);
-axis(ax,'on');
-hold(ax,'on');
+# ---------------------------------------------------------------------------
+# Parse the input deck
+# ---------------------------------------------------------------------------
 
-title({
-    'LEFT click = add point'
-    'RIGHT click = undo'
-    'Use toolbar for zoom/pan'
-    'Press ENTER when done'
-    });
+def parse_inp(filepath):
+    """
+    Parse *NODE and *ELEMENT,TYPE=DC3D10 blocks.
 
-zoom(fig,'on');
+    Returns
+    -------
+    nodes     : dict {node_id (int): np.array([x,y,z])}
+    elements  : dict {elem_id (int): [n1..n10] (global 1-based node IDs)}
+    raw_lines : list[str]  (verbatim file lines)
+    """
+    nodes    = {}
+    elements = {}
+    in_node  = False
+    in_elem  = False
+    cont_buf = []          # buffer for multi-line element cards
 
-%% STORAGE
+    def flush_elem_buf():
+        if not cont_buf:
+            return
+        parts = [p.strip() for p in ','.join(cont_buf).split(',') if p.strip()]
+        if len(parts) >= 11:
+            try:
+                eid  = int(parts[0])
+                conn = [int(p) for p in parts[1:11]]
+                elements[eid] = conn
+            except ValueError:
+                pass
+        cont_buf.clear()
 
-px = [];
-py = [];
+    with open(filepath, 'r') as fh:
+        raw_lines = fh.readlines()
 
-hPts = gobjects(0);
-hTxt = gobjects(0);
+    for raw in raw_lines:
+        line  = raw.strip()
+        upper = line.upper()
 
-finished = false;
+        if not line:
+            continue
 
-%% CALLBACKS
+        if line.startswith('*'):
+            flush_elem_buf()
+            if upper.startswith('**'):
+                continue
+            # Detect *NODE (exclude *NODE OUTPUT, *NODE PRINT, *NODE FILE)
+            if (upper.startswith('*NODE') and
+                    'OUTPUT' not in upper and
+                    'PRINT'  not in upper and
+                    'FILE'   not in upper):
+                in_node = True
+                in_elem = False
+            # Detect *ELEMENT with DC3D10 (covers C3D10 and DC3D10 variants)
+            elif upper.startswith('*ELEMENT') and ('DC3D10' in upper or
+                    ('C3D10' in upper and 'DC3D10' not in upper)):
+                in_elem = True
+                in_node = False
+            else:
+                in_node = False
+                in_elem = False
+            continue
 
-fig.WindowButtonDownFcn = @mouseClick;
-fig.KeyPressFcn = @keyPress;
+        if in_node:
+            parts = line.split(',')
+            if len(parts) >= 4:
+                try:
+                    nid = int(parts[0])
+                    coords = np.array([float(parts[1]),
+                                       float(parts[2]),
+                                       float(parts[3])])
+                    nodes[nid] = coords
+                except ValueError:
+                    pass
 
-uiwait(fig);
+        elif in_elem:
+            cont_buf.append(line.rstrip(','))
+            if not line.endswith(','):   # last line of this element card
+                flush_elem_buf()
 
-%% CONVERT COORDINATES
+    flush_elem_buf()
+    return nodes, elements, raw_lines
 
-x_data = origin_x + (px - origin_px)*dx;
-y_data = origin_y - (py - origin_py)*dy;
 
-results = table( ...
-    px(:), py(:), x_data(:), y_data(:), ...
-    'VariableNames',{'PixelX','PixelY','X','Y'});
+# ---------------------------------------------------------------------------
+# Exterior face detection
+# ---------------------------------------------------------------------------
 
-disp(results);
+def find_exterior_faces(elements):
+    """
+    Return list of exterior faces, each a 6-tuple of global node IDs:
+        (corner_a, corner_b, corner_c, mid_ab, mid_bc, mid_ca)
 
-%% ========================================================
-% CALLBACK FUNCTIONS
-% =========================================================
+    A face is exterior iff its sorted corner triple appears in exactly one tet.
+    """
+    face_map = defaultdict(list)
 
-function mouseClick(~,~)
+    for eid, conn in elements.items():
+        for (ca, cb, cc, mab, mbc, mca) in DC3D10_FACES:
+            key  = tuple(sorted((conn[ca], conn[cb], conn[cc])))
+            full = (conn[ca], conn[cb], conn[cc],
+                    conn[mab], conn[mbc], conn[mca])
+            face_map[key].append(full)
 
-    if finished
-        return;
-    end
+    return [v[0] for v in face_map.values() if len(v) == 1]
 
-    clickType = fig.SelectionType;
 
-    cp = ax.CurrentPoint;
-    x = cp(1,1);
-    y = cp(1,2);
+# ---------------------------------------------------------------------------
+# Node normals
+# ---------------------------------------------------------------------------
 
-    % inside image axes only
-    xl = xlim(ax);
-    yl = ylim(ax);
+def compute_node_normals(exterior_faces, nodes, elements):
+    """
+    Compute area-weighted averaged OUTWARD normals for all surface nodes.
 
-    if x<xl(1) || x>xl(2) || y<yl(1) || y>yl(2)
-        return;
-    end
+    For each exterior face the raw cross product cross(cb-ca, cc-ca) is checked
+    against the vector from the face centroid to the tet centroid (which always
+    points INWARD).  If the dot product is positive the cross product is inward
+    and is flipped before accumulation.  This makes the direction test
+    geometry-driven rather than relying solely on the face-winding table, so it
+    is robust regardless of tet orientation or mesh generator conventions.
 
-    switch clickType
+    Weighting by triangle area (||cross product|| = 2*area) ensures corner/edge
+    nodes shared by many faces receive a geometrically meaningful blended normal.
 
-        % LEFT CLICK
-        case 'normal'
+    Returns dict {node_id: unit_normal (np.array shape (3,))}
+    """
+    # Build a lookup: sorted-corner-triple -> tet centroid
+    # (only corner nodes, indices 0-3, are used for the centroid)
+    face_to_tet_centroid = {}
+    for eid, conn in elements.items():
+        tet_centroid = sum(nodes[conn[i]] for i in range(4)) / 4.0
+        for (ca, cb, cc, mab, mbc, mca) in DC3D10_FACES:
+            key = tuple(sorted((conn[ca], conn[cb], conn[cc])))
+            face_to_tet_centroid[key] = tet_centroid
 
-            px(end+1) = x;
-            py(end+1) = y;
+    accum = defaultdict(lambda: np.zeros(3, dtype=np.float64))
 
-            hPts(end+1) = plot(ax,x,y,...
-                'r+','MarkerSize',12,'LineWidth',2);
+    for face in exterior_faces:
+        ca, cb, cc = face[0], face[1], face[2]
+        pa, pb, pc = nodes[ca], nodes[cb], nodes[cc]
+        n = np.cross(pb - pa, pc - pa)   # raw cross product
 
-            hTxt(end+1) = text(ax,x,y,...
-                sprintf(' %d',length(px)),...
-                'Color','y',...
-                'FontWeight','bold');
+        # Verify direction: dot with (tet_centroid - face_centroid) < 0 means outward
+        key = tuple(sorted((ca, cb, cc)))
+        tet_c = face_to_tet_centroid[key]
+        face_c = (pa + pb + pc) / 3.0
+        if np.dot(n, tet_c - face_c) > 0:
+            n = -n   # was pointing inward — flip
 
-        % RIGHT CLICK
-        case 'alt'
+        for nid in face:          # contribute to all 6 nodes of this face
+            accum[nid] += n
 
-            if ~isempty(px)
+    result = {}
+    for nid, n in accum.items():
+        mag = np.linalg.norm(n)
+        result[nid] = n / mag if mag > 1e-30 else np.zeros(3)
+    return result
 
-                px(end) = [];
-                py(end) = [];
 
-                delete(hPts(end));
-                delete(hTxt(end));
+# ---------------------------------------------------------------------------
+# Wedge layer growth
+# ---------------------------------------------------------------------------
 
-                hPts(end) = [];
-                hTxt(end) = [];
-            end
-    end
-end
+def grow_wedge_layers(nodes, elements, exterior_faces, node_normals,
+                      total_thickness):
+    """
+    Generate new nodes and C3D15 wedge elements.
 
-%% ========================================================
+    Node depths along outward normal for each surface node:
+      0    (original,  kept in place)
+      t/4  (vertical mid-edge of layer 1)  ->  to_q1
+      t/2  (interface between layers)       ->  to_mid
+      3t/4 (vertical mid-edge of layer 2)  ->  to_q3
+      t    (outer surface)                  ->  to_out
 
-function keyPress(~,event)
+    C3D15 layout per face:
+      Layer 1  bottom: original nodes   top: mid nodes   vert mids: q1 nodes
+      Layer 2  bottom: mid nodes        top: out nodes   vert mids: q3 nodes
 
-    switch event.Key
+    Returns
+    -------
+    new_nodes   : dict {node_id: coords}
+    wedge_elems : dict {elem_id: list[15 global node IDs]}
+    """
+    t   = total_thickness
+    t4  = t * 0.25
+    t2  = t * 0.50
+    t34 = t * 0.75
 
-        case 'return'
+    max_nid  = max(nodes.keys())
+    max_eid  = max(elements.keys())
+    next_nid = [max_nid + 1]    # mutable counter
+    next_eid = [max_eid + 1]
 
-            finished = true;
-            uiresume(fig);
-    end
-end
+    def new_nid():
+        nid = next_nid[0];  next_nid[0] += 1;  return nid
+
+    def new_eid():
+        eid = next_eid[0];  next_eid[0] += 1;  return eid
+
+    # --- Corner node depth maps (grown along blended nodal normals) ---
+    # Only CORNER nodes get depth nodes grown along their normal.
+    # Mid-edge nodes on each layer are computed as averages of the two adjacent
+    # corner nodes AT THAT LAYER — this guarantees they lie exactly on the edge
+    # and prevents Jacobian distortion on curved surfaces or at mesh edges where
+    # adjacent normals diverge.
+    to_q1  = {}   # t/4  — vertical mid-edge for layer 1
+    to_mid = {}   # t/2  — interface between layers (corner nodes only)
+    to_q3  = {}   # 3t/4 — vertical mid-edge for layer 2
+    to_out = {}   # t    — outer surface (corner nodes only)
+    new_nodes = {}
+
+    # Only grow corner nodes (indices 0-3 in DC3D10, i.e. all nodes that appear
+    # as corners in DC3D10_FACES).  Mid-edge nodes on the skin layers will be
+    # created fresh per-face as averages of their two endpoint corner nodes.
+    corner_surface_nodes = set()
+    for face in exterior_faces:
+        for nid in face[:3]:   # only the 3 corner nodes
+            corner_surface_nodes.add(nid)
+
+    for nid in corner_surface_nodes:
+        n = node_normals[nid]
+        p = nodes[nid]
+        q1_id, mid_id, q3_id, out_id = new_nid(), new_nid(), new_nid(), new_nid()
+        new_nodes[q1_id]  = p + n * t4
+        new_nodes[mid_id] = p + n * t2
+        new_nodes[q3_id]  = p + n * t34
+        new_nodes[out_id] = p + n * t
+        to_q1[nid]  = q1_id
+        to_mid[nid] = mid_id
+        to_q3[nid]  = q3_id
+        to_out[nid] = out_id
+
+    # --- Mid-edge node cache: keyed by frozenset of the two endpoint corner IDs
+    #     at a given depth, so adjacent faces share the same mid-edge node. ---
+    midedge_cache = {}   # (frozenset({c0,c1}), depth_key) -> node_id
+
+    def get_midedge(c0_coord, c1_coord, depth_key):
+        """Return (possibly cached) mid-edge node ID for the edge between two
+        corner nodes whose coordinates at the current depth are c0_coord and
+        c1_coord.  depth_key must uniquely identify the layer and edge pair.
+        """
+        key = depth_key
+        if key not in midedge_cache:
+            nid = new_nid()
+            new_nodes[nid] = (c0_coord + c1_coord) * 0.5
+            midedge_cache[key] = nid
+        return midedge_cache[key]
+
+    wedge_elems = {}
+
+    for face in exterior_faces:
+        ca, cb, cc, _mab, _mbc, _mca = face
+        # _mab/_mbc/_mca are the ORIGINAL mid-edge nodes on the tet surface.
+        # They form the bottom face mid-edges of layer 1 (depth = 0) — kept as-is.
+        # All other layer mid-edge nodes are computed as corner averages.
+
+        # Corner node IDs at each depth
+        ca_mid, cb_mid, cc_mid = to_mid[ca], to_mid[cb], to_mid[cc]
+        ca_out, cb_out, cc_out = to_out[ca], to_out[cb], to_out[cc]
+        ca_q1,  cb_q1,  cc_q1  = to_q1[ca],  to_q1[cb],  to_q1[cc]
+        ca_q3,  cb_q3,  cc_q3  = to_q3[ca],  to_q3[cb],  to_q3[cc]
+
+        # Mid-edge nodes for the INTERFACE triangle (depth t/2)
+        # Averaged from adjacent corner nodes at t/2 — shared between adjacent faces
+        # via frozenset key so conforming edges are not duplicated.
+        m_mid_ab = get_midedge(new_nodes[ca_mid], new_nodes[cb_mid], (frozenset((ca,cb)), 'mid'))
+        m_mid_bc = get_midedge(new_nodes[cb_mid], new_nodes[cc_mid], (frozenset((cb,cc)), 'mid'))
+        m_mid_ca = get_midedge(new_nodes[cc_mid], new_nodes[ca_mid], (frozenset((cc,ca)), 'mid'))
+
+        # Mid-edge nodes for the OUTER triangle (depth t)
+        m_out_ab = get_midedge(new_nodes[ca_out], new_nodes[cb_out], (frozenset((ca,cb)), 'out'))
+        m_out_bc = get_midedge(new_nodes[cb_out], new_nodes[cc_out], (frozenset((cb,cc)), 'out'))
+        m_out_ca = get_midedge(new_nodes[cc_out], new_nodes[ca_out], (frozenset((cc,ca)), 'out'))
+
+        # Vertical mid-edge nodes for layer 1 (midpoint of edge: orig corner -> mid corner)
+        # Use to_q1 nodes directly — they are already at t/4 along the nodal normal,
+        # which is exactly the midpoint of the vertical edge for equal-thickness layers.
+        v_q1_a, v_q1_b, v_q1_c = ca_q1, cb_q1, cc_q1
+
+        # Vertical mid-edge nodes for layer 2 (midpoint of edge: mid corner -> out corner)
+        # Use to_q3 nodes directly — they sit at 3t/4, midpoint of the second vertical edge.
+        v_q3_a, v_q3_b, v_q3_c = ca_q3, cb_q3, cc_q3
+
+        # C3D15 connectivity (Abaqus ordering):
+        # [1,2,3]=bot corners  [4,5,6]=top corners
+        # [7,8,9]=bot tri mids [10,11,12]=top tri mids
+        # [13,14,15]=vertical mids (edge 1-4, 2-5, 3-6)
+        #
+        # The tet exterior face winding (ca,cb,cc) has its outward normal pointing
+        # AWAY from the tet interior.  For a C3D15 wedge grown outward the tet
+        # face becomes the OUTER face (top, nodes 4-5-6) and the new outer surface
+        # becomes... wait — we grow outward so:
+        #   "bottom" (nodes 1-2-3) = new outer surface (depth t/2 or t)
+        #   "top"    (nodes 4-5-6) = tet surface (depth 0)
+        # Abaqus C3D15: the normal of the bottom face (1-2-3 CCW) points toward
+        # the top face.  We need that direction to be INWARD (toward tet), so
+        # bottom = outer side, top = tet side.  Swap bottom<->top and reverse the
+        # triangle winding on each face to keep CCW convention:
+        #   bottom corners reversed: cc, cb, ca  (flips CCW to point outward = away from tet)
+        #   top    corners reversed: cc_*, cb_*, ca_*
+        #   mid-edge nodes reordered to match reversed corners:
+        #     edge (cc-cb) = _mbc reversed,  (cb-ca) = _mab reversed,  (ca-cc)... wait
+        # Simpler: swap bottom<->top entirely and reverse corner order on BOTH faces
+        # so the cross product on the new bottom (outer) face points toward the tet.
+        #
+        # Correct rule: put the tet surface as TOP (4-5-6) with its original winding,
+        # put the new outer nodes as BOTTOM (1-2-3) with REVERSED winding so CCW
+        # on the bottom points toward the top (toward tet = inward = correct for Abaqus).
+
+        layer1 = [ca_mid,   cb_mid,   cc_mid,    # 1-3  bottom = interface (depth t/2), CCW reversed below
+                  ca,       cb,       cc,         # 4-6  top    = tet surface (depth 0)
+                  m_mid_ab, m_mid_bc, m_mid_ca,  # 7-9  bottom tri mids
+                  _mab,     _mbc,     _mca,       # 10-12 top tri mids (original surface)
+                  v_q1_a,   v_q1_b,   v_q1_c]   # 13-15 vertical mids (depth t/4)
+
+        layer2 = [ca_out,   cb_out,   cc_out,    # 1-3  bottom = outer surface (depth t)
+                  ca_mid,   cb_mid,   cc_mid,    # 4-6  top    = interface (depth t/2)
+                  m_out_ab, m_out_bc, m_out_ca,  # 7-9  bottom tri mids (depth t)
+                  m_mid_ab, m_mid_bc, m_mid_ca,  # 10-12 top tri mids (depth t/2)
+                  v_q3_a,   v_q3_b,   v_q3_c]   # 13-15 vertical mids (depth 3t/4)
+
+        eid1 = new_eid();  wedge_elems[eid1] = layer1
+        eid2 = new_eid();  wedge_elems[eid2] = layer2
+
+    return new_nodes, wedge_elems
+
+
+# ---------------------------------------------------------------------------
+# Write output
+# ---------------------------------------------------------------------------
+
+def write_output(input_path, output_path, raw_lines,
+                 new_nodes, wedge_elems,
+                 wedge_type, elset_name, nset_name):
+
+    # Inject immediately before the first *ELEMENT keyword so the new nodes
+    # and elements sit inside the same part/mesh definition block as the
+    # original DC3D10 elements.
+    insert_at = None
+    for i, raw in enumerate(raw_lines):
+        stripped = raw.strip().upper()
+        if stripped.startswith('*ELEMENT') and not stripped.startswith('**'):
+            insert_at = i
+            break
+    if insert_at is None:
+        # No *ELEMENT found — fall back to end of file
+        insert_at = len(raw_lines)
+
+    # Build the block to inject
+    inject = []
+    inject.append('\n**\n')
+    inject.append('** ================================================================\n')
+    inject.append('** Wedge skin layers inserted by grow_wedge_layers.py\n')
+    inject.append(f'**   Element type : {wedge_type}\n')
+    inject.append(f'**   New nodes    : {len(new_nodes)}\n')
+    inject.append(f'**   New elements : {len(wedge_elems)}\n')
+    inject.append('** ================================================================\n**\n')
+
+    # New nodes
+    inject.append('*NODE\n')
+    for nid in sorted(new_nodes.keys()):
+        x, y, z = new_nodes[nid]
+        inject.append(f'{nid:>10d}, {x:>20.12e}, {y:>20.12e}, {z:>20.12e}\n')
+
+    # New elements (8 nodes on first line, 7 on continuation)
+    inject.append(f'*ELEMENT, TYPE={wedge_type}, ELSET={elset_name}\n')
+    for eid in sorted(wedge_elems.keys()):
+        conn = wedge_elems[eid]
+        line1 = f'{eid:>10d}, ' + ', '.join(f'{n:>10d}' for n in conn[:8]) + ','
+        line2 = '            '  + ', '.join(f'{n:>10d}' for n in conn[8:])
+        inject.append(line1 + '\n')
+        inject.append(line2 + '\n')
+
+    # NSET for new skin nodes
+    all_new = sorted(new_nodes.keys())
+    inject.append(f'*NSET, NSET={nset_name}\n')
+    per_line = 8
+    for i, nid in enumerate(all_new):
+        inject.append(f'{nid:>10d}')
+        if (i + 1) % per_line == 0 or i == len(all_new) - 1:
+            inject.append('\n')
+        else:
+            inject.append(', ')
+
+    with open(output_path, 'w') as f:
+        f.writelines(raw_lines[:insert_at])
+        f.writelines(inject)
+        f.writelines(raw_lines[insert_at:])
+
+    print(f'Output : {output_path}')
+    print(f'  New nodes    : {len(new_nodes)}')
+    print(f'  New elements : {len(wedge_elems)}')
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Grow two DC3D15/C3D15 wedge skin layers from a DC3D10 Abaqus mesh.'
+    )
+    ap.add_argument('--input',           required=True,
+                    help='Input Abaqus .inp file')
+    ap.add_argument('--output',          required=True,
+                    help='Output Abaqus .inp file')
+    ap.add_argument('--total-thickness', required=True, type=float,
+                    help='Total skin thickness in model units')
+    ap.add_argument('--wedge-type',      default='DC3D15',
+                    help='Element type string (default DC3D15 for heat transfer; '
+                         'use C3D15 for structural)')
+    ap.add_argument('--wedge-elset',     default='SKIN_ELEMENTS',
+                    help='ELSET name for the new wedge elements (default: SKIN_ELEMENTS)')
+    ap.add_argument('--wedge-nset',      default='SKIN_NODES',
+                    help='NSET name for the new skin nodes (default: SKIN_NODES)')
+    args = ap.parse_args()
+
+    print(f'Reading  : {args.input}')
+    nodes, elements, raw_lines = parse_inp(args.input)
+    print(f'  Nodes    : {len(nodes)}')
+    print(f'  Elements : {len(elements)}  (DC3D10/C3D10)')
+
+    if not elements:
+        sys.exit('ERROR: No DC3D10 elements found. Verify *ELEMENT TYPE in input deck.')
+
+    print('Detecting exterior faces ...')
+    exterior_faces = find_exterior_faces(elements)
+    print(f'  Exterior faces  : {len(exterior_faces)}')
+
+    print('Computing surface node normals ...')
+    node_normals = compute_node_normals(exterior_faces, nodes, elements)
+    print(f'  Surface nodes   : {len(node_normals)}')
+
+    print(f'Growing wedge layers (total thickness = {args.total_thickness}) ...')
+    new_nodes, wedge_elems = grow_wedge_layers(
+        nodes, elements, exterior_faces, node_normals, args.total_thickness
+    )
+
+    write_output(
+        args.input, args.output, raw_lines,
+        new_nodes, wedge_elems,
+        args.wedge_type, args.wedge_elset, args.wedge_nset
+    )
+
+
+if __name__ == '__main__':
+    main()
