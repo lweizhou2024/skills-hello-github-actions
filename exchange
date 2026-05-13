@@ -1,16 +1,34 @@
 % -----------------------------
+% FIGURE
+% -----------------------------
+fig = figure('Name','Image Digitizer');
+
+imshow(img);
+axis on;
+hold on;
+
+title({
+    'Left click = add point'
+    'Right click = undo last point'
+    'Press ENTER to finish'
+    });
+
+zoom on;
+
+% -----------------------------
 % STORAGE
 % -----------------------------
 px = [];
 py = [];
-hPts = [];
+
+hPts = gobjects(0);
+hTxt = gobjects(0);
 
 % -----------------------------
-% INTERACTIVE LOOP
+% LOOP
 % -----------------------------
-while true
+while isvalid(fig)
 
-    % wait for mouse or keyboard
     [x,y,button] = ginput(1);
 
     % ENTER pressed
@@ -18,42 +36,35 @@ while true
         break;
     end
 
-    % LEFT CLICK -> add point
+    % LEFT CLICK = add point
     if button == 1
 
         px(end+1) = x;
         py(end+1) = y;
 
-        hPts(end+1) = plot(x,y,'r+','MarkerSize',12,'LineWidth',2);
+        hPts(end+1) = plot(x,y, ...
+            'r+','MarkerSize',12,'LineWidth',2);
 
-        % optional numbering
-        text(x,y,sprintf(' %d',length(px)), ...
-            'Color','y','FontWeight','bold');
+        hTxt(end+1) = text(x,y, ...
+            sprintf(' %d',length(px)), ...
+            'Color','y', ...
+            'FontWeight','bold');
 
-    % RIGHT CLICK -> undo
+    % RIGHT CLICK = undo
     elseif button == 3
 
         if ~isempty(px)
 
+            % remove last stored point
             px(end) = [];
             py(end) = [];
 
+            % delete graphics objects
             delete(hPts(end));
+            delete(hTxt(end));
+
             hPts(end) = [];
-
-            % redraw everything cleanly
-            cla;
-            imshow(img);
-            axis on;
-            hold on;
-
-            for k = 1:length(px)
-                hPts(k) = plot(px(k),py(k), ...
-                    'r+','MarkerSize',12,'LineWidth',2);
-
-                text(px(k),py(k),sprintf(' %d',k), ...
-                    'Color','y','FontWeight','bold');
-            end
+            hTxt(end) = [];
         end
     end
 end
