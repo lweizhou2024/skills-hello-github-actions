@@ -1,70 +1,142 @@
-% -----------------------------
-% FIGURE
-% -----------------------------
-fig = figure('Name','Image Digitizer');
+% =========================================================
+% Interactive Image Digitizer
+%
+% Left click   -> add point
+% Right click  -> undo last point
+% ENTER        -> finish
+%
+% Zoom/pan toolbar works normally
+% =========================================================
 
-imshow(img);
-axis on;
-hold on;
+clear; clc;
+
+%% LOAD IMAGE
+img = imread('your_image.png');
+
+%% USER INPUTS
+
+origin_px = 250;
+origin_py = 400;
+
+origin_x = 0;
+origin_y = 0;
+
+dx = 0.01;
+dy = 0.02;
+
+%% FIGURE
+
+fig = figure('Name','Digitizer');
+
+ax = axes(fig);
+
+imshow(img,'Parent',ax);
+axis(ax,'on');
+hold(ax,'on');
 
 title({
-    'Left click = add point'
-    'Right click = undo last point'
-    'Press ENTER to finish'
+    'LEFT click = add point'
+    'RIGHT click = undo'
+    'Use toolbar for zoom/pan'
+    'Press ENTER when done'
     });
 
-zoom on;
+zoom(fig,'on');
 
-% -----------------------------
-% STORAGE
-% -----------------------------
+%% STORAGE
+
 px = [];
 py = [];
 
 hPts = gobjects(0);
 hTxt = gobjects(0);
 
-% -----------------------------
-% LOOP
-% -----------------------------
-while isvalid(fig)
+finished = false;
 
-    [x,y,button] = ginput(1);
+%% CALLBACKS
 
-    % ENTER pressed
-    if isempty(button)
-        break;
+fig.WindowButtonDownFcn = @mouseClick;
+fig.KeyPressFcn = @keyPress;
+
+uiwait(fig);
+
+%% CONVERT COORDINATES
+
+x_data = origin_x + (px - origin_px)*dx;
+y_data = origin_y - (py - origin_py)*dy;
+
+results = table( ...
+    px(:), py(:), x_data(:), y_data(:), ...
+    'VariableNames',{'PixelX','PixelY','X','Y'});
+
+disp(results);
+
+%% ========================================================
+% CALLBACK FUNCTIONS
+% =========================================================
+
+function mouseClick(~,~)
+
+    if finished
+        return;
     end
 
-    % LEFT CLICK = add point
-    if button == 1
+    clickType = fig.SelectionType;
 
-        px(end+1) = x;
-        py(end+1) = y;
+    cp = ax.CurrentPoint;
+    x = cp(1,1);
+    y = cp(1,2);
 
-        hPts(end+1) = plot(x,y, ...
-            'r+','MarkerSize',12,'LineWidth',2);
+    % inside image axes only
+    xl = xlim(ax);
+    yl = ylim(ax);
 
-        hTxt(end+1) = text(x,y, ...
-            sprintf(' %d',length(px)), ...
-            'Color','y', ...
-            'FontWeight','bold');
+    if x<xl(1) || x>xl(2) || y<yl(1) || y>yl(2)
+        return;
+    end
 
-    % RIGHT CLICK = undo
-    elseif button == 3
+    switch clickType
 
-        if ~isempty(px)
+        % LEFT CLICK
+        case 'normal'
 
-            % remove last stored point
-            px(end) = [];
-            py(end) = [];
+            px(end+1) = x;
+            py(end+1) = y;
 
-            % delete graphics objects
-            delete(hPts(end));
-            delete(hTxt(end));
+            hPts(end+1) = plot(ax,x,y,...
+                'r+','MarkerSize',12,'LineWidth',2);
 
-            hPts(end) = [];
-            hTxt(end) = [];
-        end
+            hTxt(end+1) = text(ax,x,y,...
+                sprintf(' %d',length(px)),...
+                'Color','y',...
+                'FontWeight','bold');
+
+        % RIGHT CLICK
+        case 'alt'
+
+            if ~isempty(px)
+
+                px(end) = [];
+                py(end) = [];
+
+                delete(hPts(end));
+                delete(hTxt(end));
+
+                hPts(end) = [];
+                hTxt(end) = [];
+            end
+    end
+end
+
+%% ========================================================
+
+function keyPress(~,event)
+
+    switch event.Key
+
+        case 'return'
+
+            finished = true;
+            uiresume(fig);
     end
 end
