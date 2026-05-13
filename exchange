@@ -204,22 +204,31 @@ def compute_node_normals(exterior_faces, nodes, elements):
             key = tuple(sorted((conn[ca], conn[cb], conn[cc])))
             face_to_tet_centroid[key] = tet_centroid
 
+    # Accumulate normals to CORNER nodes only (face[:3]).
+    # Mid-edge nodes (face[3:]) are intentionally excluded — their grown positions
+    # are derived later as averages of their two endpoint corner nodes at each depth
+    # (see grow_wedge_layers).  Accumulating to mid-edge nodes causes instability
+    # at sharp edges where adjacent face normals diverge: the area-weighted sum can
+    # cancel or flip sign, placing the mid-edge node on the wrong side of the surface.
     accum = defaultdict(lambda: np.zeros(3, dtype=np.float64))
 
     for face in exterior_faces:
         ca, cb, cc = face[0], face[1], face[2]
         pa, pb, pc = nodes[ca], nodes[cb], nodes[cc]
-        n = np.cross(pb - pa, pc - pa)   # raw cross product
+        n = np.cross(pb - pa, pc - pa)   # raw cross product, magnitude = 2*area
 
-        # Verify direction: dot with (tet_centroid - face_centroid) < 0 means outward
+        # Geometry-driven outward check: dot against (tet_centroid - face_centroid).
+        # If positive the normal points inward — flip it.
         key = tuple(sorted((ca, cb, cc)))
-        tet_c = face_to_tet_centroid[key]
+        tet_c  = face_to_tet_centroid[key]
         face_c = (pa + pb + pc) / 3.0
         if np.dot(n, tet_c - face_c) > 0:
-            n = -n   # was pointing inward — flip
+            n = -n
 
-        for nid in face:          # contribute to all 6 nodes of this face
-            accum[nid] += n
+        # Accumulate to corner nodes only
+        accum[ca] += n
+        accum[cb] += n
+        accum[cc] += n
 
     result = {}
     for nid, n in accum.items():
