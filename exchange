@@ -156,30 +156,52 @@ def parse_inp(filepath):
 # Exterior face detection
 # ---------------------------------------------------------------------------
 
-def find_exterior_faces(elements):
+def find_exterior_faces(elements, nodes):
     """
     Return list of exterior faces, each a 6-tuple of global node IDs:
         (corner_a, corner_b, corner_c, mid_ab, mid_bc, mid_ca)
 
     A face is exterior iff its sorted corner triple appears in exactly one tet.
+    Every returned face is guaranteed to have OUTWARD CCW winding:
+    cross(cb-ca, cc-ca) points away from the tet interior.  This is verified
+    geometrically against the tet centroid so it is independent of the
+    DC3D10_FACES winding table and mesh generator conventions.
     """
     face_map = defaultdict(list)
 
     for eid, conn in elements.items():
+        tet_centroid = sum(nodes[conn[i]] for i in range(4)) / 4.0
         for (ca, cb, cc, mab, mbc, mca) in DC3D10_FACES:
-            key  = tuple(sorted((conn[ca], conn[cb], conn[cc])))
-            full = (conn[ca], conn[cb], conn[cc],
-                    conn[mab], conn[mbc], conn[mca])
+            ga, gb, gc = conn[ca], conn[cb], conn[cc]
+            key  = tuple(sorted((ga, gb, gc)))
+            full = (ga, gb, gc,
+                    conn[mab], conn[mbc], conn[mca],
+                    tet_centroid)   # carry centroid for winding fix below
             face_map[key].append(full)
 
-    return [v[0] for v in face_map.values() if len(v) == 1]
+    result = []
+    for key, entries in face_map.items():
+        if len(entries) != 1:
+            continue
+        ga, gb, gc, mab, mbc, mca, tet_c = entries[0]
+        pa, pb, pc = nodes[ga], nodes[gb], nodes[gc]
+        n = np.cross(pb - pa, pc - pa)
+        face_c = (pa + pb + pc) / 3.0
+        if np.dot(n, tet_c - face_c) > 0:
+            # Normal points inward — reverse winding: swap b and c, and their mids
+            # (swapping b↔c reverses the cross product; mid_ab↔mid_ca swap accordingly,
+            #  mid_bc stays as the new mid_bc between the swapped corners)
+            ga, gb, gc = ga, gc, gb
+            mab, mbc, mca = mca, mbc, mab
+        result.append((ga, gb, gc, mab, mbc, mca))
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Node normals
 # ---------------------------------------------------------------------------
 
-def compute_node_normals(exterior_faces, nodes, elements):
+def compute_node_normals(exterior_faces, nodes):
     """
     Compute area-weighted averaged OUTWARD normals for all surface nodes.
 
@@ -195,37 +217,17 @@ def compute_node_normals(exterior_faces, nodes, elements):
 
     Returns dict {node_id: unit_normal (np.array shape (3,))}
     """
-    # Build a lookup: sorted-corner-triple -> tet centroid
-    # (only corner nodes, indices 0-3, are used for the centroid)
-    face_to_tet_centroid = {}
-    for eid, conn in elements.items():
-        tet_centroid = sum(nodes[conn[i]] for i in range(4)) / 4.0
-        for (ca, cb, cc, mab, mbc, mca) in DC3D10_FACES:
-            key = tuple(sorted((conn[ca], conn[cb], conn[cc])))
-            face_to_tet_centroid[key] = tet_centroid
-
-    # Accumulate normals to CORNER nodes only (face[:3]).
-    # Mid-edge nodes (face[3:]) are intentionally excluded — their grown positions
-    # are derived later as averages of their two endpoint corner nodes at each depth
-    # (see grow_wedge_layers).  Accumulating to mid-edge nodes causes instability
-    # at sharp edges where adjacent face normals diverge: the area-weighted sum can
-    # cancel or flip sign, placing the mid-edge node on the wrong side of the surface.
+    # Accumulate area-weighted outward normals to CORNER nodes only (face[:3]).
+    # find_exterior_faces already guarantees outward CCW winding, so
+    # cross(cb-ca, cc-ca) is always outward — no per-face direction check needed.
+    # Mid-edge nodes are excluded: their positions are derived as averages of
+    # adjacent corner nodes at each depth layer in grow_wedge_layers.
     accum = defaultdict(lambda: np.zeros(3, dtype=np.float64))
 
     for face in exterior_faces:
         ca, cb, cc = face[0], face[1], face[2]
         pa, pb, pc = nodes[ca], nodes[cb], nodes[cc]
-        n = np.cross(pb - pa, pc - pa)   # raw cross product, magnitude = 2*area
-
-        # Geometry-driven outward check: dot against (tet_centroid - face_centroid).
-        # If positive the normal points inward — flip it.
-        key = tuple(sorted((ca, cb, cc)))
-        tet_c  = face_to_tet_centroid[key]
-        face_c = (pa + pb + pc) / 3.0
-        if np.dot(n, tet_c - face_c) > 0:
-            n = -n
-
-        # Accumulate to corner nodes only
+        n = np.cross(pb - pa, pc - pa)   # outward, magnitude = 2*area
         accum[ca] += n
         accum[cb] += n
         accum[cc] += n
@@ -284,9 +286,7 @@ def grow_wedge_layers(nodes, elements, exterior_faces, node_normals,
     # corner nodes AT THAT LAYER — this guarantees they lie exactly on the edge
     # and prevents Jacobian distortion on curved surfaces or at mesh edges where
     # adjacent normals diverge.
-    to_q1  = {}   # t/4  — vertical mid-edge for layer 1
     to_mid = {}   # t/2  — interface between layers (corner nodes only)
-    to_q3  = {}   # 3t/4 — vertical mid-edge for layer 2
     to_out = {}   # t    — outer surface (corner nodes only)
     new_nodes = {}
 
@@ -301,14 +301,10 @@ def grow_wedge_layers(nodes, elements, exterior_faces, node_normals,
     for nid in corner_surface_nodes:
         n = node_normals[nid]
         p = nodes[nid]
-        q1_id, mid_id, q3_id, out_id = new_nid(), new_nid(), new_nid(), new_nid()
-        new_nodes[q1_id]  = p + n * t4
+        mid_id, out_id = new_nid(), new_nid()
         new_nodes[mid_id] = p + n * t2
-        new_nodes[q3_id]  = p + n * t34
         new_nodes[out_id] = p + n * t
-        to_q1[nid]  = q1_id
         to_mid[nid] = mid_id
-        to_q3[nid]  = q3_id
         to_out[nid] = out_id
 
     # --- Mid-edge node cache: keyed by frozenset of the two endpoint corner IDs
@@ -338,66 +334,56 @@ def grow_wedge_layers(nodes, elements, exterior_faces, node_normals,
         # Corner node IDs at each depth
         ca_mid, cb_mid, cc_mid = to_mid[ca], to_mid[cb], to_mid[cc]
         ca_out, cb_out, cc_out = to_out[ca], to_out[cb], to_out[cc]
-        ca_q1,  cb_q1,  cc_q1  = to_q1[ca],  to_q1[cb],  to_q1[cc]
-        ca_q3,  cb_q3,  cc_q3  = to_q3[ca],  to_q3[cb],  to_q3[cc]
 
-        # Mid-edge nodes for the INTERFACE triangle (depth t/2)
-        # Averaged from adjacent corner nodes at t/2 — shared between adjacent faces
-        # via frozenset key so conforming edges are not duplicated.
+        # Triangular mid-edge nodes at interface depth (t/2): average of corner pair at t/2.
+        # Cached by frozenset so adjacent faces share the same node.
         m_mid_ab = get_midedge(new_nodes[ca_mid], new_nodes[cb_mid], (frozenset((ca,cb)), 'mid'))
         m_mid_bc = get_midedge(new_nodes[cb_mid], new_nodes[cc_mid], (frozenset((cb,cc)), 'mid'))
         m_mid_ca = get_midedge(new_nodes[cc_mid], new_nodes[ca_mid], (frozenset((cc,ca)), 'mid'))
 
-        # Mid-edge nodes for the OUTER triangle (depth t)
+        # Triangular mid-edge nodes at outer depth (t): average of corner pair at t.
         m_out_ab = get_midedge(new_nodes[ca_out], new_nodes[cb_out], (frozenset((ca,cb)), 'out'))
         m_out_bc = get_midedge(new_nodes[cb_out], new_nodes[cc_out], (frozenset((cb,cc)), 'out'))
         m_out_ca = get_midedge(new_nodes[cc_out], new_nodes[ca_out], (frozenset((cc,ca)), 'out'))
 
-        # Vertical mid-edge nodes for layer 1 (midpoint of edge: orig corner -> mid corner)
-        # Use to_q1 nodes directly — they are already at t/4 along the nodal normal,
-        # which is exactly the midpoint of the vertical edge for equal-thickness layers.
-        v_q1_a, v_q1_b, v_q1_c = ca_q1, cb_q1, cc_q1
-
-        # Vertical mid-edge nodes for layer 2 (midpoint of edge: mid corner -> out corner)
-        # Use to_q3 nodes directly — they sit at 3t/4, midpoint of the second vertical edge.
-        v_q3_a, v_q3_b, v_q3_c = ca_q3, cb_q3, cc_q3
+        # Vertical mid-edge nodes: TRUE geometric midpoint of the vertical edge endpoints.
+        # Layer 1 vertical edge: original corner (depth 0) -> interface corner (depth t/2).
+        # Layer 2 vertical edge: interface corner (depth t/2) -> outer corner (depth t).
+        # These must be midpoints of their actual endpoint positions, NOT offset along a
+        # single nodal normal — at mesh edges the two endpoint normals diverge and
+        # original+normal*t/4 is NOT the same as (endpoint_A + endpoint_B)/2.
+        v_q1_a = get_midedge(nodes[ca],        new_nodes[ca_mid], (ca, 'vq1'))
+        v_q1_b = get_midedge(nodes[cb],        new_nodes[cb_mid], (cb, 'vq1'))
+        v_q1_c = get_midedge(nodes[cc],        new_nodes[cc_mid], (cc, 'vq1'))
+        v_q3_a = get_midedge(new_nodes[ca_mid], new_nodes[ca_out], (ca, 'vq3'))
+        v_q3_b = get_midedge(new_nodes[cb_mid], new_nodes[cb_out], (cb, 'vq3'))
+        v_q3_c = get_midedge(new_nodes[cc_mid], new_nodes[cc_out], (cc, 'vq3'))
 
         # C3D15 connectivity (Abaqus ordering):
         # [1,2,3]=bot corners  [4,5,6]=top corners
         # [7,8,9]=bot tri mids [10,11,12]=top tri mids
         # [13,14,15]=vertical mids (edge 1-4, 2-5, 3-6)
         #
-        # The tet exterior face winding (ca,cb,cc) has its outward normal pointing
-        # AWAY from the tet interior.  For a C3D15 wedge grown outward the tet
-        # face becomes the OUTER face (top, nodes 4-5-6) and the new outer surface
-        # becomes... wait — we grow outward so:
-        #   "bottom" (nodes 1-2-3) = new outer surface (depth t/2 or t)
-        #   "top"    (nodes 4-5-6) = tet surface (depth 0)
-        # Abaqus C3D15: the normal of the bottom face (1-2-3 CCW) points toward
-        # the top face.  We need that direction to be INWARD (toward tet), so
-        # bottom = outer side, top = tet side.  Swap bottom<->top and reverse the
-        # triangle winding on each face to keep CCW convention:
-        #   bottom corners reversed: cc, cb, ca  (flips CCW to point outward = away from tet)
-        #   top    corners reversed: cc_*, cb_*, ca_*
-        #   mid-edge nodes reordered to match reversed corners:
-        #     edge (cc-cb) = _mbc reversed,  (cb-ca) = _mab reversed,  (ca-cc)... wait
-        # Simpler: swap bottom<->top entirely and reverse corner order on BOTH faces
-        # so the cross product on the new bottom (outer) face points toward the tet.
-        #
-        # Correct rule: put the tet surface as TOP (4-5-6) with its original winding,
-        # put the new outer nodes as BOTTOM (1-2-3) with REVERSED winding so CCW
-        # on the bottom points toward the top (toward tet = inward = correct for Abaqus).
+        # find_exterior_faces guarantees (ca,cb,cc) has OUTWARD CCW winding,
+        # meaning cross(cb-ca,cc-ca) points away from the tet.
+        # Abaqus C3D15 requires cross(n2-n1, n3-n1) on the BOTTOM face (nodes 1-2-3)
+        # to point TOWARD the top face (into the element interior).
+        # Since we grow outward, the tet surface is the INNER face and the new
+        # nodes are OUTER.  We need the bottom face normal to point outward (toward
+        # the new nodes), so the bottom face must have OUTWARD CCW winding —
+        # which is exactly what (ca,cb,cc) already provides.
+        # Therefore: bottom = tet surface (depth 0), top = grown nodes (depth t/2, t).
 
-        layer1 = [ca_mid,   cb_mid,   cc_mid,    # 1-3  bottom = interface (depth t/2), CCW reversed below
-                  ca,       cb,       cc,         # 4-6  top    = tet surface (depth 0)
-                  m_mid_ab, m_mid_bc, m_mid_ca,  # 7-9  bottom tri mids
-                  _mab,     _mbc,     _mca,       # 10-12 top tri mids (original surface)
+        layer1 = [ca,       cb,       cc,        # 1-3  bottom = tet surface  (depth 0)
+                  ca_mid,   cb_mid,   cc_mid,    # 4-6  top    = interface    (depth t/2)
+                  _mab,     _mbc,     _mca,      # 7-9  bottom tri mids (original surface nodes)
+                  m_mid_ab, m_mid_bc, m_mid_ca,  # 10-12 top tri mids  (depth t/2, averaged)
                   v_q1_a,   v_q1_b,   v_q1_c]   # 13-15 vertical mids (depth t/4)
 
-        layer2 = [ca_out,   cb_out,   cc_out,    # 1-3  bottom = outer surface (depth t)
-                  ca_mid,   cb_mid,   cc_mid,    # 4-6  top    = interface (depth t/2)
-                  m_out_ab, m_out_bc, m_out_ca,  # 7-9  bottom tri mids (depth t)
-                  m_mid_ab, m_mid_bc, m_mid_ca,  # 10-12 top tri mids (depth t/2)
+        layer2 = [ca_mid,   cb_mid,   cc_mid,    # 1-3  bottom = interface   (depth t/2)
+                  ca_out,   cb_out,   cc_out,    # 4-6  top    = outer surf  (depth t)
+                  m_mid_ab, m_mid_bc, m_mid_ca,  # 7-9  bottom tri mids (depth t/2, averaged)
+                  m_out_ab, m_out_bc, m_out_ca,  # 10-12 top tri mids  (depth t, averaged)
                   v_q3_a,   v_q3_b,   v_q3_c]   # 13-15 vertical mids (depth 3t/4)
 
         eid1 = new_eid();  wedge_elems[eid1] = layer1
@@ -505,11 +491,11 @@ def main():
         sys.exit('ERROR: No DC3D10 elements found. Verify *ELEMENT TYPE in input deck.')
 
     print('Detecting exterior faces ...')
-    exterior_faces = find_exterior_faces(elements)
+    exterior_faces = find_exterior_faces(elements, nodes)
     print(f'  Exterior faces  : {len(exterior_faces)}')
 
     print('Computing surface node normals ...')
-    node_normals = compute_node_normals(exterior_faces, nodes, elements)
+    node_normals = compute_node_normals(exterior_faces, nodes)
     print(f'  Surface nodes   : {len(node_normals)}')
 
     print(f'Growing wedge layers (total thickness = {args.total_thickness}) ...')
