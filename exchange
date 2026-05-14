@@ -1,11 +1,5 @@
-function data = readTempLog(filename)
-% readTempLog  Read temperature log file starting from line 3.
-%
-% Format per line (after 2 header lines):
-%   m/d/yyyy hh:mm:ss, TempA °C/ TempB °F/ TempC °K/, some text
-%
-% Returns a struct array with fields:
-%   datetime, tempA_C, tempB_F, tempC_K, note
+% Read temperature log file
+filename = 'mylog.txt';
 
 fid = fopen(filename, 'r');
 if fid == -1
@@ -16,8 +10,11 @@ end
 fgetl(fid);
 fgetl(fid);
 
-data = struct('datetime', {}, 'tempA_C', {}, 'tempB_F', {}, 'tempC_K', {}, 'note', {});
-idx = 0;
+% Read all valid lines into a raw cell first
+rawDatetime = {};
+rawA = [];
+rawB = [];
+rawC = [];
 
 while ~feof(fid)
     line = fgetl(fid);
@@ -25,71 +22,75 @@ while ~feof(fid)
         continue;
     end
 
-    % ── 1. Split on the first comma → [datetime_temp_block, rest] ──────────
+    % Split on first comma
     commaPos = strfind(line, ',');
     if isempty(commaPos)
-        warning('Skipping malformed line: %s', line);
         continue;
     end
 
     datetimeTemp = strtrim(line(1 : commaPos(1)-1));
     rest         = strtrim(line(commaPos(1)+1 : end));
 
-    % ── 2. Parse date & time ────────────────────────────────────────────────
-    % Expected: "m/d/yyyy hh:mm:ss"
+    % Parse date & time
     spacePos = strfind(datetimeTemp, ' ');
     if isempty(spacePos)
-        warning('Cannot find space between date and time: %s', line);
         continue;
     end
-    dateStr = datetimeTemp(1 : spacePos(1)-1);          % e.g. "5/9/2024"
-    timeStr = datetimeTemp(spacePos(1)+1 : end);         % e.g. "14:03:27"
+    dateStr = datetimeTemp(1 : spacePos(1)-1);
+    timeStr = datetimeTemp(spacePos(1)+1 : end);
 
     try
-        dt = datetime([dateStr ' ' timeStr], ...
-                      'InputFormat', 'M/d/yyyy HH:mm:ss');
+        dt = datetime([dateStr ' ' timeStr], 'InputFormat', 'M/d/yyyy HH:mm:ss');
     catch
-        warning('Cannot parse datetime on line: %s', line);
         continue;
     end
 
-    % ── 3. Parse temperatures ───────────────────────────────────────────────
-    % rest looks like: "23.5 °C/ 74.3 °F/ 296.65 °K/, some text"
-    % Strategy: find each unit tag and read the number before it.
+    % Parse tempA: number before "°C /"
+    tA = NaN;
+    tB = NaN;
+    tC = NaN;
 
-    % tempA  – number before "°C/"
-    tA = extractBefore(rest, '°C/');
-    tA = str2double(strtrim(tA));
-
-    % tempB  – between "°C/" and "°F/"
-    tB_block = extractBetween(rest, '°C/', '°F/');
-    tB = str2double(strtrim(tB_block{1}));
-
-    % tempC  – between "°F/" and "°K/,"
-    tC_block = extractBetween(rest, '°F/', '°K/,');
-    tC = str2double(strtrim(tC_block{1}));
-
-    % ── 4. Parse trailing note ──────────────────────────────────────────────
-    kelvinEnd = strfind(rest, '°K/,');
-    if ~isempty(kelvinEnd)
-        note = strtrim(rest(kelvinEnd(1) + length('°K/,') : end));
-    else
-        note = '';
+    idxC = strfind(rest, '°C /');
+    if ~isempty(idxC)
+        tA = str2double(strtrim(rest(1 : idxC(1)-1)));
     end
 
-    % ── 5. Store ────────────────────────────────────────────────────────────
-    idx = idx + 1;
-    data(idx).datetime = dt;
-    data(idx).tempA_C  = tA;
-    data(idx).tempB_F  = tB;
-    data(idx).tempC_K  = tC;
-    data(idx).note     = note;
+    % Skip line if tempA is NaN
+    if isnan(tA)
+        continue;
+    end
+
+    % Parse tempB: between "°C /" and "°F /"
+    idxF = strfind(rest, '°F /');
+    if ~isempty(idxF)
+        tB = str2double(strtrim(rest(idxC(1)+length('°C /') : idxF(1)-1)));
+    end
+
+    % Parse tempC: between "°F /" and "K,"
+    idxK = strfind(rest, 'K,');
+    if ~isempty(idxK)
+        tC = str2double(strtrim(rest(idxF(1)+length('°F /') : idxK(1)-1)));
+    end
+
+    % Store
+    rawDatetime{end+1} = dt;
+    rawA(end+1) = tA;
+    rawB(end+1) = tB;
+    rawC(end+1) = tC;
 end
 
 fclose(fid);
 
-% ── 6. Display summary ──────────────────────────────────────────────────────
-fprintf('Loaded %d records from "%s"\n', idx, filename);
-T = struct2table(data);
-disp(T);
+% Build output array: [time_seconds, tempA, tempB, tempC]
+n = numel(rawDatetime);
+data = zeros(n, 4);
+
+t0 = rawDatetime{1};
+for i = 1:n
+    data(i, 1) = seconds(rawDatetime{i} - t0);
+    data(i, 2) = rawA(i);
+    data(i, 3) = rawB(i);
+    data(i, 4) = rawC(i);
 end
+
+disp(data);
