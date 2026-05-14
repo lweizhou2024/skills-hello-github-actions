@@ -1,20 +1,95 @@
-fid = fopen('data.txt','r');
+function data = readTempLog(filename)
+% readTempLog  Read temperature log file starting from line 3.
+%
+% Format per line (after 2 header lines):
+%   m/d/yyyy hh:mm:ss, TempA °C/ TempB °F/ TempC °K/, some text
+%
+% Returns a struct array with fields:
+%   datetime, tempA_C, tempB_F, tempC_K, note
 
-% Skip first 2 lines
+fid = fopen(filename, 'r');
+if fid == -1
+    error('Cannot open file: %s', filename);
+end
+
+% Skip the first 2 header lines
 fgetl(fid);
 fgetl(fid);
 
-% Read remaining lines
-C = textscan(fid, ...
-    '%{M/d/yyyy HH:mm:ss}D %f°C/ %f°F/ %f°K/,%[^\n\r]', ...
-    'Delimiter', '', ...
-    'MultipleDelimsAsOne', false);
+data = struct('datetime', {}, 'tempA_C', {}, 'tempB_F', {}, 'tempC_K', {}, 'note', {});
+idx = 0;
+
+while ~feof(fid)
+    line = fgetl(fid);
+    if ~ischar(line) || isempty(strtrim(line))
+        continue;
+    end
+
+    % ── 1. Split on the first comma → [datetime_temp_block, rest] ──────────
+    commaPos = strfind(line, ',');
+    if isempty(commaPos)
+        warning('Skipping malformed line: %s', line);
+        continue;
+    end
+
+    datetimeTemp = strtrim(line(1 : commaPos(1)-1));
+    rest         = strtrim(line(commaPos(1)+1 : end));
+
+    % ── 2. Parse date & time ────────────────────────────────────────────────
+    % Expected: "m/d/yyyy hh:mm:ss"
+    spacePos = strfind(datetimeTemp, ' ');
+    if isempty(spacePos)
+        warning('Cannot find space between date and time: %s', line);
+        continue;
+    end
+    dateStr = datetimeTemp(1 : spacePos(1)-1);          % e.g. "5/9/2024"
+    timeStr = datetimeTemp(spacePos(1)+1 : end);         % e.g. "14:03:27"
+
+    try
+        dt = datetime([dateStr ' ' timeStr], ...
+                      'InputFormat', 'M/d/yyyy HH:mm:ss');
+    catch
+        warning('Cannot parse datetime on line: %s', line);
+        continue;
+    end
+
+    % ── 3. Parse temperatures ───────────────────────────────────────────────
+    % rest looks like: "23.5 °C/ 74.3 °F/ 296.65 °K/, some text"
+    % Strategy: find each unit tag and read the number before it.
+
+    % tempA  – number before "°C/"
+    tA = extractBefore(rest, '°C/');
+    tA = str2double(strtrim(tA));
+
+    % tempB  – between "°C/" and "°F/"
+    tB_block = extractBetween(rest, '°C/', '°F/');
+    tB = str2double(strtrim(tB_block{1}));
+
+    % tempC  – between "°F/" and "°K/,"
+    tC_block = extractBetween(rest, '°F/', '°K/,');
+    tC = str2double(strtrim(tC_block{1}));
+
+    % ── 4. Parse trailing note ──────────────────────────────────────────────
+    kelvinEnd = strfind(rest, '°K/,');
+    if ~isempty(kelvinEnd)
+        note = strtrim(rest(kelvinEnd(1) + length('°K/,') : end));
+    else
+        note = '';
+    end
+
+    % ── 5. Store ────────────────────────────────────────────────────────────
+    idx = idx + 1;
+    data(idx).datetime = dt;
+    data(idx).tempA_C  = tA;
+    data(idx).tempB_F  = tB;
+    data(idx).tempC_K  = tC;
+    data(idx).note     = note;
+end
 
 fclose(fid);
 
-% Extract results
-datetimeVals = C{1};
-tempC = C{2};
-tempF = C{3};
-tempK = C{4};
-extraText = string(C{5});
+% ── 6. Display summary ──────────────────────────────────────────────────────
+fprintf('Loaded %d records from "%s"\n', idx, filename);
+T = struct2table(data);
+disp(T);
+end
