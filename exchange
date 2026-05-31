@@ -1,96 +1,373 @@
-% Read temperature log file
-filename = 'mylog.txt';
+"""
+spaceclaim_replace_face.py
+--------------------------
+SpaceClaim Python API script to:
+  1. Read surface node coordinates from a CSV (produced by parse_cdb.py)
+  2. Auto-detect the aspect ratio of the node distribution
+  3. Fit a smooth Thin-Plate Spline surface through the scattered points
+  4. Sample onto a rectangular (Nu x Nv) NURBS control grid matching the aspect ratio
+  5. Create a SpaceClaim surface body from the fitted NURBS surface
+  6. Export as Parasolid / STEP
 
-fid = fopen(filename, 'r');
-if fid == -1
-    error('Cannot open file: %s', filename);
-end
+USE CASE: You have ONLY a surface mesh (no solid body).
+          The script creates a new clean CAD surface — no face deletion, no sewing.
 
-% Skip the first 2 header lines
-fgetl(fid);
-fgetl(fid);
+HOW TO RUN IN SPACECLAIM:
+  File > Scripting > Open Script...  (or paste into the Script Editor)
+  Set the CONFIG section below before running.
 
-% Read all valid lines into a raw cell first
-rawDatetime = {};
-rawA = [];
-rawB = [];
-rawC = [];
+REQUIREMENTS:
+  SpaceClaim 2020 R1 or later (numpy is bundled).
+  No scipy needed — TPS solver uses numpy only.
+"""
 
-while ~feof(fid)
-    line = fgetl(fid);
-    if ~ischar(line) || isempty(strtrim(line))
-        continue;
-    end
+import csv as csv_mod
+import clr
 
-    % Split on first comma
-    commaPos = strfind(line, ',');
-    if isempty(commaPos)
-        continue;
-    end
+import SpaceClaim.Api.V23 as sc   # change V23 to match your version: V21/V22/V23/V24
+from SpaceClaim.Api.V23.Geometry import NurbsSurface, ControlPoint, Knots
+from SpaceClaim.Api.V23.Modeler  import ShapeHelper
 
-    datetimeTemp = strtrim(line(1 : commaPos(1)-1));
-    rest         = strtrim(line(commaPos(1)+1 : end));
+import numpy as np
 
-    % Parse date & time
-    spacePos = strfind(datetimeTemp, ' ');
-    if isempty(spacePos)
-        continue;
-    end
-    dateStr = datetimeTemp(1 : spacePos(1)-1);
-    timeStr = datetimeTemp(spacePos(1)+1 : end);
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+CSV_PATH   = r"C:\your\path\surface_nodes.csv"   # <-- set this
 
-    try
-        dt = datetime([dateStr ' ' timeStr], 'InputFormat', 'M/d/yyyy HH:mm:ss');
-    catch
-        continue;
-    end
+# Grid resolution — set BOTH dimensions to match your mesh aspect ratio.
+# Leave GRID_RES_V = None to auto-compute from aspect ratio of node distribution.
+# Example for a 4:1 surface with ~200 nodes: GRID_RES_U=40, GRID_RES_V=10
+GRID_RES_U = None    # resolution along the longer axis  (None = auto)
+GRID_RES_V = None    # resolution along the shorter axis (None = auto)
+GRID_TOTAL = 400     # used only when both above are None:
+                     # auto-splits GRID_TOTAL into Nu x Nv matching aspect ratio
+                     # e.g. 4:1 surface → 40 x 10 (= 400 cells)
 
-    % Parse tempA: number before "°C /"
-    tA = NaN;
-    tB = NaN;
-    tC = NaN;
+SPLINE_DEGREE = 3    # cubic B-spline (recommended; must be <= min(Nu,Nv)-1)
 
-    idxC = strfind(rest, '°C /');
-    if ~isempty(idxC)
-        tA = str2double(strtrim(rest(1 : idxC(1)-1)));
-    end
+SMOOTH_FACTOR = 0.0  # 0 = exact interpolation through every node
+                     # increase (e.g. 0.001) only if nodes are noisy
 
-    % Skip line if tempA is NaN
-    if isnan(tA)
-        continue;
-    end
+SURFACE_NAME = "FittedSurface"   # name given to the new body in SpaceClaim
 
-    % Parse tempB: between "°C /" and "°F /"
-    idxF = strfind(rest, '°F /');
-    if ~isempty(idxF)
-        tB = str2double(strtrim(rest(idxC(1)+length('°C /') : idxF(1)-1)));
-    end
+# ─── DEVIATION / QUALITY CONTROL ─────────────────────────────────────────────
+ABORT_ON_HIGH_DEVIATION = True
+MAX_ALLOWED_DEVIATION   = 1e-3    # model units (mm or m). None = disable check
+DEVIATION_REPORT_PATH   = r"C:\your\path\deviation_report.csv"  # None = skip
+# ─────────────────────────────────────────────────────────────────────────────
 
-    % Parse tempC: between "°F /" and "K,"
-    idxK = strfind(rest, 'K,');
-    if ~isempty(idxK)
-        tC = str2double(strtrim(rest(idxF(1)+length('°F /') : idxK(1)-1)));
-    end
 
-    % Store
-    rawDatetime{end+1} = dt;
-    rawA(end+1) = tA;
-    rawB(end+1) = tB;
-    rawC(end+1) = tC;
-end
+# ══ 1. Read CSV ════════════════════════════════════════════════════════════════
 
-fclose(fid);
+def read_csv(path):
+    pts = []
+    with open(path, "r") as f:
+        reader = csv_mod.DictReader(f)
+        for row in reader:
+            pts.append((float(row["x"]), float(row["y"]), float(row["z"])))
+    return pts
 
-% Build output array: [time_seconds, tempA, tempB, tempC]
-n = numel(rawDatetime);
-data = zeros(n, 4);
 
-t0 = rawDatetime{1};
-for i = 1:n
-    data(i, 1) = seconds(rawDatetime{i} - t0);
-    data(i, 2) = rawA(i);
-    data(i, 3) = rawB(i);
-    data(i, 4) = rawC(i);
-end
+# ══ 2. PCA plane fit ══════════════════════════════════════════════════════════
 
-disp(data);
+def fit_plane_pca(pts_arr):
+    """
+    Returns (centroid, normal, u_axis, v_axis).
+    u_axis = direction of maximum spread (longest axis of the point cloud)
+    v_axis = direction of second spread
+    normal = out-of-plane direction (smallest spread)
+    """
+    centroid = pts_arr.mean(axis=0)
+    _, S, Vt = np.linalg.svd(pts_arr - centroid)
+    # Singular values S[0] >= S[1] >= S[2]
+    # Vt rows are principal directions
+    u_axis = Vt[0]   # longest
+    v_axis = Vt[1]   # second
+    normal = Vt[2]   # normal (smallest spread = out-of-plane)
+    aspect = S[0] / S[1] if S[1] > 1e-12 else 1.0
+    return centroid, normal, u_axis, v_axis, aspect
+
+
+# ══ 3. Auto grid resolution ═══════════════════════════════════════════════════
+
+def compute_grid_resolution(aspect_ratio):
+    """
+    Given aspect ratio (>= 1.0, longer/shorter), split GRID_TOTAL into
+    Nu x Nv so that Nu/Nv ≈ aspect_ratio and Nu*Nv ≈ GRID_TOTAL.
+
+    If the user has set GRID_RES_U / GRID_RES_V explicitly, use those.
+    """
+    if GRID_RES_U is not None and GRID_RES_V is not None:
+        nu, nv = int(GRID_RES_U), int(GRID_RES_V)
+        print(f"  Grid: {nu} x {nv}  (user-specified)")
+        return nu, nv
+
+    # Auto: nu/nv = aspect_ratio, nu*nv = GRID_TOTAL
+    # nu = sqrt(GRID_TOTAL * aspect_ratio)
+    nu = max(4, int(round((GRID_TOTAL * aspect_ratio) ** 0.5)))
+    nv = max(4, int(round(GRID_TOTAL / nu)))
+    # Nudge to keep product close to GRID_TOTAL
+    print(f"  Aspect ratio: {aspect_ratio:.2f}  →  auto grid: {nu} x {nv} "
+          f"= {nu*nv} control points")
+    print(f"  (override with GRID_RES_U / GRID_RES_V in CONFIG if needed)")
+    return nu, nv
+
+
+# ══ 4. Thin-Plate Spline ══════════════════════════════════════════════════════
+
+def _phi(r):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(r == 0, 0.0, r**2 * np.log(r + 1e-300))
+
+
+def thin_plate_spline_fit(u, v, z, grid_u, grid_v, smooth=0.0):
+    """
+    Fit TPS through scattered (u,v,z) and evaluate on a rectangular grid.
+    Returns z_grid of shape (len(grid_u), len(grid_v)).
+    """
+    n = len(u)
+    r = np.sqrt((u[:, None] - u[None, :])**2 + (v[:, None] - v[None, :])**2)
+    K = _phi(r)
+    if smooth > 0:
+        K += smooth * np.eye(n)
+    Pm = np.column_stack([np.ones(n), u, v])
+    M  = np.block([[K, Pm], [Pm.T, np.zeros((3, 3))]])
+    rhs = np.concatenate([z, [0, 0, 0]])
+    try:
+        coeffs = np.linalg.solve(M, rhs)
+    except np.linalg.LinAlgError:
+        coeffs = np.linalg.lstsq(M, rhs, rcond=None)[0]
+    w, a = coeffs[:n], coeffs[n:]
+
+    GU, GV = np.meshgrid(grid_u, grid_v, indexing="ij")
+    gu_f   = GU.ravel()
+    gv_f   = GV.ravel()
+    r_eval = np.sqrt((gu_f[:, None] - u[None, :])**2 +
+                     (gv_f[:, None] - v[None, :])**2)
+    z_flat = _phi(r_eval).dot(w) + a[0] + a[1]*gu_f + a[2]*gv_f
+    return z_flat.reshape(len(grid_u), len(grid_v)), w, a
+
+
+# ══ 5. Deviation diagnostics ══════════════════════════════════════════════════
+
+def compute_deviations(pts_arr, w, a, u_coords, v_coords,
+                       centroid, normal, u_axis, v_axis,
+                       world_pts):
+    """
+    Two deviation components:
+      [A] TPS fit error  — spline vs. original nodes (controlled by SMOOTH_FACTOR)
+      [B] Grid sampling  — NxN grid vs. spline      (controlled by grid resolution)
+    """
+    z_coords = (pts_arr - centroid).dot(normal)
+
+    # [A] TPS self-evaluation at node (u,v) positions
+    r_self = np.sqrt((u_coords[:, None] - u_coords[None, :])**2 +
+                     (v_coords[:, None] - v_coords[None, :])**2)
+    z_tps_at_nodes = (_phi(r_self).dot(w)
+                      + a[0] + a[1]*u_coords + a[2]*v_coords)
+    fitted_3d = (centroid
+                 + u_coords[:, None] * u_axis
+                 + v_coords[:, None] * v_axis
+                 + z_tps_at_nodes[:, None] * normal)
+    tps_dev = np.linalg.norm(pts_arr - fitted_3d, axis=1)
+
+    # [B] Bilinear interpolation error: TPS grid vs. TPS exact
+    nu, nv, _ = world_pts.shape
+    u_min, u_max = u_coords.min(), u_coords.max()
+    v_min, v_max = v_coords.min(), v_coords.max()
+    grid_u = np.linspace(u_min, u_max, nu)
+    grid_v = np.linspace(v_min, v_max, nv)
+
+    du = (u_max - u_min) / (nu - 1) if nu > 1 else 1.0
+    dv = (v_max - v_min) / (nv - 1) if nv > 1 else 1.0
+    ui = np.clip((u_coords - grid_u[0]) / du, 0, nu - 1 - 1e-9)
+    vi = np.clip((v_coords - grid_v[0]) / dv, 0, nv - 1 - 1e-9)
+    i0, j0 = ui.astype(int), vi.astype(int)
+    i1 = np.clip(i0 + 1, 0, nu - 1)
+    j1 = np.clip(j0 + 1, 0, nv - 1)
+    fu, fv = ui - i0, vi - j0
+
+    # z-component along normal for the grid
+    wn = world_pts.dot(normal)   # shape (nu, nv)
+    z_grid_at_nodes = (wn[i0, j0]*(1-fu)*(1-fv) +
+                       wn[i1, j0]*fu    *(1-fv) +
+                       wn[i0, j1]*(1-fu)*fv     +
+                       wn[i1, j1]*fu    *fv)
+    z_tps_proj = fitted_3d.dot(normal)
+    nurbs_extra = np.abs(z_tps_proj - z_grid_at_nodes)
+
+    return tps_dev, nurbs_extra
+
+
+def print_deviation_report(pts_arr, tps_dev, nurbs_extra, nu, nv):
+    combined = tps_dev + nurbs_extra
+    sep = "─" * 58
+    print(f"\n{sep}")
+    print(f"  Deviation report  ({len(tps_dev)} nodes,  grid {nu} x {nv})")
+    print(sep)
+    print(f"  [A] TPS spline fit error (should be ~0 at SMOOTH_FACTOR=0):")
+    print(f"      Max  {tps_dev.max():.4e}   Mean {tps_dev.mean():.4e}"
+          f"   RMS {np.sqrt(np.mean(tps_dev**2)):.4e}")
+    print(f"  [B] NURBS grid discretisation error:")
+    print(f"      Max  {nurbs_extra.max():.4e}   Mean {nurbs_extra.mean():.4e}")
+    print(f"  [A+B] Combined worst-case:")
+    print(f"      Max  {combined.max():.4e}   P95 {np.percentile(combined,95):.4e}"
+          f"   P99 {np.percentile(combined,99):.4e}")
+    print(sep)
+
+    max_d = combined.max()
+    if   max_d < 1e-4: verdict = "EXCELLENT"
+    elif max_d < 1e-3: verdict = "GOOD — suitable for most engineering work"
+    elif max_d < 1e-2: verdict = "MODERATE — review if tight tolerances needed"
+    else:              verdict = "HIGH — see tuning guide below"
+
+    print(f"  Verdict: {verdict}")
+
+    if max_d >= 1e-3:
+        print()
+        print("  Tuning guide:")
+        if nurbs_extra.max() > tps_dev.max():
+            print("    → [B] dominates: increase GRID_RES_U / GRID_RES_V")
+            print(f"       Try GRID_RES_U={nu*2}, GRID_RES_V={nv*2}")
+        else:
+            print("    → [A] dominates: reduce SMOOTH_FACTOR (currently "
+                  f"{SMOOTH_FACTOR})")
+            print("       At SMOOTH_FACTOR=0.0 [A] should be near machine epsilon.")
+            print("       If [A] is still large, check for duplicate node (u,v) coords.")
+    print(sep + "\n")
+    return combined.max()
+
+
+def save_deviation_csv(pts_arr, tps_dev, nurbs_extra, path):
+    combined = tps_dev + nurbs_extra
+    with open(path, "w", newline="") as f:
+        w = csv_mod.writer(f)
+        w.writerow(["x","y","z","tps_error","grid_error","combined"])
+        for i in range(len(pts_arr)):
+            w.writerow([pts_arr[i,0], pts_arr[i,1], pts_arr[i,2],
+                        f"{tps_dev[i]:.4e}", f"{nurbs_extra[i]:.4e}",
+                        f"{combined[i]:.4e}"])
+    print(f"  Per-node deviation saved: {path}")
+
+
+# ══ 6. Build NURBS surface ════════════════════════════════════════════════════
+
+def uniform_knots(n, d):
+    """Clamped uniform knot vector: n control points, degree d."""
+    knots  = [0.0] * (d + 1)
+    n_internal = n - d - 1
+    for k in range(1, n_internal + 1):
+        knots.append(k / (n_internal + 1))
+    knots += [1.0] * (d + 1)
+    return Knots.Create(knots)
+
+
+def build_nurbs_surface(world_pts, degree):
+    """
+    world_pts: np.ndarray (nu, nv, 3)
+    Returns a SpaceClaim NurbsSurface.
+    """
+    nu, nv, _ = world_pts.shape
+
+    # Ensure degree is valid
+    d = min(degree, nu - 1, nv - 1)
+    if d < degree:
+        print(f"  Note: degree reduced from {degree} to {d} "
+              f"(grid too small for requested degree)")
+
+    ctrl_pts = []
+    for i in range(nu):
+        row = []
+        for j in range(nv):
+            p = world_pts[i, j]
+            row.append(ControlPoint.Create(float(p[0]), float(p[1]), float(p[2]), 1.0))
+        ctrl_pts.append(row)
+
+    ku = uniform_knots(nu, d)
+    kv = uniform_knots(nv, d)
+    return NurbsSurface.CreateFromControlPoints(ctrl_pts, d, d, ku, kv)
+
+
+# ══ 7. Main ═══════════════════════════════════════════════════════════════════
+
+def main():
+
+    # ── Read nodes ────────────────────────────────────────────────────────────
+    print(f"Reading nodes: {CSV_PATH}")
+    pts_raw = read_csv(CSV_PATH)
+    pts_arr = np.array(pts_raw)
+    print(f"  {len(pts_arr)} nodes loaded")
+    if len(pts_arr) < 9:
+        raise RuntimeError("Need at least 9 nodes to fit a surface.")
+
+    # ── PCA plane fit + aspect ratio ──────────────────────────────────────────
+    print("\nFitting plane and computing aspect ratio...")
+    centroid, normal, u_axis, v_axis, aspect = fit_plane_pca(pts_arr)
+    u_coords = (pts_arr - centroid).dot(u_axis)
+    v_coords = (pts_arr - centroid).dot(v_axis)
+    z_coords = (pts_arr - centroid).dot(normal)
+
+    u_span = u_coords.max() - u_coords.min()
+    v_span = v_coords.max() - v_coords.min()
+    print(f"  u-span (long axis) : {u_span:.4g}")
+    print(f"  v-span (short axis): {v_span:.4g}")
+    print(f"  Aspect ratio       : {aspect:.3f}  ({u_span:.3g} / {v_span:.3g})")
+    print(f"  Out-of-plane range : {z_coords.min():.4g}  to  {z_coords.max():.4g}")
+
+    # ── Auto grid resolution ──────────────────────────────────────────────────
+    print("\nComputing grid resolution...")
+    nu, nv = compute_grid_resolution(aspect)
+
+    # ── Fit TPS ───────────────────────────────────────────────────────────────
+    print(f"\nFitting Thin-Plate Spline (SMOOTH_FACTOR={SMOOTH_FACTOR})...")
+    grid_u = np.linspace(u_coords.min(), u_coords.max(), nu)
+    grid_v = np.linspace(v_coords.min(), v_coords.max(), nv)
+    z_grid, w, a = thin_plate_spline_fit(u_coords, v_coords, z_coords,
+                                          grid_u, grid_v, smooth=SMOOTH_FACTOR)
+    print("  TPS solved OK")
+
+    # ── Build world-coordinate grid ───────────────────────────────────────────
+    GU, GV = np.meshgrid(grid_u, grid_v, indexing="ij")
+    world_pts = (centroid
+                 + GU[:, :, None] * u_axis
+                 + GV[:, :, None] * v_axis
+                 + z_grid[:, :, None] * normal)   # shape (nu, nv, 3)
+
+    # ── Deviation diagnostics ─────────────────────────────────────────────────
+    print("Running deviation diagnostics...")
+    tps_dev, nurbs_extra = compute_deviations(
+        pts_arr, w, a, u_coords, v_coords, centroid, normal, u_axis, v_axis, world_pts
+    )
+    max_combined = print_deviation_report(pts_arr, tps_dev, nurbs_extra, nu, nv)
+
+    if DEVIATION_REPORT_PATH:
+        save_deviation_csv(pts_arr, tps_dev, nurbs_extra, DEVIATION_REPORT_PATH)
+
+    if ABORT_ON_HIGH_DEVIATION and MAX_ALLOWED_DEVIATION is not None:
+        if max_combined > MAX_ALLOWED_DEVIATION:
+            raise RuntimeError(
+                f"ABORTED: combined deviation {max_combined:.3e} > "
+                f"MAX_ALLOWED_DEVIATION {MAX_ALLOWED_DEVIATION:.3e}\n"
+                f"  See tuning guide printed above."
+            )
+        print(f"  Deviation check PASSED  "
+              f"({max_combined:.3e} ≤ {MAX_ALLOWED_DEVIATION:.3e})")
+
+    # ── Build NURBS + create surface in SpaceClaim ────────────────────────────
+    print(f"\nBuilding NURBS surface ({nu} x {nv} control points, degree {SPLINE_DEGREE})...")
+    nurbs_surf = build_nurbs_surface(world_pts, SPLINE_DEGREE)
+
+    doc = sc.DocumentHelper.GetActiveDocument()
+    if doc is None:
+        raise RuntimeError("No active SpaceClaim document. Open or create one first.")
+
+    def _create_surface(context):
+        body = ShapeHelper.CreateSurfaceBody(nurbs_surf, doc.MainPart)
+        if SURFACE_NAME:
+            body.Master.Name = SURFACE_NAME
+
+    sc.Command.Execute(_create_surface)
+    print(f"  Surface body '{SURFACE_NAME}' created in SpaceClaim")
+    print("\nDone.  File > Save As > Parasolid (.x_t) or STEP (.stp) to export.")
+
+
+main()
