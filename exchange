@@ -1,502 +1,172 @@
-"""
-spaceclaim_multipatch.py
-------------------------
-SpaceClaim Python API script for a 4-patch surface from Ansys CDB components.
-
-Workflow:
-  1. Read 4 node components from the CSV directory (one CSV per component,
-     produced by parse_cdb.py run 4 times with different --comp names)
-  2. Arrange patches in a 4x1 strip along the long axis
-  3. Fit each patch with TPS, using a one-row overlap of neighbour boundary
-     nodes to enforce tangent continuity at shared seams
-  4. Force shared seam edges to have identical NURBS control points
-  5. Create 4 SpaceClaim surface bodies and sew them into one surface
-  6. Run deviation diagnostics on each patch and the seam gaps
-
-HOW TO RUN:
-  File > Scripting > Open Script...
-  Set CONFIG section below, then run.
-
-REQUIREMENTS:
-  SpaceClaim 2020 R1+, numpy bundled.
-  4 CSV files from parse_cdb.py (one per component).
-"""
-
-import csv as csv_mod
-import os
-import clr
-
-import SpaceClaim.Api.V23 as sc   # change to match your version: V21/V22/V23/V24
-from SpaceClaim.Api.V23.Geometry import NurbsSurface, ControlPoint, Knots
-from SpaceClaim.Api.V23.Modeler  import ShapeHelper
-
-import numpy as np
-
-# ─── CONFIG ──────────────────────────────────────────────────────────────────
-# One CSV per patch, in order along the long axis (patch 0 = one end, patch 3 = other end)
-CSV_PATHS = [
-    r"C:\your\path\patch_0.csv",
-    r"C:\your\path\patch_1.csv",
-    r"C:\your\path\patch_2.csv",
-    r"C:\your\path\patch_3.csv",
-]
-
-# Grid resolution per patch.
-# Since each patch is 1/4 of a 4:1 surface, each patch is roughly square.
-# Auto-compute from aspect ratio of each patch, or set manually:
-GRID_RES_U = None   # resolution along long axis of each patch (None = auto)
-GRID_RES_V = None   # resolution along short axis              (None = auto)
-GRID_TOTAL = 200    # control points per patch when auto (e.g. 200 → ~14x14 per patch)
-
-SPLINE_DEGREE   = 3      # cubic (must be <= min(Nu,Nv)-1)
-SMOOTH_FACTOR   = 0.0    # 0 = exact interpolation
-OVERLAP_ROWS    = 3      # how many boundary node rows from each neighbour to
-                         # include when fitting (higher = smoother tangent join)
-SEW_TOLERANCE   = 1e-4   # model units — increase to 1e-3 for mm-scale models
-
-# Quality control
-ABORT_ON_HIGH_DEVIATION = True
-MAX_ALLOWED_DEVIATION   = 1e-3   # model units. None = disable
-DEVIATION_REPORT_PATH   = r"C:\your\path\deviation_report.csv"  # None = skip
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# ══ Utilities ═════════════════════════════════════════════════════════════════
-
-def read_csv(path):
-    pts = []
-    node_ids = []
-    with open(path, "r") as f:
-        reader = csv_mod.DictReader(f)
-        for row in reader:
-            node_ids.append(int(row["node_id"]))
-            pts.append((float(row["x"]), float(row["y"]), float(row["z"])))
-    return np.array(node_ids), np.array(pts)
-
-
-def fit_plane_pca(pts_arr):
-    centroid = pts_arr.mean(axis=0)
-    _, S, Vt  = np.linalg.svd(pts_arr - centroid)
-    aspect    = S[0] / S[1] if S[1] > 1e-12 else 1.0
-    return centroid, Vt[2], Vt[0], Vt[1], aspect   # normal, u_axis, v_axis
-
-
-def auto_grid(aspect, total, res_u, res_v):
-    if res_u is not None and res_v is not None:
-        return int(res_u), int(res_v)
-    nu = max(4, int(round((total * aspect) ** 0.5)))
-    nv = max(4, int(round(total / nu)))
-    return nu, nv
-
-
-def _phi(r):
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(r == 0, 0.0, r**2 * np.log(r + 1e-300))
-
-
-def tps_fit_and_eval(u, v, z, grid_u, grid_v, smooth=0.0):
-    """Fit TPS, evaluate on grid. Returns z_grid (nu x nv), w, a."""
-    n   = len(u)
-    r   = np.sqrt((u[:,None]-u[None,:])**2 + (v[:,None]-v[None,:])**2)
-    K   = _phi(r) + (smooth * np.eye(n) if smooth > 0 else 0)
-    Pm  = np.column_stack([np.ones(n), u, v])
-    M   = np.block([[K, Pm], [Pm.T, np.zeros((3,3))]])
-    rhs = np.concatenate([z, [0,0,0]])
-    try:
-        coeffs = np.linalg.solve(M, rhs)
-    except np.linalg.LinAlgError:
-        coeffs = np.linalg.lstsq(M, rhs, rcond=None)[0]
-    w, a = coeffs[:n], coeffs[n:]
-    GU, GV = np.meshgrid(grid_u, grid_v, indexing="ij")
-    guf, gvf = GU.ravel(), GV.ravel()
-    re = np.sqrt((guf[:,None]-u[None,:])**2 + (gvf[:,None]-v[None,:])**2)
-    zg = (_phi(re).dot(w) + a[0] + a[1]*guf + a[2]*gvf).reshape(len(grid_u), len(grid_v))
-    return zg, w, a
-
-
-def tps_eval_points(w, a, u_train, v_train, u_q, v_q):
-    r = np.sqrt((u_q[:,None]-u_train[None,:])**2 +
-                (v_q[:,None]-v_train[None,:])**2)
-    return _phi(r).dot(w) + a[0] + a[1]*u_q + a[2]*v_q
-
-
-# ══ Global coordinate system ══════════════════════════════════════════════════
-# All 4 patches share one global PCA frame so their (u,v) coordinates are
-# comparable and seam edges align exactly.
-
-def global_frame(all_pts):
-    """PCA over ALL patch nodes combined → one shared u/v/normal frame."""
-    centroid = all_pts.mean(axis=0)
-    _, S, Vt  = np.linalg.svd(all_pts - centroid)
-    return centroid, Vt[2], Vt[0], Vt[1]   # normal, u_long, v_short
-
-
-# ══ Overlap-augmented fitting per patch ══════════════════════════════════════
-
-def get_boundary_nodes(pts_arr, u_coords, side, n_rows, strip_width):
-    """
-    Extract boundary nodes from one side of a patch (in u-direction).
-    side = 'lo' (low-u boundary) or 'hi' (high-u boundary).
-    n_rows: how many node rows deep to grab (by proximity to the boundary).
-    strip_width: u-width to consider as "boundary region".
-    """
-    if side == 'lo':
-        mask = u_coords <= (u_coords.min() + strip_width)
-    else:
-        mask = u_coords >= (u_coords.max() - strip_width)
-    return pts_arr[mask]
-
-
-def fit_patch(patch_pts, neighbour_lo_pts, neighbour_hi_pts,
-              centroid, normal, u_axis, v_axis,
-              nu, nv, smooth, patch_idx):
-    """
-    Fit a single patch, optionally augmented with overlap nodes from neighbours.
-    Returns world_pts (nu x nv x 3), w, a, u_train, v_train.
-    """
-    # Combine patch nodes with overlap from neighbours
-    all_fit_pts = patch_pts.copy()
-    if neighbour_lo_pts is not None and len(neighbour_lo_pts):
-        all_fit_pts = np.vstack([all_fit_pts, neighbour_lo_pts])
-    if neighbour_hi_pts is not None and len(neighbour_hi_pts):
-        all_fit_pts = np.vstack([all_fit_pts, neighbour_hi_pts])
-
-    # Project onto global frame
-    offset   = all_fit_pts - centroid
-    u_all    = offset.dot(u_axis)
-    v_all    = offset.dot(v_axis)
-    z_all    = offset.dot(normal)
-
-    # Grid spans only the patch's own node range (not the overlap)
-    own_off  = patch_pts - centroid
-    u_own    = own_off.dot(u_axis)
-    v_own    = own_off.dot(v_axis)
-    u_min, u_max = u_own.min(), u_own.max()
-    v_min, v_max = v_own.min(), v_own.max()
-
-    grid_u = np.linspace(u_min, u_max, nu)
-    grid_v = np.linspace(v_min, v_max, nv)
-
-    print(f"  Patch {patch_idx}: {len(patch_pts)} own nodes + "
-          f"{len(all_fit_pts)-len(patch_pts)} overlap nodes → "
-          f"grid {nu}x{nv}")
-
-    z_grid, w, a = tps_fit_and_eval(u_all, v_all, z_all,
-                                     grid_u, grid_v, smooth)
-
-    GU, GV = np.meshgrid(grid_u, grid_v, indexing="ij")
-    world_pts = (centroid
-                 + GU[:,:,None] * u_axis
-                 + GV[:,:,None] * v_axis
-                 + z_grid[:,:,None] * normal)
-
-    return world_pts, w, a, u_all, v_all, z_all
-
-
-# ══ Seam enforcement ══════════════════════════════════════════════════════════
-
-def enforce_shared_seam(world_pts_lo, world_pts_hi):
-    """
-    Force the hi-u edge of patch_lo and the lo-u edge of patch_hi to be
-    identical by averaging their control points.
-    Modifies world_pts_lo[-1,:,:] and world_pts_hi[0,:,:] in place.
-
-    Both patches must have the same nv (guaranteed by shared v_min/v_max
-    from the global frame and same GRID_RES_V).
-    """
-    nv_lo = world_pts_lo.shape[1]
-    nv_hi = world_pts_hi.shape[1]
-
-    if nv_lo != nv_hi:
-        # Resample the smaller to match the larger via linear interpolation
-        # (shouldn't happen if using same GRID_RES_V, but guard anyway)
-        print(f"  WARNING: seam nv mismatch ({nv_lo} vs {nv_hi}). "
-              f"Averaging closest points instead.")
-        avg = (world_pts_lo[-1,:min(nv_lo,nv_hi),:] +
-               world_pts_hi[0,:min(nv_lo,nv_hi),:]) / 2.0
-        world_pts_lo[-1,:min(nv_lo,nv_hi),:] = avg
-        world_pts_hi[0,:min(nv_lo,nv_hi),:] = avg
-    else:
-        avg = (world_pts_lo[-1,:,:] + world_pts_hi[0,:,:]) / 2.0
-        world_pts_lo[-1,:,:] = avg
-        world_pts_hi[0,:,:]  = avg
-
-    seam_gap = np.linalg.norm(
-        world_pts_lo[-1,:,:] - world_pts_hi[0,:,:], axis=-1).max()
-    # After averaging this is always 0, but log it for confirmation
-    print(f"  Seam gap after enforcement: {seam_gap:.2e}  (should be 0.0)")
-
-
-# ══ Deviation diagnostics ════════════════════════════════════════════════════
-
-def patch_deviations(patch_pts, w, a, u_train, v_train,
-                     world_pts, centroid, normal, u_axis, v_axis):
-    """Returns tps_dev, nurbs_extra per node in this patch."""
-    own_off  = patch_pts - centroid
-    u_own    = own_off.dot(u_axis)
-    v_own    = own_off.dot(v_axis)
-    z_own    = own_off.dot(normal)
-
-    # [A] TPS self-evaluation at own nodes
-    z_tps = tps_eval_points(w, a, u_train, v_train, u_own, v_own)
-    fitted_3d = (centroid
-                 + u_own[:,None]*u_axis
-                 + v_own[:,None]*v_axis
-                 + z_tps[:,None]*normal)
-    tps_dev = np.linalg.norm(patch_pts - fitted_3d, axis=1)
-
-    # [B] Grid sampling error
-    nu, nv, _ = world_pts.shape
-    u_min = u_own.min(); u_max = u_own.max()
-    v_min = v_own.min(); v_max = v_own.max()
-    du = (u_max-u_min)/(nu-1) if nu>1 else 1.0
-    dv = (v_max-v_min)/(nv-1) if nv>1 else 1.0
-    ui = np.clip((u_own - u_min)/du, 0, nu-1-1e-9)
-    vi = np.clip((v_own - v_min)/dv, 0, nv-1-1e-9)
-    i0, j0 = ui.astype(int), vi.astype(int)
-    i1 = np.clip(i0+1, 0, nu-1)
-    j1 = np.clip(j0+1, 0, nv-1)
-    fu, fv = ui-i0, vi-j0
-    wn = world_pts.dot(normal)
-    zg = (wn[i0,j0]*(1-fu)*(1-fv) + wn[i1,j0]*fu*(1-fv) +
-          wn[i0,j1]*(1-fu)*fv      + wn[i1,j1]*fu*fv)
-    nurbs_extra = np.abs(fitted_3d.dot(normal) - zg)
-
-    return tps_dev, nurbs_extra
-
-
-def print_patch_report(idx, tps_dev, nurbs_extra, nu, nv):
-    combined = tps_dev + nurbs_extra
-    print(f"\n  Patch {idx}  ({len(tps_dev)} nodes,  grid {nu}x{nv})")
-    print(f"    [A] TPS:  max {tps_dev.max():.3e}   mean {tps_dev.mean():.3e}")
-    print(f"    [B] Grid: max {nurbs_extra.max():.3e}   mean {nurbs_extra.mean():.3e}")
-    print(f"    Combined: max {combined.max():.3e}   P95 {np.percentile(combined,95):.3e}")
-    return combined.max()
-
-
-def seam_continuity_report(world_pts_list):
-    """
-    After seam enforcement, check tangent continuity by measuring the angle
-    between surface normals on either side of each seam.
-    """
-    print("\n  Seam tangent continuity check:")
-    for i in range(len(world_pts_list)-1):
-        lo = world_pts_list[i]
-        hi = world_pts_list[i+1]
-        # Normal at last row of lo = cross(du, dv) at [-1,:,:]
-        # Normal at first row of hi = cross(du, dv) at [0,:,:]
-        def row_normals(wp, row):
-            # finite-difference tangents along v at this row
-            dv = wp[row, 1:, :] - wp[row, :-1, :]   # (nv-1, 3)
-            if row == 0:
-                du = wp[1, :-1, :] - wp[0, :-1, :]
-            else:
-                du = wp[-1, :-1, :] - wp[-2, :-1, :]
-            n  = np.cross(du, dv)
-            norms = np.linalg.norm(n, axis=1, keepdims=True)
-            return n / np.where(norms > 1e-12, norms, 1.0)
-
-        n_lo = row_normals(lo, -1)
-        n_hi = row_normals(hi,  0)
-        dot  = np.clip((n_lo * n_hi).sum(axis=1), -1, 1)
-        angles_deg = np.degrees(np.arccos(dot))
-        print(f"    Seam {i}-{i+1}: max angle {angles_deg.max():.3f}°  "
-              f"mean {angles_deg.mean():.3f}°")
-        if angles_deg.max() < 1.0:
-            print(f"             → Good (< 1°)")
-        elif angles_deg.max() < 5.0:
-            print(f"             → Acceptable (< 5°)")
-        else:
-            print(f"             → WARNING: large tangent discontinuity. "
-                  f"Increase OVERLAP_ROWS (currently {OVERLAP_ROWS}).")
-
-
-def save_combined_deviation_csv(all_results, path):
-    with open(path, "w", newline="") as f:
-        w = csv_mod.writer(f)
-        w.writerow(["patch","x","y","z","tps_error","grid_error","combined"])
-        for patch_idx, (pts, tps_d, nurbs_e) in enumerate(all_results):
-            combined = tps_d + nurbs_e
-            for i in range(len(pts)):
-                w.writerow([patch_idx,
-                            pts[i,0], pts[i,1], pts[i,2],
-                            f"{tps_d[i]:.4e}", f"{nurbs_e[i]:.4e}",
-                            f"{combined[i]:.4e}"])
-    print(f"\n  Combined deviation report: {path}")
-
-
-# ══ NURBS surface builder ═════════════════════════════════════════════════════
-
-def uniform_knots(n, d):
-    knots = [0.0]*(d+1)
-    n_int = n - d - 1
-    for k in range(1, n_int+1):
-        knots.append(k/(n_int+1))
-    knots += [1.0]*(d+1)
-    return Knots.Create(knots)
-
-
-def build_nurbs(world_pts, degree):
-    nu, nv, _ = world_pts.shape
-    d = min(degree, nu-1, nv-1)
-    if d < degree:
-        print(f"    Note: degree capped at {d} (grid size {nu}x{nv})")
-    ctrl = []
-    for i in range(nu):
-        row = []
-        for j in range(nv):
-            p = world_pts[i,j]
-            row.append(ControlPoint.Create(float(p[0]), float(p[1]), float(p[2]), 1.0))
-        ctrl.append(row)
-    return NurbsSurface.CreateFromControlPoints(ctrl, d, d,
-                                                uniform_knots(nu, d),
-                                                uniform_knots(nv, d))
-
-
-# ══ Main ══════════════════════════════════════════════════════════════════════
-
-def main():
-
-    # ── 1. Read all patches ───────────────────────────────────────────────────
-    print("Reading patch CSVs...")
-    patches = []
-    for i, path in enumerate(CSV_PATHS):
-        nids, pts = read_csv(path)
-        patches.append((nids, pts))
-        print(f"  Patch {i}: {len(pts)} nodes  from  {os.path.basename(path)}")
-
-    # ── 2. Global PCA frame ───────────────────────────────────────────────────
-    all_pts = np.vstack([p[1] for p in patches])
-    centroid, normal, u_axis, v_axis = global_frame(all_pts)
-    print(f"\nGlobal frame established over {len(all_pts)} total nodes")
-
-    # ── 3. Sort patches along u-axis (long axis) ──────────────────────────────
-    # Ensure patches are ordered lo→hi along u
-    def patch_u_centre(pts):
-        return (pts - centroid).dot(u_axis).mean()
-
-    patches_sorted = sorted(patches, key=lambda x: patch_u_centre(x[1]))
-    print("Patch order along long axis:")
-    for i, (_, pts) in enumerate(patches_sorted):
-        uc = patch_u_centre(pts)
-        print(f"  Patch {i}: u_centre = {uc:.4g}")
-
-    # ── 4. Auto grid resolution (use aspect ratio of first patch as reference) ─
-    _, pts0 = patches_sorted[0]
-    _, _, _, _, asp0 = fit_plane_pca(pts0)
-    nu, nv = auto_grid(asp0, GRID_TOTAL, GRID_RES_U, GRID_RES_V)
-    print(f"\nGrid per patch: {nu} x {nv}  (aspect {asp0:.2f})")
-    print(f"All patches use the same nv={nv} to guarantee seam alignment")
-
-    # ── 5. Compute overlap width for each boundary ────────────────────────────
-    # Use the u-span of a typical patch divided by (OVERLAP_ROWS+1) as strip width
-    u_spans = []
-    for _, pts in patches_sorted:
-        u_own = (pts - centroid).dot(u_axis)
-        u_spans.append(u_own.max() - u_own.min())
-    avg_u_span = np.mean(u_spans)
-    strip_width = avg_u_span / max(5, nu // OVERLAP_ROWS)
-
-    # ── 6. Fit each patch with overlap ────────────────────────────────────────
-    print("\nFitting patches...")
-    world_pts_list = []
-    fit_data_list  = []   # (w, a, u_train, v_train) per patch
-
-    for i, (nids, pts) in enumerate(patches_sorted):
-        lo_nbr_pts = None
-        hi_nbr_pts = None
-
-        if i > 0:
-            _, nbr_pts = patches_sorted[i-1]
-            u_nbr = (nbr_pts - centroid).dot(u_axis)
-            # High-u side of previous patch
-            mask = u_nbr >= (u_nbr.max() - strip_width)
-            lo_nbr_pts = nbr_pts[mask]
-
-        if i < len(patches_sorted)-1:
-            _, nbr_pts = patches_sorted[i+1]
-            u_nbr = (nbr_pts - centroid).dot(u_axis)
-            # Low-u side of next patch
-            mask = u_nbr <= (u_nbr.min() + strip_width)
-            hi_nbr_pts = nbr_pts[mask]
-
-        wp, w, a, u_tr, v_tr = fit_patch(
-            pts, lo_nbr_pts, hi_nbr_pts,
-            centroid, normal, u_axis, v_axis,
-            nu, nv, SMOOTH_FACTOR, i
-        )
-        world_pts_list.append(wp)
-        fit_data_list.append((w, a, u_tr, v_tr))
-
-    # ── 7. Enforce shared seam control points ─────────────────────────────────
-    print("\nEnforcing seam continuity...")
-    for i in range(len(world_pts_list)-1):
-        enforce_shared_seam(world_pts_list[i], world_pts_list[i+1])
-
-    # ── 8. Deviation diagnostics ──────────────────────────────────────────────
-    print("\n" + "─"*58)
-    print("  Deviation diagnostics")
-    print("─"*58)
-    all_results = []
-    max_devs    = []
-    for i, (nids, pts) in enumerate(patches_sorted):
-        w, a, u_tr, v_tr = fit_data_list[i]
-        tps_d, nurbs_e = patch_deviations(
-            pts, w, a, u_tr, v_tr,
-            world_pts_list[i], centroid, normal, u_axis, v_axis
-        )
-        max_d = print_patch_report(i, tps_d, nurbs_e, nu, nv)
-        max_devs.append(max_d)
-        all_results.append((pts, tps_d, nurbs_e))
-
-    overall_max = max(max_devs)
-    print(f"\n  Overall max deviation across all patches: {overall_max:.3e}")
-
-    seam_continuity_report(world_pts_list)
-
-    if DEVIATION_REPORT_PATH:
-        save_combined_deviation_csv(all_results, DEVIATION_REPORT_PATH)
-
-    if ABORT_ON_HIGH_DEVIATION and MAX_ALLOWED_DEVIATION is not None:
-        if overall_max > MAX_ALLOWED_DEVIATION:
-            raise RuntimeError(
-                f"ABORTED: max deviation {overall_max:.3e} > "
-                f"MAX_ALLOWED_DEVIATION {MAX_ALLOWED_DEVIATION:.3e}\n"
-                f"  Increase GRID_TOTAL or reduce SMOOTH_FACTOR."
-            )
-        print(f"\n  Deviation check PASSED  "
-              f"({overall_max:.3e} ≤ {MAX_ALLOWED_DEVIATION:.3e})")
-
-    # ── 9. Build NURBS surfaces in SpaceClaim ─────────────────────────────────
-    doc = sc.DocumentHelper.GetActiveDocument()
-    if doc is None:
-        raise RuntimeError("No active SpaceClaim document.")
-
-    print("\nCreating surface bodies in SpaceClaim...")
-    surface_bodies = []
-
-    def _create_surfaces(context):
-        for i, wp in enumerate(world_pts_list):
-            nurbs = build_nurbs(wp, SPLINE_DEGREE)
-            body  = ShapeHelper.CreateSurfaceBody(nurbs, doc.MainPart)
-            body.Master.Name = f"Patch_{i}"
-            surface_bodies.append(body)
-            print(f"  Patch_{i} created")
-
-    sc.Command.Execute(_create_surfaces)
-
-    # ── 10. Sew all 4 patches into one surface ─────────────────────────────────
-    print(f"\nSewing {len(surface_bodies)} patches "
-          f"(tolerance={SEW_TOLERANCE})...")
-
-    def _sew(context):
-        ShapeHelper.Sew(surface_bodies,
-                        tolerance=SEW_TOLERANCE,
-                        createSolid=False)   # surface result, not solid
-
-    sc.Command.Execute(_sew)
-    print("  Sew complete")
-    print("\nDone.  File > Save As > Parasolid (.x_t) or STEP (.stp)")
-
-
-main()
+%% Surface Deviation: Point Cloud vs STL
+% Inputs:
+%   pts  - Nx3 array of mesh node coordinates (your point cloud)
+%   stl  - STL file of reference CAD geometry
+
+clear; clc;
+
+%% --- USER INPUTS ---
+ptcloud_file = 'mesh_nodes.csv';   % Nx3 CSV, no header
+stl_file     = 'reference.stl';
+output_csv   = 'deviation_output.csv';
+
+%% --- LOAD POINT CLOUD ---
+pts = readmatrix(ptcloud_file);    % Nx3: [X Y Z]
+N   = size(pts, 1);
+fprintf('Loaded %d mesh nodes\n', N);
+
+%% --- LOAD STL ---
+TR = stlread(stl_file);            % triangulation object
+stl_verts = TR.Points;             % Mx3 vertices
+stl_tris  = TR.ConnectivityList;   % Tx3 triangle indices
+fprintf('Loaded STL: %d vertices, %d triangles\n', ...
+        size(stl_verts,1), size(stl_tris,1));
+
+%% --- BUILD KD-TREE ON STL VERTICES (coarse nearest vertex) ---
+kdtree = KDTreeSearcher(stl_verts);
+[nn_idx, nn_dist] = knnsearch(kdtree, pts, 'K', 1);
+
+%% --- EXACT PROJECTION: point to nearest triangle ---
+% For each point, check triangles sharing the nearest vertex for
+% closest point on surface (not just vertex)
+
+% Build vertex-to-triangle map
+num_tris = size(stl_tris, 1);
+vert_to_tri = cell(size(stl_verts, 1), 1);
+for t = 1:num_tris
+    for v = stl_tris(t,:)
+        vert_to_tri{v}(end+1) = t;
+    end
+end
+
+% Preallocate
+dev_signed   = zeros(N, 1);
+dev_abs      = zeros(N, 1);
+closest_pts  = zeros(N, 3);
+closest_norm = zeros(N, 3);
+
+% Precompute triangle normals (for sign)
+V0 = stl_verts(stl_tris(:,1), :);
+V1 = stl_verts(stl_tris(:,2), :);
+V2 = stl_verts(stl_tris(:,3), :);
+E1 = V1 - V0;
+E2 = V2 - V0;
+tri_normals = cross(E1, E2, 2);
+tri_normals = tri_normals ./ (vecnorm(tri_normals, 2, 2) + eps);  % normalize
+
+fprintf('Computing point-to-surface projections...\n');
+for i = 1:N
+    P = pts(i,:);
+
+    % Candidate triangles: those sharing the nearest vertex
+    cand_tris = vert_to_tri{nn_idx(i)};
+
+    best_dist2 = inf;
+    best_cp    = stl_verts(nn_idx(i), :);
+    best_tri   = cand_tris(1);
+
+    for t = cand_tris
+        cp = point_to_tri(P, ...
+                          stl_verts(stl_tris(t,1),:), ...
+                          stl_verts(stl_tris(t,2),:), ...
+                          stl_verts(stl_tris(t,3),:));
+        d2 = sum((P - cp).^2);
+        if d2 < best_dist2
+            best_dist2 = d2;
+            best_cp    = cp;
+            best_tri   = t;
+        end
+    end
+
+    dev_abs(i)      = sqrt(best_dist2);
+    closest_pts(i,:)= best_cp;
+    closest_norm(i,:)= tri_normals(best_tri,:);
+
+    % Sign: positive if point is on the normal side
+    dev_signed(i) = sign(dot(P - best_cp, tri_normals(best_tri,:))) ...
+                    * dev_abs(i);
+end
+fprintf('Done.\n');
+
+%% --- STATISTICS ---
+fprintf('\n--- Deviation Statistics ---\n');
+fprintf('  Mean  (abs): %.6f\n', mean(dev_abs));
+fprintf('  Max   (abs): %.6f\n', max(dev_abs));
+fprintf('  Min   (abs): %.6f\n', min(dev_abs));
+fprintf('  StdDev(abs): %.6f\n', std(dev_abs));
+fprintf('  Mean (signed): %.6f\n', mean(dev_signed));
+fprintf('  RMS  (signed): %.6f\n', rms(dev_signed));
+
+%% --- VISUALIZATION ---
+figure('Name','Surface Deviation Map','Color','w');
+
+% Color map: blue = negative (inside), red = positive (outside)
+scatter3(pts(:,1), pts(:,2), pts(:,3), 10, dev_signed, 'filled');
+colormap(jet); cb = colorbar;
+cb.Label.String = 'Signed Deviation';
+clim_val = max(abs(dev_signed)) * 1.0;
+clim([-clim_val clim_val]);
+axis equal; grid on;
+xlabel('X'); ylabel('Y'); zlabel('Z');
+title('Mesh vs STL Signed Deviation');
+
+% Histogram
+figure('Name','Deviation Histogram','Color','w');
+histogram(dev_signed, 60, 'FaceColor',[0.2 0.5 0.8], 'EdgeColor','none');
+xlabel('Signed Deviation'); ylabel('Count');
+title('Deviation Distribution');
+xline(0,'k--','LineWidth',1.5);
+xline( mean(dev_signed),'r-','Mean','LineWidth',1.2);
+grid on;
+
+%% --- EXPORT ---
+header = {'X','Y','Z','Deviation_Signed','Deviation_Abs', ...
+          'Closest_X','Closest_Y','Closest_Z'};
+out = [pts, dev_signed, dev_abs, closest_pts];
+writecell([header; num2cell(out)], output_csv);
+fprintf('\nResults saved to %s\n', output_csv);
+
+
+%% =========================================================
+function cp = point_to_tri(P, A, B, C)
+% Closest point on triangle ABC to point P (all 1x3 row vectors)
+% Returns cp: closest point on triangle surface
+
+AB = B - A;  AC = C - A;  AP = P - A;
+
+d1 = dot(AB, AP);  d2 = dot(AC, AP);
+if d1 <= 0 && d2 <= 0,  cp = A; return; end
+
+BP = P - B;
+d3 = dot(AB, BP);  d4 = dot(AC, BP);
+if d3 >= 0 && d4 <= d3,  cp = B; return; end
+
+CP = P - C;
+d5 = dot(AB, CP);  d6 = dot(AC, CP);
+if d6 >= 0 && d5 <= d6,  cp = C; return; end
+
+% Edge AB
+vc = d1*d4 - d3*d2;
+if vc <= 0 && d1 >= 0 && d3 <= 0
+    cp = A + (d1/(d1-d3)) * AB; return;
+end
+
+% Edge AC
+vb = d5*d2 - d1*d6;
+if vb <= 0 && d2 >= 0 && d6 <= 0
+    cp = A + (d2/(d2-d6)) * AC; return;
+end
+
+% Edge BC
+va = d3*d6 - d5*d4;
+if va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0
+    w = (d4-d3)/((d4-d3)+(d5-d6));
+    cp = B + w*(C-B); return;
+end
+
+% Interior
+denom = 1/(va+vb+vc);
+v = vb * denom;
+w = vc * denom;
+cp = A + v*AB + w*AC;
+end
