@@ -1,31 +1,19 @@
 function [camber_angle, stagger_angle] = vane_camber_stagger(xy)
 
-%% 1. Initial chord guess: min/max x
-[~, i_LE] = min(xy(:,1));
-[~, i_TE] = max(xy(:,1));
+%% 1. LE / TE as furthest point pair
+D = pdist2(xy, xy);
+[~, idx] = max(D(:));
+[i_LE, i_TE] = ind2sub(size(D), idx);
+
 LE = xy(i_LE, :);
 TE = xy(i_TE, :);
 
-%% 2. Iterate to converge chord direction
-for iter = 1:20
-    u_hat = (TE - LE) / norm(TE - LE);
-
-    % Project all points onto current chord axis
-    t = (xy - LE) * u_hat';          % scalar projection for each point
-
-    % New LE and TE = points with min/max projection
-    [~, i_LE] = min(t);
-    [~, i_TE] = max(t);
-
-    LE_new = xy(i_LE, :);
-    TE_new = xy(i_TE, :);
-
-    if norm(LE_new - LE) < 1e-10 && norm(TE_new - TE) < 1e-10
-        break
-    end
-    LE = LE_new;
-    TE = TE_new;
-end
+%% 2. Reorder contour starting from LE
+n = size(xy, 1);
+idx_ordered = mod((i_LE-1 : i_LE+n-2), n) + 1;
+xy = xy(idx_ordered, :);
+% Update i_TE position after reorder
+i_TE = mod(i_TE - i_LE, n) + 1;
 
 %% 3. Final chord frame
 chord_vec = TE - LE;
@@ -37,9 +25,20 @@ v_hat = [-u_hat(2), u_hat(1)];      % normal, 90 deg CCW
 u = (xy - LE) * u_hat';
 v = (xy - LE) * v_hat';
 
-%% 4. Split upper / lower by sign of v
-[u_up, i] = sort(u(v >= 0));  v_up = v(v >= 0);  v_up = v_up(i);
-[u_lo, i] = sort(u(v <= 0));  v_lo = v(v <= 0);  v_lo = v_lo(i);
+%% 4. Split upper / lower
+% Points from LE to TE (indices 1:i_TE) = one surface
+% Points from TE back to LE (indices i_TE:end) = other surface
+seg1_u = u(1:i_TE);      seg1_v = v(1:i_TE);
+seg2_u = u(i_TE:end);    seg2_v = v(i_TE:end);
+
+% Upper = positive v side
+if mean(seg1_v) > mean(seg2_v)
+    [u_up, i] = sort(seg1_u);  v_up = seg1_v(i);
+    [u_lo, i] = sort(seg2_u);  v_lo = seg2_v(i);
+else
+    [u_up, i] = sort(seg2_u);  v_up = seg2_v(i);
+    [u_lo, i] = sort(seg1_u);  v_lo = seg1_v(i);
+end
 
 %% 5. Camber line on uniform u grid
 u_grid = linspace(0, chord_len, 300)';
@@ -70,6 +69,9 @@ plot(xy(:,1), xy(:,2), 'k.-');
 camber_xy = LE + u_grid * u_hat + v_camber * v_hat;
 plot(camber_xy(:,1), camber_xy(:,2), 'r-', 'LineWidth', 2);
 plot([LE(1) TE(1)], [LE(2) TE(2)], 'b--', 'LineWidth', 1.5);
-legend('Profile','Camber line','Chord');
+plot(LE(1), LE(2), 'go', 'MarkerSize', 8, 'MarkerFaceColor', 'g');
+plot(TE(1), TE(2), 'rs', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+legend('Profile','Camber line','Chord','LE','TE');
 xlabel('x'); ylabel('y');
+title(sprintf('Camber: %.2f deg  |  Stagger: %.2f deg', camber_angle, stagger_angle));
 end
