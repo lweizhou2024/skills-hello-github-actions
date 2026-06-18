@@ -1,202 +1,223 @@
-function [R, t, nodes_transformed] = register_vane(mesh_file, corr_file)
-% REGISTER_VANE  Register a scanned vane mesh into the CAD coordinate frame.
+%% SECTION 4 REPLACEMENT v3 — Frangi vesselness crack detection
 %
-% Uses weighted rigid registration (SVD) on user-supplied corner
-% correspondences. No ICP, no surface fitting — the airfoil surface is
-% untouched so cross-section deviations are pure manufacturing error.
+% Designed for faint cracks that are only slightly darker than surroundings.
+% The Frangi filter detects tubular/crack-like structures via Hessian
+% eigenvalues — it amplifies faint elongated dark features while suppressing
+% flat regions and blob-like features.
 %
-% INPUTS
-%   mesh_file   Path to scan mesh file.
-%               Format: one node per line,  node_id  x  y  z
-%               Whitespace or comma delimited. Comment lines starting
-%               with * or $ are skipped.
+% No external toolbox needed — the Frangi filter is implemented here directly.
 %
-%   corr_file   Path to correspondence file.
-%               Format: CSV with header row, columns:
-%                 node_id, x_cad, y_cad, z_cad, weight
-%               node_id must exist in mesh_file.
+% -------------------------------------------------------------------------
+%  ADD THESE to your cfg block at the top of the main script
+% -------------------------------------------------------------------------
 %
-% OUTPUTS
-%   R                  [3x3] rotation matrix  (CAD = R * scan + t)
-%   t                  [3x1] translation vector
-%   nodes_transformed  [N x 4] array: [node_id  x_new  y_new  z_new]
-%                      All mesh nodes transformed to CAD frame.
-%
-% RESIDUAL REPORT (printed to console)
-%   Per-corner residual magnitude and RMS are printed after registration.
-%   Large residuals on a subset of corners indicate local distortion at
-%   that corner (e.g. twist deviation), not registration failure.
-%
-% USAGE
-%   [R, t, nodes] = register_vane('scan_mesh.txt', 'correspondences.csv');
-%
-%   % Write transformed nodes to file:
-%   writematrix(nodes, 'scan_registered.txt', 'Delimiter', ' ');
-%
-% FILE FORMAT EXAMPLES
-%
-%   scan_mesh.txt:
-%     * Header comment line
-%     1001  12.301  -5.612   0.013
-%     1002  14.187  -5.089   0.021
-%     ...
-%
-%   correspondences.csv:
-%     node_id,x_cad,y_cad,z_cad,weight
-%     1001,12.34,-5.67,0.00,1.0
-%     1002,14.21,-5.12,0.00,1.0
-%     2089,11.98,-5.43,45.32,0.5
-%     ...
+%   cfg.frangi_scales       = 1:1:4;   % range of crack half-widths to search (px)
+%                                      % e.g. [1 2 3 4] searches cracks 2-8 px wide
+%                                      % increase upper end if cracks are wider
+%   cfg.frangi_beta         = 0.5;     % tubeness shape sensitivity [0.1 .. 1]
+%                                      % lower = more permissive about blob-iness
+%   cfg.frangi_c_frac       = 0.1;     % noise sensitivity as fraction of max |H|
+%                                      % lower = picks up fainter features
+%   cfg.crack_expected_angle = 90;     % 90 = vertical cracks, 0 = horizontal
+%   cfg.crack_angle_tol     = 35;      % ± degrees tolerance around expected angle
+%   cfg.crack_min_length    = 15;      % min skeleton segment length (px)
+%   cfg.crack_eccentricity  = 0.75;    % shape filter (0=circle, 1=line)
+%   cfg.vesselness_thresh   = 0.05;    % threshold on [0,1] vesselness map
+%                                      % lower = more sensitive; start at 0.05
+%                                      % raise if too much background noise picked up
 
-    %% ------------------------------------------------------------------ %%
-    %  1. Read mesh file
-    %% ------------------------------------------------------------------ %%
-    fprintf('Reading mesh: %s\n', mesh_file);
-    nodes_raw = read_mesh(mesh_file);
-    % nodes_raw: [N x 4]  [node_id  x  y  z]
+% -------------------------------------------------------------------------
+fprintf('Detecting cracks — Frangi vesselness filter ...\n');
 
-    % Build lookup: node_id -> row index for fast access
-    node_ids = nodes_raw(:, 1);
-    id_to_row = containers.Map(num2cell(node_ids), num2cell(1:numel(node_ids)));
-    fprintf('  Loaded %d nodes.\n', size(nodes_raw, 1));
+% =========================================================================
+%  LOCAL FUNCTION: Frangi multi-scale vesselness (dark tubular structures)
+% =========================================================================
+% Nested function defined at the bottom of this block — call it as:
+%   V = frangi_dark(img_in, scales, beta, c_frac)
 
-    %% ------------------------------------------------------------------ %%
-    %  2. Read correspondence file
-    %% ------------------------------------------------------------------ %%
-    fprintf('Reading correspondences: %s\n', corr_file);
-    corr = readtable(corr_file, 'VariableNamingRule', 'preserve');
+    function V = frangi_dark(I, scales, beta, c_frac)
+        % Returns a vesselness map in [0,1] highlighting dark tubular features.
+        % I      : 2-D double image, values in [0,1]
+        % scales : vector of Gaussian sigma values (px) = crack half-widths
+        % beta   : controls sensitivity to deviation from tubular shape
+        % c_frac : fraction of max Frobenius norm used as noise threshold
 
-    % Accept flexible column names (case-insensitive)
-    cnames = lower(corr.Properties.VariableNames);
-    col_id  = find(contains(cnames, 'node'));
-    col_x   = find(strcmp(cnames, 'x_cad') | strcmp(cnames, 'x'));
-    col_y   = find(strcmp(cnames, 'y_cad') | strcmp(cnames, 'y'));
-    col_z   = find(strcmp(cnames, 'z_cad') | strcmp(cnames, 'z'));
-    col_w   = find(contains(cnames, 'weight') | contains(cnames, 'w'));
+        [nr, nc] = size(I);
+        V_all = zeros(nr, nc, numel(scales));
 
-    assert(~isempty(col_id), 'Cannot find node_id column in correspondence file.');
-    assert(numel([col_x col_y col_z]) == 3, 'Cannot find x/y/z CAD columns.');
+        for si = 1:numel(scales)
+            s = scales(si);
 
-    corr_ids    = table2array(corr(:, col_id));
-    p_cad       = table2array(corr(:, [col_x col_y col_z]));  % [K x 3] CAD targets
-    if ~isempty(col_w)
-        weights = table2array(corr(:, col_w));
-    else
-        warning('No weight column found — using uniform weights.');
-        weights = ones(size(corr_ids));
-    end
-    weights = weights(:) / sum(weights);   % normalise so sum = 1
+            % Hessian via Gaussian second derivatives at scale s
+            % Use scale-normalised derivatives (multiply by s^2)
+            g   = fspecial('gaussian', ceil(6*s+1), s);
 
-    K = numel(corr_ids);
-    fprintf('  Loaded %d correspondences.\n', K);
-    assert(K >= 3, 'Need at least 3 correspondences for a unique rigid transform.');
+            % Second-derivative kernels
+            [x, y] = meshgrid(-(ceil(3*s)):ceil(3*s), -(ceil(3*s)):ceil(3*s));
+            Lxx_k  = (x.^2/s^4 - 1/s^2) .* exp(-(x.^2+y.^2)/(2*s^2));
+            Lyy_k  = (y.^2/s^4 - 1/s^2) .* exp(-(x.^2+y.^2)/(2*s^2));
+            Lxy_k  = (x.*y/s^4)          .* exp(-(x.^2+y.^2)/(2*s^2));
 
-    %% ------------------------------------------------------------------ %%
-    %  3. Extract scan corner coordinates by node ID
-    %% ------------------------------------------------------------------ %%
-    p_scan = zeros(K, 3);
-    for k = 1:K
-        nid = corr_ids(k);
-        assert(isKey(id_to_row, nid), ...
-               'Node ID %d in correspondence file not found in mesh.', nid);
-        row = id_to_row(nid);
-        p_scan(k, :) = nodes_raw(row, 2:4);
-    end
+            % Normalise kernels
+            Lxx_k = Lxx_k / sum(abs(Lxx_k(:)));
+            Lyy_k = Lyy_k / sum(abs(Lyy_k(:)));
+            Lxy_k = Lxy_k / sum(abs(Lxy_k(:)));
 
-    %% ------------------------------------------------------------------ %%
-    %  4. Weighted SVD rigid registration
-    %     Minimise:  sum_k  w_k * || p_cad_k - (R * p_scan_k + t) ||^2
-    %% ------------------------------------------------------------------ %%
-    [R, t] = weighted_svd_rigid(p_cad, p_scan, weights);
+            % Apply (scale-normalised: multiply by s^2)
+            Lxx = s^2 * imfilter(I, Lxx_k, 'replicate');
+            Lyy = s^2 * imfilter(I, Lyy_k, 'replicate');
+            Lxy = s^2 * imfilter(I, Lxy_k, 'replicate');
 
-    %% ------------------------------------------------------------------ %%
-    %  5. Residual report
-    %% ------------------------------------------------------------------ %%
-    p_scan_moved = (R * p_scan')' + t';   % [K x 3]
-    residuals    = p_cad - p_scan_moved;  % [K x 3]
-    res_mag      = sqrt(sum(residuals.^2, 2));  % [K x 1]
-    rms_all      = sqrt(sum(weights .* res_mag.^2));
+            % Eigenvalues of 2x2 Hessian at each pixel
+            % lambda = (Lxx+Lyy)/2 ± sqrt(((Lxx-Lyy)/2)^2 + Lxy^2)
+            tmp   = sqrt(((Lxx - Lyy)/2).^2 + Lxy.^2);
+            lam1  = (Lxx + Lyy)/2 - tmp;   % smaller eigenvalue
+            lam2  = (Lxx + Lyy)/2 + tmp;   % larger eigenvalue
 
-    fprintf('\n--- Registration residuals ---\n');
-    fprintf('  %-10s  %-10s  %-10s  %-10s  %-10s  %-10s\n', ...
-            'node_id', 'dx', 'dy', 'dz', '|res|', 'weight');
-    for k = 1:K
-        fprintf('  %-10d  %-10.4f  %-10.4f  %-10.4f  %-10.4f  %-10.4f\n', ...
-                corr_ids(k), residuals(k,1), residuals(k,2), residuals(k,3), ...
-                res_mag(k), weights(k) * sum(weights.^0));  % unnorm weight
-    end
-    fprintf('  Weighted RMS: %.6f\n', rms_all);
-    fprintf('  Max residual: %.6f  (node %d)\n', max(res_mag), ...
-            corr_ids(res_mag == max(res_mag)));
+            % For DARK tubes: both eigenvalues should be positive
+            % (second derivative is positive = local minimum = dark)
+            % Suppress pixels where lam2 <= 0
+            valid_mask = lam2 > 0;
 
-    %% ------------------------------------------------------------------ %%
-    %  6. Apply transform to all mesh nodes
-    %% ------------------------------------------------------------------ %%
-    xyz_all       = nodes_raw(:, 2:4);               % [N x 3]
-    xyz_moved     = (R * xyz_all')' + t';            % [N x 3]
-    nodes_transformed = [node_ids  xyz_moved];       % [N x 4]
+            % Rb: ratio of eigenvalues (elongatedness)
+            Rb = lam1 ./ (lam2 + eps);
 
-    fprintf('\nAll %d nodes transformed to CAD frame.\n', size(nodes_raw,1));
-    fprintf('Transform:\n');
-    fprintf('  R = [%8.5f %8.5f %8.5f]\n', R(1,:));
-    fprintf('      [%8.5f %8.5f %8.5f]\n', R(2,:));
-    fprintf('      [%8.5f %8.5f %8.5f]\n', R(3,:));
-    fprintf('  t = [%8.4f  %8.4f  %8.4f]\n', t(1), t(2), t(3));
-end
+            % S : Frobenius norm of Hessian (signal strength)
+            S  = sqrt(lam1.^2 + lam2.^2);
+            c  = c_frac * max(S(:));
 
+            % Frangi vesselness (Eq. 13 from Frangi 1998, dark tube variant)
+            V_s = exp(-Rb.^2 / (2*beta^2)) .* (1 - exp(-S.^2 / (2*c^2)));
+            V_s(~valid_mask) = 0;
 
-%% ======================================================================= %%
-%  Weighted SVD rigid registration
-%  Finds R [3x3], t [3x1] minimising sum_k w_k ||p_k - (R*q_k + t)||^2
-%  p = CAD targets [K x 3], q = scan points [K x 3], w = weights [K x 1]
-%% ======================================================================= %%
-function [R, t] = weighted_svd_rigid(p, q, w)
-    w = w(:) / sum(w);   % ensure normalised
+            V_all(:,:,si) = V_s;
+        end
 
-    % Weighted centroids
-    cp = sum(w .* p, 1);   % [1 x 3]
-    cq = sum(w .* q, 1);
+        % Take maximum response across scales
+        V = max(V_all, [], 3);
 
-    % Centred, weight-scaled point matrices  [3 x K]
-    P = (p - cp)' .* sqrt(w)';
-    Q = (q - cq)' .* sqrt(w)';
-
-    % Cross-covariance
-    H = Q * P';   % [3 x 3]
-
-    [U, ~, V] = svd(H);
-
-    % Correct for reflection (ensure det(R) = +1)
-    D = diag([1  1  det(V * U')]);
-    R = V * D * U';
-
-    t = cp' - R * cq';   % [3 x 1]
-end
-
-
-%% ======================================================================= %%
-%  Read mesh file:  node_id  x  y  z  (whitespace or comma delimited)
-%  Skips lines starting with * $ # or that cannot be parsed as 4 numbers.
-%% ======================================================================= %%
-function nodes = read_mesh(fname)
-    fid = fopen(fname, 'r');
-    assert(fid ~= -1, 'Cannot open mesh file: %s', fname);
-
-    data = {};
-    while ~feof(fid)
-        line = strtrim(fgetl(fid));
-        if isempty(line), continue; end
-        if any(line(1) == '*$#%'), continue; end   % comment / keyword lines
-
-        % Replace commas with spaces and parse
-        line = strrep(line, ',', ' ');
-        vals = sscanf(line, '%f');
-        if numel(vals) >= 4
-            data{end+1} = vals(1:4)';  %#ok<AGROW>
+        % Normalise to [0,1]
+        vmax = max(V(:));
+        if vmax > 0
+            V = V / vmax;
         end
     end
-    fclose(fid);
 
-    assert(~isempty(data), 'No valid node data found in mesh file.');
-    nodes = cell2mat(data');   % [N x 4]
+% =========================================================================
+%  Step 4a: prepare coating sub-image
+% =========================================================================
+coating_mean = mean(img(coating_mask));
+img_filled   = img;
+img_filled(~coating_mask) = coating_mean;   % neutral fill outside mask
+
+% =========================================================================
+%  Step 4b: run Frangi filter
+% =========================================================================
+V = frangi_dark(img_filled, cfg.frangi_scales, cfg.frangi_beta, cfg.frangi_c_frac);
+
+% Zero outside coating mask
+V(~coating_mask) = 0;
+
+% =========================================================================
+%  Step 4c: threshold vesselness map
+% =========================================================================
+crack_mask_raw = V > cfg.vesselness_thresh;
+crack_mask_raw = bwareaopen(crack_mask_raw, 5);   % remove tiny speckle
+
+% =========================================================================
+%  Step 4d: skeletonise
+% =========================================================================
+if exist('bwskel', 'file')      % R2019a+
+    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
+else
+    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
+    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
+end
+
+% =========================================================================
+%  Step 4e: label and filter by shape + orientation
+% =========================================================================
+CC_crack    = bwconncomp(skeleton);
+props_crack = regionprops(CC_crack, img, ...
+    'Area', 'Eccentricity', 'Orientation', 'MajorAxisLength', 'BoundingBox');
+
+keep = false(CC_crack.NumObjects, 1);
+for k = 1:CC_crack.NumObjects
+    if props_crack(k).Eccentricity < cfg.crack_eccentricity,  continue; end
+    if props_crack(k).Area         < cfg.crack_min_length,    continue; end
+
+    ang_diff = abs(props_crack(k).Orientation - cfg.crack_expected_angle);
+    ang_diff = min(ang_diff, 180 - ang_diff);
+    if ang_diff <= cfg.crack_angle_tol
+        keep(k) = true;
+    end
+end
+
+crack_skeleton = false(nrows, ncols);
+n_cracks = 0;
+for k = 1:CC_crack.NumObjects
+    if keep(k)
+        n_cracks = n_cracks + 1;
+        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
+    end
+end
+
+fprintf('  Cracks detected: %d segments\n', n_cracks);
+crack_vis = imdilate(crack_skeleton, strel('disk', 1));
+
+% =========================================================================
+%  Step 4f: diagnostic figures
+% =========================================================================
+
+% Figure A: raw vesselness map — use this to tune vesselness_thresh
+figure('Name', 'Frangi vesselness map', 'NumberTitle', 'off');
+tiledlayout(1, 3, 'TileSpacing', 'compact');
+
+nexttile;
+imshow(img, []);
+title('Original SEM (coating region)', 'FontWeight', 'normal');
+
+nexttile;
+imshow(V, []);
+colormap(gca, hot);
+colorbar;
+title(sprintf('Vesselness  (thresh = %.3f)', cfg.vesselness_thresh), ...
+    'FontWeight', 'normal');
+
+nexttile;
+imshow(img, []);
+hold on;
+[cr, cc_] = find(crack_vis);
+if ~isempty(cr)
+    scatter(cc_, cr, 2, 'r', 'filled');
+end
+[br, bc] = find(bwperim(coating_mask));
+scatter(bc, br, 1, 'c', 'filled');
+hold off;
+legend({'Cracks', 'Coating boundary'}, 'TextColor', 'w', 'Color', 'k', ...
+    'Location', 'northeastoutside');
+title('Detected cracks', 'FontWeight', 'normal');
+
+% Figure B: vesselness histogram — helps choose vesselness_thresh
+figure('Name', 'Vesselness histogram', 'NumberTitle', 'off');
+v_vals = V(coating_mask & V > 0);
+histogram(v_vals, 100, 'Normalization', 'probability', 'FaceColor', [0.2 0.4 0.8]);
+xline(cfg.vesselness_thresh, 'r--', sprintf('thresh = %.3f', cfg.vesselness_thresh), ...
+    'LineWidth', 1.5, 'LabelHorizontalAlignment', 'left');
+xlabel('Vesselness score');
+ylabel('Probability');
+title('Distribution inside coating mask — set thresh above the noise floor', ...
+    'FontWeight', 'normal');
+grid on; box off;
+
+% =========================================================================
+%  Variables passed to sections 5-6 (unchanged from original)
+% =========================================================================
+if n_cracks > 0
+    crack_props_keep = props_crack(keep);
+    lengths_nm   = [crack_props_keep.MajorAxisLength] * cfg.nm_per_pixel;
+    orientations = [crack_props_keep.Orientation];
+else
+    lengths_nm   = [];
+    orientations = [];
 end
