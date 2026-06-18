@@ -1,172 +1,280 @@
-%% Surface Deviation: Point Cloud vs STL
-% Inputs:
-%   pts  - Nx3 array of mesh node coordinates (your point cloud)
-%   stl  - STL file of reference CAD geometry
+%% SEM Coating Thickness & Crack Analysis
+% Inputs : a grayscale .tif SEM image where
+%          - the coating layer has an intermediate grey level
+%          - one side (substrate) is darker, the other (epoxy/air) is brighter
+% Outputs: thickness profile, mean/std, crack skeleton overlay, CSV report
+%
+% Requirements: Image Processing Toolbox
+% Optional    : Statistics and Machine Learning Toolbox (for robust stats)
+%
+% -------------------------------------------------------------------------
+%  ADJUST THESE PARAMETERS before running
+% -------------------------------------------------------------------------
 
-clear; clc;
+cfg.image_file   = 'your_sem_image.tif'; % path to your TIFF
+cfg.nm_per_pixel = 10;                   % <--- set from your SEM scale bar
+cfg.scan_dir     = 'vertical';           % 'vertical'   : coating runs left-right
+                                         % 'horizontal' : coating runs top-bottom
+cfg.n_classes    = 3;                    % Otsu classes: substrate | coating | bright
+                                         %   use 2 if one boundary is very clean
+cfg.coating_class = 2;                   % which Otsu class is the coating (1=darkest)
+cfg.morph_radius  = 5;                   % morphological disk radius (px)
+cfg.min_blob_area = 500;                 % ignore coating blobs smaller than this (px^2)
+cfg.crack_sensitivity = 0.85;            % adaptive threshold sensitivity [0..1]
+                                         %   lower = more aggressive crack detection
+cfg.crack_min_length = 20;              % min skeleton length to call something a crack (px)
+cfg.crack_eccentricity = 0.75;          % regionprops eccentricity cutoff (0=circle, 1=line)
+cfg.smooth_kernel = 3;                  % Gaussian sigma for pre-smoothing (0 = off)
 
-%% --- USER INPUTS ---
-ptcloud_file = 'mesh_nodes.csv';   % Nx3 CSV, no header
-stl_file     = 'reference.stl';
-output_csv   = 'deviation_output.csv';
+% -------------------------------------------------------------------------
+%% 1.  Load image
+% -------------------------------------------------------------------------
+fprintf('Loading %s ...\n', cfg.image_file);
+raw = imread(cfg.image_file);
 
-%% --- LOAD POINT CLOUD ---
-pts = readmatrix(ptcloud_file);    % Nx3: [X Y Z]
-N   = size(pts, 1);
-fprintf('Loaded %d mesh nodes\n', N);
+% Handle RGB tifs (take luminance channel)
+if ndims(raw) == 3
+    raw = rgb2gray(raw);
+end
 
-%% --- LOAD STL ---
-TR = stlread(stl_file);            % triangulation object
-stl_verts = TR.Points;             % Mx3 vertices
-stl_tris  = TR.ConnectivityList;   % Tx3 triangle indices
-fprintf('Loaded STL: %d vertices, %d triangles\n', ...
-        size(stl_verts,1), size(stl_tris,1));
+img = im2double(raw);   % [0, 1] double
 
-%% --- BUILD KD-TREE ON STL VERTICES (coarse nearest vertex) ---
-kdtree = KDTreeSearcher(stl_verts);
-[nn_idx, nn_dist] = knnsearch(kdtree, pts, 'K', 1);
+if cfg.smooth_kernel > 0
+    img_smooth = imgaussfilt(img, cfg.smooth_kernel);
+else
+    img_smooth = img;
+end
 
-%% --- EXACT PROJECTION: point to nearest triangle ---
-% For each point, check triangles sharing the nearest vertex for
-% closest point on surface (not just vertex)
+[nrows, ncols] = size(img);
+fprintf('  Image size: %d x %d px  (%.1f x %.1f µm)\n', ...
+    ncols, nrows, ncols*cfg.nm_per_pixel/1000, nrows*cfg.nm_per_pixel/1000);
 
-% Build vertex-to-triangle map
-num_tris = size(stl_tris, 1);
-vert_to_tri = cell(size(stl_verts, 1), 1);
-for t = 1:num_tris
-    for v = stl_tris(t,:)
-        vert_to_tri{v}(end+1) = t;
+% -------------------------------------------------------------------------
+%% 2.  Segment the coating layer
+% -------------------------------------------------------------------------
+fprintf('Segmenting coating ...\n');
+
+% Otsu multi-class thresholding
+thresholds = multithresh(img_smooth, cfg.n_classes - 1);
+
+% Build a label image  (1 = darkest, n_classes = brightest)
+label_img = imquantize(img_smooth, thresholds);   % values 1..n_classes
+
+% Extract the coating class mask
+coating_mask_raw = (label_img == cfg.coating_class);
+
+% Morphological cleanup
+se = strel('disk', cfg.morph_radius);
+mask = imclose(coating_mask_raw, se);   % close small gaps
+mask = imfill(mask, 'holes');           % fill internal holes
+mask = imopen(mask, se);               % remove speckle
+mask = bwareaopen(mask, cfg.min_blob_area); % drop tiny blobs
+
+% Keep only the LARGEST connected component
+CC  = bwconncomp(mask);
+if CC.NumObjects == 0
+    error('No coating region found. Try adjusting cfg.coating_class or cfg.n_classes.');
+end
+stats_cc = regionprops(CC, 'Area');
+[~, idx] = max([stats_cc.Area]);
+coating_mask = false(nrows, ncols);
+coating_mask(CC.PixelIdxList{idx}) = true;
+
+fprintf('  Coating area: %.1f µm²\n', ...
+    sum(coating_mask(:)) * (cfg.nm_per_pixel/1000)^2);
+
+% -------------------------------------------------------------------------
+%% 3.  Thickness measurement (spanwise profile)
+% -------------------------------------------------------------------------
+fprintf('Measuring thickness ...\n');
+
+% Rotate so that thickness is always measured column-by-column
+if strcmp(cfg.scan_dir, 'horizontal')
+    work_mask = coating_mask';
+else
+    work_mask = coating_mask;
+end
+
+[wr, wc] = size(work_mask);
+top_px    = NaN(1, wc);
+bot_px    = NaN(1, wc);
+thickness_px = NaN(1, wc);
+
+for c = 1:wc
+    col = work_mask(:, c);
+    rows_on = find(col);
+    if ~isempty(rows_on)
+        top_px(c) = rows_on(1);
+        bot_px(c) = rows_on(end);
+        thickness_px(c) = bot_px(c) - top_px(c) + 1;
     end
 end
 
-% Preallocate
-dev_signed   = zeros(N, 1);
-dev_abs      = zeros(N, 1);
-closest_pts  = zeros(N, 3);
-closest_norm = zeros(N, 3);
+% Convert to physical units
+thickness_nm = thickness_px * cfg.nm_per_pixel;
 
-% Precompute triangle normals (for sign)
-V0 = stl_verts(stl_tris(:,1), :);
-V1 = stl_verts(stl_tris(:,2), :);
-V2 = stl_verts(stl_tris(:,3), :);
-E1 = V1 - V0;
-E2 = V2 - V0;
-tri_normals = cross(E1, E2, 2);
-tri_normals = tri_normals ./ (vecnorm(tri_normals, 2, 2) + eps);  % normalize
+% Robust filtering: remove columns where thickness deviates by > 3 MAD
+t_med = median(thickness_nm, 'omitnan');
+t_mad = mad(thickness_nm, 1);
+valid  = abs(thickness_nm - t_med) < 3 * t_mad;
 
-fprintf('Computing point-to-surface projections...\n');
-for i = 1:N
-    P = pts(i,:);
+thickness_filtered = thickness_nm;
+thickness_filtered(~valid) = NaN;
 
-    % Candidate triangles: those sharing the nearest vertex
-    cand_tris = vert_to_tri{nn_idx(i)};
+mean_thickness = mean(thickness_filtered, 'omitnan');
+std_thickness  = std(thickness_filtered,  'omitnan');
+min_thickness  = min(thickness_filtered,  [], 'omitnan');
+max_thickness  = max(thickness_filtered,  [], 'omitnan');
 
-    best_dist2 = inf;
-    best_cp    = stl_verts(nn_idx(i), :);
-    best_tri   = cand_tris(1);
+fprintf('  Mean thickness : %.1f nm\n', mean_thickness);
+fprintf('  Std  thickness : %.1f nm\n', std_thickness);
+fprintf('  Min / Max      : %.1f / %.1f nm\n', min_thickness, max_thickness);
 
-    for t = cand_tris
-        cp = point_to_tri(P, ...
-                          stl_verts(stl_tris(t,1),:), ...
-                          stl_verts(stl_tris(t,2),:), ...
-                          stl_verts(stl_tris(t,3),:));
-        d2 = sum((P - cp).^2);
-        if d2 < best_dist2
-            best_dist2 = d2;
-            best_cp    = cp;
-            best_tri   = t;
-        end
+% -------------------------------------------------------------------------
+%% 4.  Crack detection
+% -------------------------------------------------------------------------
+fprintf('Detecting cracks ...\n');
+
+% Work only inside the coating mask
+img_in_coating = img;
+img_in_coating(~coating_mask) = NaN;
+
+% Adaptive thresholding: cracks are locally dark within the coating
+%   'ForegroundPolarity','dark' finds dark objects on a brighter background
+crack_mask_raw = ~imbinarize(img_in_coating, 'adaptive', ...
+    'Sensitivity', cfg.crack_sensitivity, ...
+    'ForegroundPolarity', 'dark');
+
+% Restrict to coating mask and remove thin speckle
+crack_mask_raw = crack_mask_raw & coating_mask;
+crack_mask_raw = bwareaopen(crack_mask_raw, 5);
+
+% Skeletonize to get 1-pixel-wide crack centrelines
+if exist('bwskel', 'file')          % R2019a+
+    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
+else
+    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
+    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
+end
+
+% Label individual crack segments and filter by shape
+CC_crack = bwconncomp(skeleton);
+props_crack = regionprops(CC_crack, img, ...
+    'Area', 'Eccentricity', 'Orientation', 'BoundingBox', 'MajorAxisLength');
+
+keep = false(CC_crack.NumObjects, 1);
+for k = 1:CC_crack.NumObjects
+    if props_crack(k).Eccentricity > cfg.crack_eccentricity && ...
+       props_crack(k).Area >= cfg.crack_min_length
+        keep(k) = true;
     end
-
-    dev_abs(i)      = sqrt(best_dist2);
-    closest_pts(i,:)= best_cp;
-    closest_norm(i,:)= tri_normals(best_tri,:);
-
-    % Sign: positive if point is on the normal side
-    dev_signed(i) = sign(dot(P - best_cp, tri_normals(best_tri,:))) ...
-                    * dev_abs(i);
-end
-fprintf('Done.\n');
-
-%% --- STATISTICS ---
-fprintf('\n--- Deviation Statistics ---\n');
-fprintf('  Mean  (abs): %.6f\n', mean(dev_abs));
-fprintf('  Max   (abs): %.6f\n', max(dev_abs));
-fprintf('  Min   (abs): %.6f\n', min(dev_abs));
-fprintf('  StdDev(abs): %.6f\n', std(dev_abs));
-fprintf('  Mean (signed): %.6f\n', mean(dev_signed));
-fprintf('  RMS  (signed): %.6f\n', rms(dev_signed));
-
-%% --- VISUALIZATION ---
-figure('Name','Surface Deviation Map','Color','w');
-
-% Color map: blue = negative (inside), red = positive (outside)
-scatter3(pts(:,1), pts(:,2), pts(:,3), 10, dev_signed, 'filled');
-colormap(jet); cb = colorbar;
-cb.Label.String = 'Signed Deviation';
-clim_val = max(abs(dev_signed)) * 1.0;
-clim([-clim_val clim_val]);
-axis equal; grid on;
-xlabel('X'); ylabel('Y'); zlabel('Z');
-title('Mesh vs STL Signed Deviation');
-
-% Histogram
-figure('Name','Deviation Histogram','Color','w');
-histogram(dev_signed, 60, 'FaceColor',[0.2 0.5 0.8], 'EdgeColor','none');
-xlabel('Signed Deviation'); ylabel('Count');
-title('Deviation Distribution');
-xline(0,'k--','LineWidth',1.5);
-xline( mean(dev_signed),'r-','Mean','LineWidth',1.2);
-grid on;
-
-%% --- EXPORT ---
-header = {'X','Y','Z','Deviation_Signed','Deviation_Abs', ...
-          'Closest_X','Closest_Y','Closest_Z'};
-out = [pts, dev_signed, dev_abs, closest_pts];
-writecell([header; num2cell(out)], output_csv);
-fprintf('\nResults saved to %s\n', output_csv);
-
-
-%% =========================================================
-function cp = point_to_tri(P, A, B, C)
-% Closest point on triangle ABC to point P (all 1x3 row vectors)
-% Returns cp: closest point on triangle surface
-
-AB = B - A;  AC = C - A;  AP = P - A;
-
-d1 = dot(AB, AP);  d2 = dot(AC, AP);
-if d1 <= 0 && d2 <= 0,  cp = A; return; end
-
-BP = P - B;
-d3 = dot(AB, BP);  d4 = dot(AC, BP);
-if d3 >= 0 && d4 <= d3,  cp = B; return; end
-
-CP = P - C;
-d5 = dot(AB, CP);  d6 = dot(AC, CP);
-if d6 >= 0 && d5 <= d6,  cp = C; return; end
-
-% Edge AB
-vc = d1*d4 - d3*d2;
-if vc <= 0 && d1 >= 0 && d3 <= 0
-    cp = A + (d1/(d1-d3)) * AB; return;
 end
 
-% Edge AC
-vb = d5*d2 - d1*d6;
-if vb <= 0 && d2 >= 0 && d6 <= 0
-    cp = A + (d2/(d2-d6)) * AC; return;
+% Rebuild filtered crack skeleton
+crack_skeleton = false(nrows, ncols);
+n_cracks = 0;
+for k = 1:CC_crack.NumObjects
+    if keep(k)
+        n_cracks = n_cracks + 1;
+        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
+    end
 end
 
-% Edge BC
-va = d3*d6 - d5*d4;
-if va <= 0 && (d4-d3) >= 0 && (d5-d6) >= 0
-    w = (d4-d3)/((d4-d3)+(d5-d6));
-    cp = B + w*(C-B); return;
+fprintf('  Cracks detected: %d segments\n', n_cracks);
+
+% Dilate for visualisation (3-px wide lines)
+crack_vis = imdilate(crack_skeleton, strel('disk', 1));
+
+% -------------------------------------------------------------------------
+%% 5.  Visualisation
+% -------------------------------------------------------------------------
+fprintf('Plotting ...\n');
+
+% --- Figure 1: segmentation overlay ---
+figure('Name', 'Coating Segmentation', 'NumberTitle', 'off');
+imshow(img, []);
+hold on;
+
+% Coating boundary in cyan
+boundary = bwperim(coating_mask);
+[br, bc] = find(boundary);
+scatter(bc, br, 1, 'c', 'filled');
+
+% Crack skeleton in red
+[cr, cc_] = find(crack_vis);
+if ~isempty(cr)
+    scatter(cc_, cr, 2, 'r', 'filled');
+end
+hold off;
+legend({'Coating boundary', 'Cracks'}, 'TextColor', 'w', ...
+    'Color', 'k', 'Location', 'northeastoutside');
+title('Coating segmentation & cracks', 'FontWeight', 'normal');
+
+% --- Figure 2: thickness profile ---
+figure('Name', 'Thickness Profile', 'NumberTitle', 'off');
+x_axis = (1:wc) * cfg.nm_per_pixel;   % position in nm
+plot(x_axis/1000, thickness_filtered, 'b-', 'LineWidth', 0.8);
+hold on;
+yline(mean_thickness, 'r--', sprintf('Mean = %.0f nm', mean_thickness), ...
+    'LineWidth', 1.2, 'LabelHorizontalAlignment', 'left');
+yline(mean_thickness + std_thickness, 'k:', 'LineWidth', 0.8);
+yline(mean_thickness - std_thickness, 'k:', sprintf('±1σ = %.0f nm', std_thickness), ...
+    'LineWidth', 0.8, 'LabelHorizontalAlignment', 'left');
+hold off;
+xlabel('Position (µm)');
+ylabel('Thickness (nm)');
+title('Spanwise coating thickness', 'FontWeight', 'normal');
+grid on; box off;
+
+% --- Figure 3: crack property scatter ---
+if n_cracks > 0
+    lengths_nm = [props_crack(keep).MajorAxisLength] * cfg.nm_per_pixel;
+    orientations = [props_crack(keep).Orientation];
+
+    figure('Name', 'Crack Properties', 'NumberTitle', 'off');
+    tiledlayout(1, 2);
+    nexttile;
+    histogram(lengths_nm, 15, 'FaceColor', [0.8 0.2 0.2]);
+    xlabel('Crack length (nm)'); ylabel('Count');
+    title('Crack length distribution', 'FontWeight', 'normal');
+
+    nexttile;
+    polarhistogram(deg2rad(orientations), 18, 'FaceColor', [0.8 0.2 0.2]);
+    title('Crack orientation (°)', 'FontWeight', 'normal');
 end
 
-% Interior
-denom = 1/(va+vb+vc);
-v = vb * denom;
-w = vc * denom;
-cp = A + v*AB + w*AC;
+% -------------------------------------------------------------------------
+%% 6.  Export results to CSV
+% -------------------------------------------------------------------------
+fprintf('Exporting results ...\n');
+
+% Thickness profile table
+col_positions = ((1:wc) * cfg.nm_per_pixel / 1000)';  % µm
+T_thick = table(col_positions, thickness_filtered', ...
+    'VariableNames', {'Position_um', 'Thickness_nm'});
+writetable(T_thick, 'coating_thickness_profile.csv');
+
+% Crack properties table
+if n_cracks > 0
+    crack_ids  = (1:n_cracks)';
+    crack_len  = lengths_nm';
+    crack_ori  = orientations';
+    T_crack = table(crack_ids, crack_len, crack_ori, ...
+        'VariableNames', {'CrackID', 'Length_nm', 'Orientation_deg'});
+    writetable(T_crack, 'crack_properties.csv');
 end
+
+% Summary
+fprintf('\n========== SUMMARY ==========\n');
+fprintf('  Mean coating thickness : %8.1f nm\n', mean_thickness);
+fprintf('  Std  coating thickness : %8.1f nm\n', std_thickness);
+fprintf('  Min  coating thickness : %8.1f nm\n', min_thickness);
+fprintf('  Max  coating thickness : %8.1f nm\n', max_thickness);
+fprintf('  Number of cracks       : %8d\n',   n_cracks);
+if n_cracks > 0
+    fprintf('  Mean crack length      : %8.1f nm\n', mean(lengths_nm));
+end
+fprintf('==============================\n');
+fprintf('Files written: coating_thickness_profile.csv');
+if n_cracks > 0, fprintf(', crack_properties.csv'); end
+fprintf('\n');
