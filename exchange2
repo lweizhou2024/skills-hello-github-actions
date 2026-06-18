@@ -1,77 +1,151 @@
-function [camber_angle, stagger_angle] = vane_camber_stagger(xy)
+%% SECTION 4 REPLACEMENT — Crack detection (orientation-aware, gradient-robust)
+%
+% Replace the entire "4. Crack detection" block in sem_coating_analysis.m
+% with this code.  Everything above and below (sections 1-3 and 5-6) stays
+% the same.
+%
+% Key changes vs the original:
+%   - White top-hat transform removes the slow grey-level gradient across the
+%     coating before thresholding, so the midplane transition no longer appears
+%     as a dark band.
+%   - Global Otsu threshold on the residual (not adaptive), which is more
+%     robust when the gradient has been removed.
+%   - Orientation filter keeps only skeleton segments whose major axis is
+%     within cfg.crack_angle_tol degrees of the expected crack direction.
+%
+% -------------------------------------------------------------------------
+%  ADDITIONAL PARAMETERS — add these to your cfg block at the top of the script
+% -------------------------------------------------------------------------
+%
+%   cfg.tophat_radius       = 20;    % disk radius for background estimation (px)
+%                                    % should be >> crack width, << coating thickness
+%   cfg.crack_thresh_factor = 1.5;   % multiply Otsu threshold by this to be stricter
+%                                    % raise toward 2.5 to reject faint features
+%   cfg.crack_angle_tol     = 30;    % ± degrees from perpendicular-to-coating
+%                                    % e.g. coating runs left-right → cracks are ~90°
+%                                    %      set crack_expected_angle = 90
+%   cfg.crack_expected_angle = 90;   % expected crack orientation in degrees
+%                                    % 90° = vertical cracks in a horizontal coating
+%                                    % 0°  = horizontal cracks in a vertical coating
+%   cfg.crack_min_length    = 20;    % (already in original cfg, keep it)
+%   cfg.crack_eccentricity  = 0.80;  % (already in original cfg, keep it)
+%
+% -------------------------------------------------------------------------
 
-%% 1. LE / TE as furthest point pair
-D = pdist2(xy, xy);
-[~, idx] = max(D(:));
-[i_LE, i_TE] = ind2sub(size(D), idx);
+fprintf('Detecting cracks (gradient-corrected) ...\n');
 
-LE = xy(i_LE, :);
-TE = xy(i_TE, :);
+% --- 4a. Isolate the coating strip and fill NaNs for morphology ---
+% Replace pixels outside the coating with the local coating mean so that
+% morphological operations don't create artefacts at the mask boundary.
+coating_mean = mean(img(coating_mask));
+img_filled   = img;
+img_filled(~coating_mask) = coating_mean;
 
-%% 2. Reorder contour starting from LE
-n = size(xy, 1);
-idx_ordered = mod((i_LE-1 : i_LE+n-2), n) + 1;
-xy = xy(idx_ordered, :);
-% Update i_TE position after reorder
-i_TE = mod(i_TE - i_LE, n) + 1;
+% --- 4b. White top-hat: remove slow background gradient ---
+% imtophat = img - morphological opening(img)
+% The opening uses a disk larger than crack width but smaller than the
+% gradient wavelength.  This leaves only sharp, locally-dark features.
+se_tophat    = strel('disk', cfg.tophat_radius);
+background   = imopen(img_filled, se_tophat);
+tophat_img   = img_filled - background;   % dark cracks → local minima → small values
 
-%% 3. Final chord frame
-chord_vec = TE - LE;
-chord_len = norm(chord_vec);
-u_hat = chord_vec / chord_len;
-v_hat = [-u_hat(2), u_hat(1)];      % normal, 90 deg CCW
+% Invert so cracks are BRIGHT in the residual (easier to threshold)
+tophat_inv   = max(tophat_img(:)) - tophat_img;
 
-% Project all points into (u, v)
-u = (xy - LE) * u_hat';
-v = (xy - LE) * v_hat';
+% Zero out anything outside the coating mask
+tophat_inv(~coating_mask) = 0;
 
-%% 4. Split upper / lower
-% Points from LE to TE (indices 1:i_TE) = one surface
-% Points from TE back to LE (indices i_TE:end) = other surface
-seg1_u = u(1:i_TE);      seg1_v = v(1:i_TE);
-seg2_u = u(i_TE:end);    seg2_v = v(i_TE:end);
+% --- 4c. Global Otsu threshold on residual (inside coating only) ---
+pixels_in_coating = tophat_inv(coating_mask);
+otsu_level = graythresh(pixels_in_coating);           % Otsu on 1-D vector
+crack_thresh = otsu_level * cfg.crack_thresh_factor;  % stricter than bare Otsu
+crack_thresh = min(crack_thresh, 0.95 * max(pixels_in_coating)); % safety cap
 
-% Upper = positive v side
-if mean(seg1_v) > mean(seg2_v)
-    [u_up, i] = sort(seg1_u);  v_up = seg1_v(i);
-    [u_lo, i] = sort(seg2_u);  v_lo = seg2_v(i);
+crack_mask_raw = (tophat_inv > crack_thresh) & coating_mask;
+
+% Small noise removal
+crack_mask_raw = bwareaopen(crack_mask_raw, 5);
+
+% --- 4d. Skeletonise ---
+if exist('bwskel', 'file')          % R2019a+
+    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
 else
-    [u_up, i] = sort(seg2_u);  v_up = seg2_v(i);
-    [u_lo, i] = sort(seg1_u);  v_lo = seg1_v(i);
+    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
+    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
 end
 
-%% 5. Camber line on uniform u grid
-u_grid = linspace(0, chord_len, 300)';
-u_min  = max(u_up(1),   u_lo(1));
-u_max  = min(u_up(end), u_lo(end));
-u_grid = u_grid(u_grid >= u_min & u_grid <= u_max);
+% --- 4e. Label segments and filter by shape AND orientation ---
+CC_crack   = bwconncomp(skeleton);
+props_crack = regionprops(CC_crack, img, ...
+    'Area', 'Eccentricity', 'Orientation', 'MajorAxisLength', 'BoundingBox');
 
-v_camber = (interp1(u_up, v_up, u_grid, 'pchip') + ...
-            interp1(u_lo, v_lo, u_grid, 'pchip')) / 2;
+keep = false(CC_crack.NumObjects, 1);
 
-%% 6. Angles
-sp    = fit(u_grid, v_camber, 'smoothingspline', 'SmoothingParam', 0.9999);
-dv_du = differentiate(sp, u_grid);
-local_angle = atan2d(dv_du, ones(size(dv_du)));
+for k = 1:CC_crack.NumObjects
+    % Shape filter: must be elongated
+    if props_crack(k).Eccentricity < cfg.crack_eccentricity
+        continue
+    end
+    % Length filter
+    if props_crack(k).Area < cfg.crack_min_length
+        continue
+    end
+    % Orientation filter
+    % regionprops Orientation is in [-90, 90] degrees (angle of major axis)
+    % Normalise the difference to [-90, 90]
+    ang_diff = abs(props_crack(k).Orientation - cfg.crack_expected_angle);
+    ang_diff = min(ang_diff, 180 - ang_diff);   % handle 0°/180° wrap
+    if ang_diff <= cfg.crack_angle_tol
+        keep(k) = true;
+    end
+end
 
-n_avg = max(1, round(0.05 * numel(u_grid)));
-inlet_local  = mean(local_angle(1:n_avg));
-outlet_local = mean(local_angle(end-n_avg+1:end));
-camber_angle  = inlet_local - outlet_local;
-stagger_angle = atan2d(chord_vec(2), chord_vec(1));
+% Rebuild filtered crack skeleton image
+crack_skeleton = false(nrows, ncols);
+n_cracks = 0;
+for k = 1:CC_crack.NumObjects
+    if keep(k)
+        n_cracks = n_cracks + 1;
+        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
+    end
+end
 
-%% 7. Report & plot
-fprintf('Stagger angle : %.2f deg\n', stagger_angle);
-fprintf('Camber angle  : %.2f deg\n', camber_angle);
+fprintf('  Cracks detected: %d segments\n', n_cracks);
 
-figure; hold on; axis equal; grid on;
-plot(xy(:,1), xy(:,2), 'k.-');
-camber_xy = LE + u_grid * u_hat + v_camber * v_hat;
-plot(camber_xy(:,1), camber_xy(:,2), 'r-', 'LineWidth', 2);
-plot([LE(1) TE(1)], [LE(2) TE(2)], 'b--', 'LineWidth', 1.5);
-plot(LE(1), LE(2), 'go', 'MarkerSize', 8, 'MarkerFaceColor', 'g');
-plot(TE(1), TE(2), 'rs', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
-legend('Profile','Camber line','Chord','LE','TE');
-xlabel('x'); ylabel('y');
-title(sprintf('Camber: %.2f deg  |  Stagger: %.2f deg', camber_angle, stagger_angle));
+% Dilate by 1 px for visibility
+crack_vis = imdilate(crack_skeleton, strel('disk', 1));
+
+% --- 4f. Diagnostic figure: top-hat residual (helps tune the threshold) ---
+figure('Name', 'Top-hat residual (crack signal)', 'NumberTitle', 'off');
+tiledlayout(1, 2, 'TileSpacing', 'compact');
+
+nexttile;
+imshow(tophat_inv, []);
+title('Top-hat residual — bright = potential crack', 'FontWeight', 'normal');
+colorbar;
+
+nexttile;
+imshow(img, []);
+hold on;
+[cr, cc_] = find(crack_vis);
+if ~isempty(cr)
+    scatter(cc_, cr, 2, 'r', 'filled');
+end
+boundary = bwperim(coating_mask);
+[br, bc]  = find(boundary);
+scatter(bc, br, 1, 'c', 'filled');
+hold off;
+title('Detected cracks (red) on SEM', 'FontWeight', 'normal');
+legend({'Cracks', 'Coating boundary'}, 'TextColor', 'w', 'Color', 'k', ...
+    'Location', 'northeastoutside');
+
+% Lengths and orientations for section 6 export (these replace the variables
+% used in Figure 3 and the CSV export further down the original script)
+if n_cracks > 0
+    crack_props_keep = props_crack(keep);
+    lengths_nm   = [crack_props_keep.MajorAxisLength] * cfg.nm_per_pixel;
+    orientations = [crack_props_keep.Orientation];
+else
+    lengths_nm   = [];
+    orientations = [];
 end
