@@ -1,151 +1,16 @@
-%% SECTION 4 REPLACEMENT — Crack detection (orientation-aware, gradient-robust)
-%
-% Replace the entire "4. Crack detection" block in sem_coating_analysis.m
-% with this code.  Everything above and below (sections 1-3 and 5-6) stays
-% the same.
-%
-% Key changes vs the original:
-%   - White top-hat transform removes the slow grey-level gradient across the
-%     coating before thresholding, so the midplane transition no longer appears
-%     as a dark band.
-%   - Global Otsu threshold on the residual (not adaptive), which is more
-%     robust when the gradient has been removed.
-%   - Orientation filter keeps only skeleton segments whose major axis is
-%     within cfg.crack_angle_tol degrees of the expected crack direction.
-%
-% -------------------------------------------------------------------------
-%  ADDITIONAL PARAMETERS — add these to your cfg block at the top of the script
-% -------------------------------------------------------------------------
-%
-%   cfg.tophat_radius       = 20;    % disk radius for background estimation (px)
-%                                    % should be >> crack width, << coating thickness
-%   cfg.crack_thresh_factor = 1.5;   % multiply Otsu threshold by this to be stricter
-%                                    % raise toward 2.5 to reject faint features
-%   cfg.crack_angle_tol     = 30;    % ± degrees from perpendicular-to-coating
-%                                    % e.g. coating runs left-right → cracks are ~90°
-%                                    %      set crack_expected_angle = 90
-%   cfg.crack_expected_angle = 90;   % expected crack orientation in degrees
-%                                    % 90° = vertical cracks in a horizontal coating
-%                                    % 0°  = horizontal cracks in a vertical coating
-%   cfg.crack_min_length    = 20;    % (already in original cfg, keep it)
-%   cfg.crack_eccentricity  = 0.80;  % (already in original cfg, keep it)
-%
-% -------------------------------------------------------------------------
+# IronPython, SpaceClaim API
+curve = selection.Items[0]  # the curve you've selected
+n_samples = 200             # increase if the curve has sharp local features
+points = []
 
-fprintf('Detecting cracks (gradient-corrected) ...\n');
+# Most curve objects expose a parametric range and an Evaluate(param) method
+start, end = curve.Shape.Bounds  # or however your curve's parametric domain is exposed
+for i in range(n_samples):
+    t = start + (end - start) * i / (n_samples - 1)
+    eval_result = curve.Shape.Evaluate(t)
+    pt = eval_result.Point
+    points.append((pt.X, pt.Y, pt.Z))
 
-% --- 4a. Isolate the coating strip and fill NaNs for morphology ---
-% Replace pixels outside the coating with the local coating mean so that
-% morphological operations don't create artefacts at the mask boundary.
-coating_mean = mean(img(coating_mask));
-img_filled   = img;
-img_filled(~coating_mask) = coating_mean;
-
-% --- 4b. White top-hat: remove slow background gradient ---
-% imtophat = img - morphological opening(img)
-% The opening uses a disk larger than crack width but smaller than the
-% gradient wavelength.  This leaves only sharp, locally-dark features.
-se_tophat    = strel('disk', cfg.tophat_radius);
-background   = imopen(img_filled, se_tophat);
-tophat_img   = img_filled - background;   % dark cracks → local minima → small values
-
-% Invert so cracks are BRIGHT in the residual (easier to threshold)
-tophat_inv   = max(tophat_img(:)) - tophat_img;
-
-% Zero out anything outside the coating mask
-tophat_inv(~coating_mask) = 0;
-
-% --- 4c. Global Otsu threshold on residual (inside coating only) ---
-pixels_in_coating = tophat_inv(coating_mask);
-otsu_level = graythresh(pixels_in_coating);           % Otsu on 1-D vector
-crack_thresh = otsu_level * cfg.crack_thresh_factor;  % stricter than bare Otsu
-crack_thresh = min(crack_thresh, 0.95 * max(pixels_in_coating)); % safety cap
-
-crack_mask_raw = (tophat_inv > crack_thresh) & coating_mask;
-
-% Small noise removal
-crack_mask_raw = bwareaopen(crack_mask_raw, 5);
-
-% --- 4d. Skeletonise ---
-if exist('bwskel', 'file')          % R2019a+
-    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
-else
-    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
-    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
-end
-
-% --- 4e. Label segments and filter by shape AND orientation ---
-CC_crack   = bwconncomp(skeleton);
-props_crack = regionprops(CC_crack, img, ...
-    'Area', 'Eccentricity', 'Orientation', 'MajorAxisLength', 'BoundingBox');
-
-keep = false(CC_crack.NumObjects, 1);
-
-for k = 1:CC_crack.NumObjects
-    % Shape filter: must be elongated
-    if props_crack(k).Eccentricity < cfg.crack_eccentricity
-        continue
-    end
-    % Length filter
-    if props_crack(k).Area < cfg.crack_min_length
-        continue
-    end
-    % Orientation filter
-    % regionprops Orientation is in [-90, 90] degrees (angle of major axis)
-    % Normalise the difference to [-90, 90]
-    ang_diff = abs(props_crack(k).Orientation - cfg.crack_expected_angle);
-    ang_diff = min(ang_diff, 180 - ang_diff);   % handle 0°/180° wrap
-    if ang_diff <= cfg.crack_angle_tol
-        keep(k) = true;
-    end
-end
-
-% Rebuild filtered crack skeleton image
-crack_skeleton = false(nrows, ncols);
-n_cracks = 0;
-for k = 1:CC_crack.NumObjects
-    if keep(k)
-        n_cracks = n_cracks + 1;
-        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
-    end
-end
-
-fprintf('  Cracks detected: %d segments\n', n_cracks);
-
-% Dilate by 1 px for visibility
-crack_vis = imdilate(crack_skeleton, strel('disk', 1));
-
-% --- 4f. Diagnostic figure: top-hat residual (helps tune the threshold) ---
-figure('Name', 'Top-hat residual (crack signal)', 'NumberTitle', 'off');
-tiledlayout(1, 2, 'TileSpacing', 'compact');
-
-nexttile;
-imshow(tophat_inv, []);
-title('Top-hat residual — bright = potential crack', 'FontWeight', 'normal');
-colorbar;
-
-nexttile;
-imshow(img, []);
-hold on;
-[cr, cc_] = find(crack_vis);
-if ~isempty(cr)
-    scatter(cc_, cr, 2, 'r', 'filled');
-end
-boundary = bwperim(coating_mask);
-[br, bc]  = find(boundary);
-scatter(bc, br, 1, 'c', 'filled');
-hold off;
-title('Detected cracks (red) on SEM', 'FontWeight', 'normal');
-legend({'Cracks', 'Coating boundary'}, 'TextColor', 'w', 'Color', 'k', ...
-    'Location', 'northeastoutside');
-
-% Lengths and orientations for section 6 export (these replace the variables
-% used in Figure 3 and the CSV export further down the original script)
-if n_cracks > 0
-    crack_props_keep = props_crack(keep);
-    lengths_nm   = [crack_props_keep.MajorAxisLength] * cfg.nm_per_pixel;
-    orientations = [crack_props_keep.Orientation];
-else
-    lengths_nm   = [];
-    orientations = [];
-end
+with open(r'C:\path\to\curve_points.csv', 'w') as f:
+    for p in points:
+        f.write('%.8f, %.8f, %.8f\n' % p)
