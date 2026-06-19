@@ -1,22 +1,25 @@
 %% filter_tet_elements.m
-% Reads an Abaqus .inp deck, extracts *NODE and *ELEMENT (C3D10M) blocks,
-% computes each element's centroid radius in the YZ plane (r = sqrt(y^2+z^2)),
-% and removes elements whose centroid radius < r0 AND centroid x is within [x1, x2].
+% Reads an Abaqus .inp deck with exactly ONE *Node block and ONE *Element
+% block. Computes each element's centroid radius in the YZ plane
+% (r = sqrt(y^2+z^2)) using its 4 corner nodes, and removes elements whose
+% centroid radius < r0 AND centroid x is within [x1, x2].
 %
-% Nodes are left untouched (all kept). Remaining elements keep their
-% original element IDs (only matching rows are deleted from the deck).
+% Nodes are left untouched (all kept). Surviving elements keep their
+% original IDs. An *ELSET named ABRBOT is appended, listing the element
+% IDs in the range [elsetLo, elsetHi] that survived the filtering.
 
 clear; clc;
 
 %% ---- USER INPUTS ----
-inputFile  = 'model.inp';      % path to source Abaqus input deck
+inputFile  = 'model.inp';
 outputFile = 'model_filtered.inp';
 
 r0 = 5.0;     % radius threshold
 x1 = 0.0;     % lower x bound
 x2 = 10.0;    % upper x bound
 
-elemTypeTag = 'C3D10M';  % element type to filter (case-insensitive match in *ELEMENT line)
+elsetLo = 661506;   % lower bound of element ID range for ABRBOT elset
+elsetHi = 886647;   % upper bound of element ID range for ABRBOT elset
 
 %% ---- READ FILE ----
 fid = fopen(inputFile, 'r');
@@ -32,106 +35,91 @@ end
 fclose(fid);
 nLines = numel(rawLines);
 
-%% ---- LOCATE *NODE BLOCK(S) ----
-nodeIDs    = [];
-nodeCoords = [];   % [x y z]
-
 isKeyword = @(s) ~isempty(s) && s(1) == '*';
 
-i = 1;
-while i <= nLines
-    line = strtrim(rawLines{i});
-    if ~isempty(line) && line(1) == '*' && ~isempty(regexpi(line, '^\*NODE\b', 'once'))
-        % consume following data lines until next keyword line
-        j = i + 1;
-        while j <= nLines
-            dl = strtrim(rawLines{j});
-            if isempty(dl)
-                j = j + 1;
-                continue;
-            end
-            if isKeyword(dl)
-                break;
-            end
-            parts = strsplit(dl, ',');
-            parts = strtrim(parts);
-            id = str2double(parts{1});
-            x  = str2double(parts{2});
-            y  = str2double(parts{3});
-            z  = str2double(parts{4});
-            nodeIDs(end+1,1)      = id; %#ok<AGROW>
-            nodeCoords(end+1,:)   = [x y z]; %#ok<AGROW>
-            j = j + 1;
-        end
-        i = j;
-    else
-        i = i + 1;
-    end
+%% ---- FIND *Node BLOCK (case-insensitive, single block) ----
+nodeStart = find(~cellfun(@isempty, regexpi(rawLines, '^\*Node\b', 'once')), 1);
+if isempty(nodeStart)
+    error('Could not find a *Node keyword line.');
 end
 
-% Map node ID -> row index for fast lookup
+j = nodeStart + 1;
+nodeIDs    = [];
+nodeCoords = [];
+while j <= nLines
+    dl = strtrim(rawLines{j});
+    if isempty(dl)
+        j = j + 1;
+        continue;
+    end
+    if isKeyword(dl)
+        break;
+    end
+    parts = strsplit(dl, ',');
+    parts = strtrim(parts);
+    id = str2double(parts{1});
+    x  = str2double(parts{2});
+    y  = str2double(parts{3});
+    z  = str2double(parts{4});
+    nodeIDs(end+1,1)    = id; %#ok<AGROW>
+    nodeCoords(end+1,:) = [x y z]; %#ok<AGROW>
+    j = j + 1;
+end
+nodeBlockEnd = j - 1;
+
 maxNodeID = max(nodeIDs);
 nodeMap = zeros(maxNodeID, 1);
 nodeMap(nodeIDs) = 1:numel(nodeIDs);
 
-%% ---- LOCATE *ELEMENT BLOCK(S) MATCHING elemTypeTag ----
-% Store: element ID, connectivity (variable length, but C3D10M = 10 nodes),
-% and the line range [startLine endLine] in rawLines so we can delete later.
+fprintf('Parsed %d nodes (lines %d-%d).\n', numel(nodeIDs), nodeStart, nodeBlockEnd);
 
-elemIDs   = [];
-elemConn  = {};   % cell array of node-id vectors
-elemLineRange = []; % [startLine endLine] per element (continuation lines included)
-
-i = 1;
-while i <= nLines
-    line = strtrim(rawLines{i});
-    if ~isempty(line) && line(1) == '*' && ~isempty(regexpi(line, '^\*ELEMENT\b', 'once'))
-        isTarget = ~isempty(regexpi(line, elemTypeTag, 'once'));
-        j = i + 1;
-        while j <= nLines
-            dl = strtrim(rawLines{j});
-            if isempty(dl)
-                j = j + 1;
-                continue;
-            end
-            if isKeyword(dl)
-                break;
-            end
-            % Abaqus allows continuation lines ending with a comma.
-            startLn = j;
-            fullStr = dl;
-            while ~isempty(fullStr) && fullStr(end) == ',' && (j+1) <= nLines
-                j = j + 1;
-                fullStr = [fullStr, strtrim(rawLines{j})]; %#ok<AGROW>
-            end
-            endLn = j;
-
-            parts = strsplit(fullStr, ',');
-            parts = strtrim(parts);
-            parts = parts(~cellfun(@isempty, parts));
-            vals  = str2double(parts);
-
-            if isTarget
-                elemIDs(end+1,1)        = vals(1); %#ok<AGROW>
-                elemConn{end+1,1}       = vals(2:end); %#ok<AGROW>
-                elemLineRange(end+1,:)  = [startLn endLn]; %#ok<AGROW>
-            end
-            j = j + 1;
-        end
-        i = j;
-    else
-        i = i + 1;
-    end
+%% ---- FIND *Element BLOCK (case-insensitive, single block) ----
+elemStart = find(~cellfun(@isempty, regexpi(rawLines, '^\*Element\b', 'once')), 1);
+if isempty(elemStart)
+    error('Could not find an *Element keyword line.');
 end
 
-fprintf('Parsed %d nodes and %d %s elements.\n', numel(nodeIDs), numel(elemIDs), elemTypeTag);
+j = elemStart + 1;
+elemIDs       = [];
+elemConn      = {};
+elemLineRange = [];   % [startLine endLine] per element, for deletion
+while j <= nLines
+    dl = strtrim(rawLines{j});
+    if isempty(dl)
+        j = j + 1;
+        continue;
+    end
+    if isKeyword(dl)
+        break;
+    end
+    startLn = j;
+    fullStr = dl;
+    while ~isempty(fullStr) && fullStr(end) == ',' && (j+1) <= nLines
+        j = j + 1;
+        fullStr = [fullStr, strtrim(rawLines{j})]; %#ok<AGROW>
+    end
+    endLn = j;
 
-%% ---- COMPUTE CENTROID & RADIUS (using corner nodes 1-4 of C3D10M) ----
+    parts = strsplit(fullStr, ',');
+    parts = strtrim(parts);
+    parts = parts(~cellfun(@isempty, parts));
+    vals  = str2double(parts);
+
+    elemIDs(end+1,1)       = vals(1); %#ok<AGROW>
+    elemConn{end+1,1}      = vals(2:end); %#ok<AGROW>
+    elemLineRange(end+1,:) = [startLn endLn]; %#ok<AGROW>
+
+    j = j + 1;
+end
+
+fprintf('Parsed %d elements (lines %d-%d).\n', numel(elemIDs), elemStart, j-1);
+
+%% ---- COMPUTE CENTROID & RADIUS (corner nodes 1-4 of 10-node tet) ----
 nElem = numel(elemIDs);
 centroid = zeros(nElem, 3);
 for k = 1:nElem
     conn = elemConn{k};
-    cornerNodes = conn(1:4);          % corner nodes of the 10-node tet
+    cornerNodes = conn(1:4);
     rows = nodeMap(cornerNodes);
     centroid(k,:) = mean(nodeCoords(rows, :), 1);
 end
@@ -151,7 +139,16 @@ for k = 1:size(removedRanges,1)
     linesToDelete(removedRanges(k,1):removedRanges(k,2)) = true;
 end
 
-%% ---- WRITE OUTPUT FILE (nodes untouched, flagged element lines removed) ----
+%% ---- BUILD ABRBOT ELSET (surviving elements within [elsetLo, elsetHi]) ----
+keptMask    = ~removeMask;
+inRangeMask = (elemIDs >= elsetLo) & (elemIDs <= elsetHi);
+abrbotIDs   = elemIDs(keptMask & inRangeMask);
+abrbotIDs   = sort(abrbotIDs);
+
+fprintf('ABRBOT elset: %d elements remain in range [%d, %d].\n', ...
+    numel(abrbotIDs), elsetLo, elsetHi);
+
+%% ---- WRITE OUTPUT FILE ----
 keepLines = rawLines(~linesToDelete);
 
 fidOut = fopen(outputFile, 'w');
@@ -161,6 +158,15 @@ end
 for k = 1:numel(keepLines)
     fprintf(fidOut, '%s\n', keepLines{k});
 end
+
+% Append the ABRBOT elset definition, 8 IDs per line
+fprintf(fidOut, '*ELSET, ELSET=ABRBOT\n');
+nPerLine = 8;
+for k = 1:nPerLine:numel(abrbotIDs)
+    lineIDs = abrbotIDs(k:min(k+nPerLine-1, numel(abrbotIDs)));
+    fprintf(fidOut, '%s\n', strjoin(cellstr(num2str(lineIDs(:), '%d')), ', '));
+end
+
 fclose(fidOut);
 
-fprintf('Wrote filtered deck to: %s\n', outputFile);
+fprintf('Wrote filtered deck with ABRBOT elset to: %s\n', outputFile);
