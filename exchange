@@ -1,280 +1,166 @@
-%% SEM Coating Thickness & Crack Analysis
-% Inputs : a grayscale .tif SEM image where
-%          - the coating layer has an intermediate grey level
-%          - one side (substrate) is darker, the other (epoxy/air) is brighter
-% Outputs: thickness profile, mean/std, crack skeleton overlay, CSV report
+%% filter_tet_elements.m
+% Reads an Abaqus .inp deck, extracts *NODE and *ELEMENT (C3D10M) blocks,
+% computes each element's centroid radius in the YZ plane (r = sqrt(y^2+z^2)),
+% and removes elements whose centroid radius < r0 AND centroid x is within [x1, x2].
 %
-% Requirements: Image Processing Toolbox
-% Optional    : Statistics and Machine Learning Toolbox (for robust stats)
-%
-% -------------------------------------------------------------------------
-%  ADJUST THESE PARAMETERS before running
-% -------------------------------------------------------------------------
+% Nodes are left untouched (all kept). Remaining elements keep their
+% original element IDs (only matching rows are deleted from the deck).
 
-cfg.image_file   = 'your_sem_image.tif'; % path to your TIFF
-cfg.nm_per_pixel = 10;                   % <--- set from your SEM scale bar
-cfg.scan_dir     = 'vertical';           % 'vertical'   : coating runs left-right
-                                         % 'horizontal' : coating runs top-bottom
-cfg.n_classes    = 3;                    % Otsu classes: substrate | coating | bright
-                                         %   use 2 if one boundary is very clean
-cfg.coating_class = 2;                   % which Otsu class is the coating (1=darkest)
-cfg.morph_radius  = 5;                   % morphological disk radius (px)
-cfg.min_blob_area = 500;                 % ignore coating blobs smaller than this (px^2)
-cfg.crack_sensitivity = 0.85;            % adaptive threshold sensitivity [0..1]
-                                         %   lower = more aggressive crack detection
-cfg.crack_min_length = 20;              % min skeleton length to call something a crack (px)
-cfg.crack_eccentricity = 0.75;          % regionprops eccentricity cutoff (0=circle, 1=line)
-cfg.smooth_kernel = 3;                  % Gaussian sigma for pre-smoothing (0 = off)
+clear; clc;
 
-% -------------------------------------------------------------------------
-%% 1.  Load image
-% -------------------------------------------------------------------------
-fprintf('Loading %s ...\n', cfg.image_file);
-raw = imread(cfg.image_file);
+%% ---- USER INPUTS ----
+inputFile  = 'model.inp';      % path to source Abaqus input deck
+outputFile = 'model_filtered.inp';
 
-% Handle RGB tifs (take luminance channel)
-if ndims(raw) == 3
-    raw = rgb2gray(raw);
+r0 = 5.0;     % radius threshold
+x1 = 0.0;     % lower x bound
+x2 = 10.0;    % upper x bound
+
+elemTypeTag = 'C3D10M';  % element type to filter (case-insensitive match in *ELEMENT line)
+
+%% ---- READ FILE ----
+fid = fopen(inputFile, 'r');
+if fid == -1
+    error('Could not open file: %s', inputFile);
 end
-
-img = im2double(raw);   % [0, 1] double
-
-if cfg.smooth_kernel > 0
-    img_smooth = imgaussfilt(img, cfg.smooth_kernel);
-else
-    img_smooth = img;
+rawLines = {};
+tline = fgetl(fid);
+while ischar(tline)
+    rawLines{end+1,1} = tline; %#ok<AGROW>
+    tline = fgetl(fid);
 end
+fclose(fid);
+nLines = numel(rawLines);
 
-[nrows, ncols] = size(img);
-fprintf('  Image size: %d x %d px  (%.1f x %.1f µm)\n', ...
-    ncols, nrows, ncols*cfg.nm_per_pixel/1000, nrows*cfg.nm_per_pixel/1000);
+%% ---- LOCATE *NODE BLOCK(S) ----
+nodeIDs    = [];
+nodeCoords = [];   % [x y z]
 
-% -------------------------------------------------------------------------
-%% 2.  Segment the coating layer
-% -------------------------------------------------------------------------
-fprintf('Segmenting coating ...\n');
+isKeyword = @(s) ~isempty(s) && s(1) == '*';
 
-% Otsu multi-class thresholding
-thresholds = multithresh(img_smooth, cfg.n_classes - 1);
-
-% Build a label image  (1 = darkest, n_classes = brightest)
-label_img = imquantize(img_smooth, thresholds);   % values 1..n_classes
-
-% Extract the coating class mask
-coating_mask_raw = (label_img == cfg.coating_class);
-
-% Morphological cleanup
-se = strel('disk', cfg.morph_radius);
-mask = imclose(coating_mask_raw, se);   % close small gaps
-mask = imfill(mask, 'holes');           % fill internal holes
-mask = imopen(mask, se);               % remove speckle
-mask = bwareaopen(mask, cfg.min_blob_area); % drop tiny blobs
-
-% Keep only the LARGEST connected component
-CC  = bwconncomp(mask);
-if CC.NumObjects == 0
-    error('No coating region found. Try adjusting cfg.coating_class or cfg.n_classes.');
-end
-stats_cc = regionprops(CC, 'Area');
-[~, idx] = max([stats_cc.Area]);
-coating_mask = false(nrows, ncols);
-coating_mask(CC.PixelIdxList{idx}) = true;
-
-fprintf('  Coating area: %.1f µm²\n', ...
-    sum(coating_mask(:)) * (cfg.nm_per_pixel/1000)^2);
-
-% -------------------------------------------------------------------------
-%% 3.  Thickness measurement (spanwise profile)
-% -------------------------------------------------------------------------
-fprintf('Measuring thickness ...\n');
-
-% Rotate so that thickness is always measured column-by-column
-if strcmp(cfg.scan_dir, 'horizontal')
-    work_mask = coating_mask';
-else
-    work_mask = coating_mask;
-end
-
-[wr, wc] = size(work_mask);
-top_px    = NaN(1, wc);
-bot_px    = NaN(1, wc);
-thickness_px = NaN(1, wc);
-
-for c = 1:wc
-    col = work_mask(:, c);
-    rows_on = find(col);
-    if ~isempty(rows_on)
-        top_px(c) = rows_on(1);
-        bot_px(c) = rows_on(end);
-        thickness_px(c) = bot_px(c) - top_px(c) + 1;
+i = 1;
+while i <= nLines
+    line = strtrim(rawLines{i});
+    if ~isempty(line) && line(1) == '*' && ~isempty(regexpi(line, '^\*NODE\b', 'once'))
+        % consume following data lines until next keyword line
+        j = i + 1;
+        while j <= nLines
+            dl = strtrim(rawLines{j});
+            if isempty(dl)
+                j = j + 1;
+                continue;
+            end
+            if isKeyword(dl)
+                break;
+            end
+            parts = strsplit(dl, ',');
+            parts = strtrim(parts);
+            id = str2double(parts{1});
+            x  = str2double(parts{2});
+            y  = str2double(parts{3});
+            z  = str2double(parts{4});
+            nodeIDs(end+1,1)      = id; %#ok<AGROW>
+            nodeCoords(end+1,:)   = [x y z]; %#ok<AGROW>
+            j = j + 1;
+        end
+        i = j;
+    else
+        i = i + 1;
     end
 end
 
-% Convert to physical units
-thickness_nm = thickness_px * cfg.nm_per_pixel;
+% Map node ID -> row index for fast lookup
+maxNodeID = max(nodeIDs);
+nodeMap = zeros(maxNodeID, 1);
+nodeMap(nodeIDs) = 1:numel(nodeIDs);
 
-% Robust filtering: remove columns where thickness deviates by > 3 MAD
-t_med = median(thickness_nm, 'omitnan');
-t_mad = mad(thickness_nm, 1);
-valid  = abs(thickness_nm - t_med) < 3 * t_mad;
+%% ---- LOCATE *ELEMENT BLOCK(S) MATCHING elemTypeTag ----
+% Store: element ID, connectivity (variable length, but C3D10M = 10 nodes),
+% and the line range [startLine endLine] in rawLines so we can delete later.
 
-thickness_filtered = thickness_nm;
-thickness_filtered(~valid) = NaN;
+elemIDs   = [];
+elemConn  = {};   % cell array of node-id vectors
+elemLineRange = []; % [startLine endLine] per element (continuation lines included)
 
-mean_thickness = mean(thickness_filtered, 'omitnan');
-std_thickness  = std(thickness_filtered,  'omitnan');
-min_thickness  = min(thickness_filtered,  [], 'omitnan');
-max_thickness  = max(thickness_filtered,  [], 'omitnan');
+i = 1;
+while i <= nLines
+    line = strtrim(rawLines{i});
+    if ~isempty(line) && line(1) == '*' && ~isempty(regexpi(line, '^\*ELEMENT\b', 'once'))
+        isTarget = ~isempty(regexpi(line, elemTypeTag, 'once'));
+        j = i + 1;
+        while j <= nLines
+            dl = strtrim(rawLines{j});
+            if isempty(dl)
+                j = j + 1;
+                continue;
+            end
+            if isKeyword(dl)
+                break;
+            end
+            % Abaqus allows continuation lines ending with a comma.
+            startLn = j;
+            fullStr = dl;
+            while ~isempty(fullStr) && fullStr(end) == ',' && (j+1) <= nLines
+                j = j + 1;
+                fullStr = [fullStr, strtrim(rawLines{j})]; %#ok<AGROW>
+            end
+            endLn = j;
 
-fprintf('  Mean thickness : %.1f nm\n', mean_thickness);
-fprintf('  Std  thickness : %.1f nm\n', std_thickness);
-fprintf('  Min / Max      : %.1f / %.1f nm\n', min_thickness, max_thickness);
+            parts = strsplit(fullStr, ',');
+            parts = strtrim(parts);
+            parts = parts(~cellfun(@isempty, parts));
+            vals  = str2double(parts);
 
-% -------------------------------------------------------------------------
-%% 4.  Crack detection
-% -------------------------------------------------------------------------
-fprintf('Detecting cracks ...\n');
-
-% Work only inside the coating mask
-img_in_coating = img;
-img_in_coating(~coating_mask) = NaN;
-
-% Adaptive thresholding: cracks are locally dark within the coating
-%   'ForegroundPolarity','dark' finds dark objects on a brighter background
-crack_mask_raw = ~imbinarize(img_in_coating, 'adaptive', ...
-    'Sensitivity', cfg.crack_sensitivity, ...
-    'ForegroundPolarity', 'dark');
-
-% Restrict to coating mask and remove thin speckle
-crack_mask_raw = crack_mask_raw & coating_mask;
-crack_mask_raw = bwareaopen(crack_mask_raw, 5);
-
-% Skeletonize to get 1-pixel-wide crack centrelines
-if exist('bwskel', 'file')          % R2019a+
-    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
-else
-    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
-    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
-end
-
-% Label individual crack segments and filter by shape
-CC_crack = bwconncomp(skeleton);
-props_crack = regionprops(CC_crack, img, ...
-    'Area', 'Eccentricity', 'Orientation', 'BoundingBox', 'MajorAxisLength');
-
-keep = false(CC_crack.NumObjects, 1);
-for k = 1:CC_crack.NumObjects
-    if props_crack(k).Eccentricity > cfg.crack_eccentricity && ...
-       props_crack(k).Area >= cfg.crack_min_length
-        keep(k) = true;
+            if isTarget
+                elemIDs(end+1,1)        = vals(1); %#ok<AGROW>
+                elemConn{end+1,1}       = vals(2:end); %#ok<AGROW>
+                elemLineRange(end+1,:)  = [startLn endLn]; %#ok<AGROW>
+            end
+            j = j + 1;
+        end
+        i = j;
+    else
+        i = i + 1;
     end
 end
 
-% Rebuild filtered crack skeleton
-crack_skeleton = false(nrows, ncols);
-n_cracks = 0;
-for k = 1:CC_crack.NumObjects
-    if keep(k)
-        n_cracks = n_cracks + 1;
-        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
-    end
+fprintf('Parsed %d nodes and %d %s elements.\n', numel(nodeIDs), numel(elemIDs), elemTypeTag);
+
+%% ---- COMPUTE CENTROID & RADIUS (using corner nodes 1-4 of C3D10M) ----
+nElem = numel(elemIDs);
+centroid = zeros(nElem, 3);
+for k = 1:nElem
+    conn = elemConn{k};
+    cornerNodes = conn(1:4);          % corner nodes of the 10-node tet
+    rows = nodeMap(cornerNodes);
+    centroid(k,:) = mean(nodeCoords(rows, :), 1);
 end
 
-fprintf('  Cracks detected: %d segments\n', n_cracks);
+x_c = centroid(:,1);
+r_c = sqrt(centroid(:,2).^2 + centroid(:,3).^2);
 
-% Dilate for visualisation (3-px wide lines)
-crack_vis = imdilate(crack_skeleton, strel('disk', 1));
+%% ---- APPLY REMOVAL CRITERION ----
+removeMask = (r_c < r0) & (x_c >= x1) & (x_c <= x2);
 
-% -------------------------------------------------------------------------
-%% 5.  Visualisation
-% -------------------------------------------------------------------------
-fprintf('Plotting ...\n');
+fprintf('Removing %d of %d elements (r < %.4g and x in [%.4g, %.4g]).\n', ...
+    sum(removeMask), nElem, r0, x1, x2);
 
-% --- Figure 1: segmentation overlay ---
-figure('Name', 'Coating Segmentation', 'NumberTitle', 'off');
-imshow(img, []);
-hold on;
-
-% Coating boundary in cyan
-boundary = bwperim(coating_mask);
-[br, bc] = find(boundary);
-scatter(bc, br, 1, 'c', 'filled');
-
-% Crack skeleton in red
-[cr, cc_] = find(crack_vis);
-if ~isempty(cr)
-    scatter(cc_, cr, 2, 'r', 'filled');
-end
-hold off;
-legend({'Coating boundary', 'Cracks'}, 'TextColor', 'w', ...
-    'Color', 'k', 'Location', 'northeastoutside');
-title('Coating segmentation & cracks', 'FontWeight', 'normal');
-
-% --- Figure 2: thickness profile ---
-figure('Name', 'Thickness Profile', 'NumberTitle', 'off');
-x_axis = (1:wc) * cfg.nm_per_pixel;   % position in nm
-plot(x_axis/1000, thickness_filtered, 'b-', 'LineWidth', 0.8);
-hold on;
-yline(mean_thickness, 'r--', sprintf('Mean = %.0f nm', mean_thickness), ...
-    'LineWidth', 1.2, 'LabelHorizontalAlignment', 'left');
-yline(mean_thickness + std_thickness, 'k:', 'LineWidth', 0.8);
-yline(mean_thickness - std_thickness, 'k:', sprintf('±1σ = %.0f nm', std_thickness), ...
-    'LineWidth', 0.8, 'LabelHorizontalAlignment', 'left');
-hold off;
-xlabel('Position (µm)');
-ylabel('Thickness (nm)');
-title('Spanwise coating thickness', 'FontWeight', 'normal');
-grid on; box off;
-
-% --- Figure 3: crack property scatter ---
-if n_cracks > 0
-    lengths_nm = [props_crack(keep).MajorAxisLength] * cfg.nm_per_pixel;
-    orientations = [props_crack(keep).Orientation];
-
-    figure('Name', 'Crack Properties', 'NumberTitle', 'off');
-    tiledlayout(1, 2);
-    nexttile;
-    histogram(lengths_nm, 15, 'FaceColor', [0.8 0.2 0.2]);
-    xlabel('Crack length (nm)'); ylabel('Count');
-    title('Crack length distribution', 'FontWeight', 'normal');
-
-    nexttile;
-    polarhistogram(deg2rad(orientations), 18, 'FaceColor', [0.8 0.2 0.2]);
-    title('Crack orientation (°)', 'FontWeight', 'normal');
+linesToDelete = false(nLines, 1);
+removedRanges = elemLineRange(removeMask, :);
+for k = 1:size(removedRanges,1)
+    linesToDelete(removedRanges(k,1):removedRanges(k,2)) = true;
 end
 
-% -------------------------------------------------------------------------
-%% 6.  Export results to CSV
-% -------------------------------------------------------------------------
-fprintf('Exporting results ...\n');
+%% ---- WRITE OUTPUT FILE (nodes untouched, flagged element lines removed) ----
+keepLines = rawLines(~linesToDelete);
 
-% Thickness profile table
-col_positions = ((1:wc) * cfg.nm_per_pixel / 1000)';  % µm
-T_thick = table(col_positions, thickness_filtered', ...
-    'VariableNames', {'Position_um', 'Thickness_nm'});
-writetable(T_thick, 'coating_thickness_profile.csv');
-
-% Crack properties table
-if n_cracks > 0
-    crack_ids  = (1:n_cracks)';
-    crack_len  = lengths_nm';
-    crack_ori  = orientations';
-    T_crack = table(crack_ids, crack_len, crack_ori, ...
-        'VariableNames', {'CrackID', 'Length_nm', 'Orientation_deg'});
-    writetable(T_crack, 'crack_properties.csv');
+fidOut = fopen(outputFile, 'w');
+if fidOut == -1
+    error('Could not open output file: %s', outputFile);
 end
-
-% Summary
-fprintf('\n========== SUMMARY ==========\n');
-fprintf('  Mean coating thickness : %8.1f nm\n', mean_thickness);
-fprintf('  Std  coating thickness : %8.1f nm\n', std_thickness);
-fprintf('  Min  coating thickness : %8.1f nm\n', min_thickness);
-fprintf('  Max  coating thickness : %8.1f nm\n', max_thickness);
-fprintf('  Number of cracks       : %8d\n',   n_cracks);
-if n_cracks > 0
-    fprintf('  Mean crack length      : %8.1f nm\n', mean(lengths_nm));
+for k = 1:numel(keepLines)
+    fprintf(fidOut, '%s\n', keepLines{k});
 end
-fprintf('==============================\n');
-fprintf('Files written: coating_thickness_profile.csv');
-if n_cracks > 0, fprintf(', crack_properties.csv'); end
-fprintf('\n');
+fclose(fidOut);
+
+fprintf('Wrote filtered deck to: %s\n', outputFile);
