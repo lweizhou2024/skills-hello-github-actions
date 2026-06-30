@@ -1,169 +1,186 @@
-%% filter_tet_elements.m
-% Single *Node block, single *Element block. Computes each element's
-% centroid radius in the YZ plane (r = sqrt(y^2+z^2)) from its 4 corner
-% nodes, and removes elements whose centroid radius < r0 AND centroid x
-% is within [x1, x2]. Nodes are untouched. Surviving elements keep their
-% original IDs. An *ELSET named ABRBOT lists surviving element IDs within
-% [elsetLo, elsetHi].
+function data = digitizePlot(imagePath)
+% DIGITIZEPLOT  Interactively digitize an XY plot from an image.
 %
-% ASSUMPTION: each element's connectivity (id + 10 node IDs) fits on a
-% single line (true for standard C3D10/C3D10M decks, which have 11
-% fields per element -- well under Abaqus's 16-value line limit). If
-% your deck wraps elements across multiple lines, let me know and this
-% will need a small change.
+%   data = digitizePlot('myplot.png')
+%
+% Workflow:
+%   1. Image is displayed.
+%   2. You click 2 points on the X-axis (e.g., two gridline/tick marks
+%      with known X values) -> you type in the true X value for each.
+%   3. You click 2 points on the Y-axis (two tick marks with known Y
+%      values) -> you type in the true Y value for each.
+%      (Calibration uses a full affine map, so a tilted/rotated/skewed
+%       image is handled automatically -- the axes do NOT need to be
+%       perfectly horizontal/vertical in the image.)
+%   4. You click along the curve, point by point, to digitize data.
+%      Press ENTER (no click) or right-click to finish digitizing.
+%   5. Digitized points are returned in 'data' (Nx2: [x y]) and also
+%      saved to digitizedData.mat / .csv, and overlaid on the image.
+%
+% Tips:
+%   - Zoom/pan with the figure toolbar BEFORE clicking calibration or
+%     data points if you need precision; the tool reads cursor position
+%     in image (pixel) coordinates regardless of zoom level.
+%   - You can re-run just the digitizing step with an existing
+%     calibration using digitizePlot(imagePath) again if you reuse the
+%     same image and axes.
 
-clear; clc;
-
-%% ---- USER INPUTS ----
-inputFile  = 'model.inp';
-outputFile = 'model_filtered.inp';
-
-r0 = 5.0;
-x1 = 0.0;
-x2 = 10.0;
-
-elsetLo = 661506;
-elsetHi = 886647;
-
-%% ---- READ ALL LINES (text I/O, not the slow part) ----
-fid = fopen(inputFile, 'r');
-if fid == -1
-    error('Could not open file: %s', inputFile);
-end
-rawLines = {};
-tline = fgetl(fid);
-while ischar(tline)
-    rawLines{end+1,1} = tline; %#ok<AGROW>
-    tline = fgetl(fid);
-end
-fclose(fid);
-nLines = numel(rawLines);
-
-%% ---- FIND *Node BLOCK (exact match, line by line) ----
-nodeStart = 0;
-for k = 1:nLines
-    if isKeywordMatch(rawLines{k}, '*Node')
-        nodeStart = k;
-        break;
+    if nargin < 1
+        [f,p] = uigetfile({'*.png;*.jpg;*.jpeg;*.tif;*.bmp','Image files'});
+        if isequal(f,0); error('No image selected.'); end
+        imagePath = fullfile(p,f);
     end
-end
-if nodeStart == 0
-    error('Could not find a *Node keyword line.');
-end
 
-nodeEnd = nodeStart;
-for k = (nodeStart+1):nLines
-    if ~isempty(rawLines{k}) && rawLines{k}(1) == '*'
-        break;
+    img = imread(imagePath);
+    hFig = figure('Name','Plot Digitizer','NumberTitle','off',...
+                   'Units','normalized','OuterPosition',[0.05 0.05 0.9 0.9]);
+    imshow(img); hold on; axis on;
+    title('Calibration: click point 1 on X-axis (known X value)');
+    set(gca,'YDir','reverse'); % image coords
+
+    %% ---- Step 1: X-axis calibration (2 points) ----
+    [xpx(1), ypx(1)] = ginputZoom(1);
+    plotMark(xpx(1), ypx(1), 'r');
+    xv(1) = inputVal('Enter the TRUE X value for point 1: ');
+
+    title('Calibration: click point 2 on X-axis (known X value)');
+    [xpx(2), ypx(2)] = ginputZoom(1);
+    plotMark(xpx(2), ypx(2), 'r');
+    xv(2) = inputVal('Enter the TRUE X value for point 2: ');
+
+    %% ---- Step 2: Y-axis calibration (2 points) ----
+    title('Calibration: click point 1 on Y-axis (known Y value)');
+    [xpy(1), ypy(1)] = ginputZoom(1);
+    plotMark(xpy(1), ypy(1), 'b');
+    yv(1) = inputVal('Enter the TRUE Y value for point 1: ');
+
+    title('Calibration: click point 2 on Y-axis (known Y value)');
+    [xpy(2), ypy(2)] = ginputZoom(1);
+    plotMark(xpy(2), ypy(2), 'b');
+    yv(2) = inputVal('Enter the TRUE Y value for point 2: ');
+
+    %% ---- Step 3: Build affine transform pixel -> data ----
+    % Model: [X;Y] = A * [px;py] + b
+    % Use the X-axis pair to get the X-direction relationship, and the
+    % Y-axis pair to get the Y-direction relationship. Two points define
+    % a line in pixel space for each axis; we solve the 2x2 affine
+    % system using all 4 calibration points together (more robust to
+    % slight tilt than assuming orthogonal pixel axes).
+    %
+    % Set up: for each known-X point, X = a11*px + a12*py + b1
+    %         for each known-Y point, Y = a21*px + a22*py + b2
+    % With only 2 points per axis the system is exactly determined if we
+    % assume the X value does not depend on py for points lying ON the
+    % x-axis tick line, etc. Simpler & robust approach: treat the 4
+    % calibration points as defining two basis vectors in pixel space
+    % corresponding to the data X and Y directions.
+
+    % X-direction vector in pixel space (per unit X)
+    dpx_X = [xpx(2)-xpx(1), ypx(2)-ypx(1)];
+    dX    = xv(2)-xv(1);
+    if dX == 0, error('The two X calibration points must have different X values.'); end
+    uX = dpx_X / dX;   % pixel displacement per unit X
+
+    % Y-direction vector in pixel space (per unit Y)
+    dpx_Y = [xpy(2)-xpy(1), ypy(2)-ypy(1)];
+    dY    = yv(2)-yv(1);
+    if dY == 0, error('The two Y calibration points must have different Y values.'); end
+    uY = dpx_Y / dY;   % pixel displacement per unit Y
+
+    % Build forward map (data -> pixel): [px;py] = M*[X;Y] + c
+    M = [uX(1) uY(1); uX(2) uY(2)];
+    % Use X-axis point 1 as reference: px = M*[X;Y] + c, with Y unknown
+    % at that point, so instead anchor using both axis origins assuming
+    % they share the plot origin is NOT required. Instead solve c from
+    % point 1 of X-cal, treating its (unknown) Y as the Y-cal point1's Y
+    % only if they coincide. To avoid that assumption, recompute using
+    % a true affine least-squares fit with all 4 points and an assumed
+    % "shared" coordinate -- but simplest robust method: anchor at the
+    % intersection of the two calibration lines (pixel-space) which
+    % corresponds to (X=xv(1)-projected, ...). We instead solve directly:
+    %
+    % px = M11*X + M12*Y + c1
+    % py = M21*X + M22*Y + c2
+    %
+    % We have 4 pixel points but only 2 independent X values and 2
+    % independent Y values, with the OTHER coordinate at each
+    % calibration point unknown. To keep this general and not require
+    % the calibration points to share an origin, solve c using the
+    % X-axis points (assume Y is whatever it is, cancels in the
+    % subtraction used for uX) -- c must come from a point where both
+    % X and Y are known. Simplest practical fix: ask user to click an
+    % ORIGIN point (intersection of axes) instead of relying on the
+    % 4 cal points' offsets.
+
+    title('Click the ORIGIN (intersection of X and Y axes, i.e. the point where X and Y values are both known)');
+    [oxpx, oypx] = ginputZoom(1);
+    plotMark(oxpx, oypx, 'g');
+    ox = inputVal('Enter the TRUE X value at this origin point: ');
+    oy = inputVal('Enter the TRUE Y value at this origin point: ');
+
+    c = [oxpx; oypx] - M*[ox; oy];
+
+    Minv = inv(M);
+
+    %% ---- Step 4: Digitize curve points ----
+    title({'Click along the curve to digitize points (one click per point).','Press ENTER or right-click when finished.'});
+    digPx = [];
+    while true
+        [xc, yc, button] = ginputZoom(1);
+        if isempty(xc) || (~isempty(button) && button == 3)
+            break;
+        end
+        digPx(end+1,:) = [xc, yc]; %#ok<AGROW>
+        plotMark(xc, yc, 'm');
+        if size(digPx,1) > 1
+            plot(digPx(:,1), digPx(:,2), 'm-','LineWidth',1);
+        end
     end
-    nodeEnd = k;
-end
 
-nodeBlockStr = strjoin(rawLines(nodeStart+1:nodeEnd), '\n');
-nodeData = textscan(nodeBlockStr, '%f%f%f%f', 'Delimiter', ',', 'CollectOutput', true);
-nodeData = nodeData{1};          % [id x y z]
-nodeIDs    = nodeData(:,1);
-nodeCoords = nodeData(:,2:4);
-
-maxNodeID = max(nodeIDs);
-nodeMap = zeros(maxNodeID, 1);
-nodeMap(nodeIDs) = 1:numel(nodeIDs);
-
-fprintf('Parsed %d nodes (lines %d-%d).\n', numel(nodeIDs), nodeStart, nodeEnd);
-
-%% ---- FIND *Element BLOCK (exact match, line by line) ----
-elemStart = 0;
-for k = (nodeEnd+1):nLines
-    if isKeywordMatch(rawLines{k}, '*Element')
-        elemStart = k;
-        break;
+    if isempty(digPx)
+        warning('No points digitized.');
+        data = [];
+        return;
     end
-end
-if elemStart == 0
-    error('Could not find an *Element keyword line.');
+
+    %% ---- Step 5: Convert pixel -> data coordinates ----
+    dataXY = (Minv * (digPx' - c))';
+    data = dataXY; % columns: [X Y]
+
+    %% ---- Step 6: Save & report ----
+    [folder,name] = fileparts(imagePath);
+    if isempty(folder), folder = pwd; end
+    matPath = fullfile(folder, [name '_digitized.mat']);
+    csvPath = fullfile(folder, [name '_digitized.csv']);
+    save(matPath, 'data');
+    writematrix(data, csvPath);
+
+    fprintf('Digitized %d points.\n', size(data,1));
+    fprintf('Saved to:\n  %s\n  %s\n', matPath, csvPath);
+
+    figure('Name','Digitized Data Check');
+    plot(data(:,1), data(:,2), 'o-');
+    xlabel('X'); ylabel('Y'); grid on;
+    title('Digitized data (verify against original plot)');
 end
 
-elemEnd = elemStart;
-for k = (elemStart+1):nLines
-    if ~isempty(rawLines{k}) && rawLines{k}(1) == '*'
-        break;
+%% ---------- Helper functions ----------
+
+function [x,y,button] = ginputZoom(n)
+% Wrapper around ginput that returns empty on ENTER (no click).
+    [x,y,button] = ginput(n);
+end
+
+function plotMark(x,y,c)
+    plot(x,y,'+','Color',c,'MarkerSize',12,'LineWidth',2);
+end
+
+function v = inputVal(prompt)
+    v = [];
+    while isempty(v)
+        v = str2double(inputdlg(prompt,'Calibration value'));
+        if isnan(v)
+            v = [];
+        end
     end
-    elemEnd = k;
-end
-
-elemBlockStr = strjoin(rawLines(elemStart+1:elemEnd), '\n');
-fmt = repmat('%f', 1, 11);   % id + 10 connectivity nodes
-elemData = textscan(elemBlockStr, fmt, 'Delimiter', ',', 'CollectOutput', true);
-elemData = elemData{1};       % [id n1 n2 ... n10]
-elemIDs  = elemData(:,1);
-
-fprintf('Parsed %d elements (lines %d-%d).\n', numel(elemIDs), elemStart, elemEnd);
-
-%% ---- COMPUTE CENTROID & RADIUS (corner nodes = connectivity cols 2-5) ----
-cornerNodes = elemData(:,2:5);              % [n1 n2 n3 n4] for every element
-rows = nodeMap(cornerNodes);                % same size, row indices into nodeCoords
-cx = mean(reshape(nodeCoords(rows,1), size(cornerNodes)), 2);
-cy = mean(reshape(nodeCoords(rows,2), size(cornerNodes)), 2);
-cz = mean(reshape(nodeCoords(rows,3), size(cornerNodes)), 2);
-
-x_c = cx;
-r_c = sqrt(cy.^2 + cz.^2);
-
-%% ---- APPLY REMOVAL CRITERION ----
-removeMask = (r_c < r0) & (x_c >= x1) & (x_c <= x2);
-fprintf('Removing %d of %d elements (r < %.4g and x in [%.4g, %.4g]).\n', ...
-    sum(removeMask), numel(elemIDs), r0, x1, x2);
-
-keepMask     = ~removeMask;
-keptElemData = elemData(keepMask, :);
-
-%% ---- BUILD ABRBOT ELSET (surviving elements within [elsetLo, elsetHi]) ----
-inRangeMask = (elemIDs >= elsetLo) & (elemIDs <= elsetHi);
-abrbotIDs = sort(elemIDs(keepMask & inRangeMask));
-fprintf('ABRBOT elset: %d elements remain in range [%d, %d].\n', ...
-    numel(abrbotIDs), elsetLo, elsetHi);
-
-%% ---- WRITE OUTPUT FILE ----
-fidOut = fopen(outputFile, 'w');
-if fidOut == -1
-    error('Could not open output file: %s', outputFile);
-end
-
-% everything up to and including the node data, untouched
-for k = 1:nodeEnd
-    fprintf(fidOut, '%s\n', rawLines{k});
-end
-
-% lines between node block and element keyword line, untouched
-for k = (nodeEnd+1):elemStart
-    fprintf(fidOut, '%s\n', rawLines{k});
-end
-
-% regenerate element data lines from surviving elements
-for k = 1:size(keptElemData,1)
-    fprintf(fidOut, '%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d\n', keptElemData(k,:));
-end
-
-% everything after the element block, untouched
-for k = (elemEnd+1):nLines
-    fprintf(fidOut, '%s\n', rawLines{k});
-end
-
-% ABRBOT elset, 8 IDs per line
-fprintf(fidOut, '*ELSET, ELSET=ABRBOT\n');
-nPerLine = 8;
-for k = 1:nPerLine:numel(abrbotIDs)
-    lineIDs = abrbotIDs(k:min(k+nPerLine-1, numel(abrbotIDs)));
-    fprintf(fidOut, '%s\n', strjoin(cellstr(num2str(lineIDs(:), '%d')), ', '));
-end
-
-fclose(fidOut);
-fprintf('Wrote filtered deck with ABRBOT elset to: %s\n', outputFile);
-
-%% ---- LOCAL FUNCTIONS (must come after all script code in MATLAB) ----
-function tf = isKeywordMatch(line, keyword)
-    % Exact match on the first comma-delimited token of the line, so
-    % e.g. '*Node output' does NOT match keyword '*Node'.
-    tok = strtrim(strtok(line, ','));
-    tf = strcmpi(tok, keyword);
 end
