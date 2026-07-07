@@ -31,94 +31,47 @@ fid = fopen(cdbFile, 'r');
 if fid == -1
     error('cdb2stl:fileOpen', 'Could not open file: %s', cdbFile);
 end
-raw = textscan(fid, '%s', 'Delimiter', '\n', 'Whitespace', '');
-fclose(fid);
-lines = raw{1};
-N = numel(lines);
 
-%% ---- Parse NBLOCK(s): node IDs and coordinates ----
-nodeIDs = zeros(0,1);
-nodeXYZ = zeros(0,3);
+% Single sequential pass over the file. NBLOCK data is 3 leading integer
+% fields (node, ref1, ref2) followed by coordinates (x,y,z,...); EBLOCK
+% data (quad-only mesh) is 19 integer fields with the 4 node numbers in
+% columns 12-15. textscan is forgiving here: it just stops reading a
+% block the moment a line no longer matches the numeric pattern (i.e.
+% the terminator line), so no manual detection of terminators is needed.
+nodeIDs   = zeros(0,1);
+nodeXYZ   = zeros(0,3);
+elemNodes = zeros(0,4);
 
-i = 1;
-while i <= N
-    line = strtrim(lines{i});
-    if ~isempty(regexpi(line, '^NBLOCK', 'once'))
-        i = i + 1;   % format descriptor line, e.g. (3i9,6e21.13e3) - skip
-        i = i + 1;   % first data line
-        while i <= N
-            l = strtrim(lines{i});
-            if isNblockTerminator(l)
-                break;
-            end
-            tok = strsplit(l);
-            if numel(tok) >= 6
-                id = str2double(tok{1});
-                x  = str2double(tok{4});
-                y  = str2double(tok{5});
-                z  = str2double(tok{6});
-                if ~isnan(id) && ~isnan(x) && ~isnan(y) && ~isnan(z)
-                    nodeIDs(end+1,1) = id;   %#ok<AGROW>
-                    nodeXYZ(end+1,:) = [x y z]; %#ok<AGROW>
-                end
-            end
-            i = i + 1;
-        end
-        continue;
+while ~feof(fid)
+    line = fgetl(fid);
+    if ~ischar(line)
+        break;
     end
-    i = i + 1;
+
+    if ~isempty(regexpi(line, '^NBLOCK', 'once'))
+        fgetl(fid);   % skip the format descriptor line, e.g. (3i9,6e21.13e3)
+        C = textscan(fid, '%f %f %f %f %f %f', 'CollectOutput', true);
+        M = C{1};
+        if ~isempty(M)
+            nodeIDs = [nodeIDs; M(:,1)];      %#ok<AGROW>
+            nodeXYZ = [nodeXYZ; M(:,4:6)];    %#ok<AGROW>
+        end
+
+    elseif ~isempty(regexpi(line, '^EBLOCK', 'once')) && ~isempty(regexpi(line, 'SOLID', 'once'))
+        fgetl(fid);   % skip the format descriptor line, e.g. (19i9)
+        C = textscan(fid, repmat('%f ', 1, 19), 'CollectOutput', true);
+        M = C{1};
+        if ~isempty(M)
+            elemNodes = [elemNodes; M(:,12:15)];  %#ok<AGROW> % 4 node cols (quad mesh)
+        end
+    end
 end
+fclose(fid);
 
 if isempty(nodeIDs)
     error('cdb2stl:noNodes', 'No nodes found - no NBLOCK parsed.');
 end
 fprintf('  Found %d nodes.\n', numel(nodeIDs));
-
-%% ---- Parse EBLOCK(s): quad element connectivity ----
-elemNodes = zeros(0,4);
-
-i = 1;
-while i <= N
-    line = strtrim(lines{i});
-    if ~isempty(regexpi(line, '^EBLOCK', 'once')) && ~isempty(regexpi(line, 'SOLID', 'once'))
-        i = i + 1;   % format descriptor line, e.g. (19i9) - skip
-        i = i + 1;   % first data line
-        while i <= N
-            l = strtrim(lines{i});
-            if isempty(l) || strcmp(l, '-1')
-                break;
-            end
-            tok = str2double(strsplit(l));
-            if numel(tok) < 11 || any(isnan(tok(1:11)))
-                i = i + 1;
-                continue;
-            end
-            nnodes     = tok(9);
-            nodesStart = 12;
-            neededLen  = nodesStart + nnodes - 1;
-
-            % pull in continuation line if node list overflows this line
-            while numel(tok) < neededLen && (i+1) <= N
-                i = i + 1;
-                tok2 = str2double(strsplit(strtrim(lines{i})));
-                tok = [tok, tok2]; %#ok<AGROW>
-            end
-
-            if numel(tok) >= neededLen
-                nlist = tok(nodesStart:nodesStart+nnodes-1);
-                if nnodes == 4
-                    elemNodes(end+1,:) = nlist; %#ok<AGROW>
-                elseif nnodes == 3
-                    elemNodes(end+1,:) = [nlist, nlist(3)]; %#ok<AGROW> % degenerate quad
-                end
-                % nnodes with other counts (line/point elements) are ignored
-            end
-            i = i + 1;
-        end
-        continue;
-    end
-    i = i + 1;
-end
 
 if isempty(elemNodes)
     error('cdb2stl:noElements', 'No quad elements found - no EBLOCK,SOLID parsed.');
@@ -177,11 +130,6 @@ fprintf('Done.\n');
 end
 
 %% ===================== Helper functions =====================
-
-function tf = isNblockTerminator(l)
-% NBLOCK data ends with a line like "N,R5.3,LOC,       -1," or just "-1"
-tf = isempty(l) || strcmpi(l, '-1') || ~isempty(regexpi(l, '^N,', 'once'));
-end
 
 function writeAsciiSTL(stlFile, V1, V2, V3, normals)
 fid = fopen(stlFile, 'w');
