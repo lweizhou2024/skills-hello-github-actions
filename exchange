@@ -1,19 +1,5 @@
-filename = 'myfile.txt';
+	
+https://www.dropbox.com/l/scl/AAIKlBbmbnrlOPIITVQ9R_c6Ydb3yr-7KhI?dbx_campid=15314609&dbx_src=email
 
-% Read all lines
-lines = readlines(filename);
 
-% Process lines 41 and 42
-for k = 41:42
-    line = strtrim(lines(k));
 
-    % Extract the three quoted fields
-    tokens = regexp(line, '"([^"]*)","([^"]*)","([^"]*)"', 'tokens', 'once');
-
-    number = str2double(tokens{2});
-    firstTwo = tokens{3}(1:2);
-
-    fprintf('Line %d:\n', k);
-    fprintf('  Number = %g\n', number);
-    fprintf('  First two letters = %s\n', firstTwo);
-end
