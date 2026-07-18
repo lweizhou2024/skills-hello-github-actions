@@ -1,223 +1,62 @@
-%% SECTION 4 REPLACEMENT v3 — Frangi vesselness crack detection
-%
-% Designed for faint cracks that are only slightly darker than surroundings.
-% The Frangi filter detects tubular/crack-like structures via Hessian
-% eigenvalues — it amplifies faint elongated dark features while suppressing
-% flat regions and blob-like features.
-%
-% No external toolbox needed — the Frangi filter is implemented here directly.
-%
-% -------------------------------------------------------------------------
-%  ADD THESE to your cfg block at the top of the main script
-% -------------------------------------------------------------------------
-%
-%   cfg.frangi_scales       = 1:1:4;   % range of crack half-widths to search (px)
-%                                      % e.g. [1 2 3 4] searches cracks 2-8 px wide
-%                                      % increase upper end if cracks are wider
-%   cfg.frangi_beta         = 0.5;     % tubeness shape sensitivity [0.1 .. 1]
-%                                      % lower = more permissive about blob-iness
-%   cfg.frangi_c_frac       = 0.1;     % noise sensitivity as fraction of max |H|
-%                                      % lower = picks up fainter features
-%   cfg.crack_expected_angle = 90;     % 90 = vertical cracks, 0 = horizontal
-%   cfg.crack_angle_tol     = 35;      % ± degrees tolerance around expected angle
-%   cfg.crack_min_length    = 15;      % min skeleton segment length (px)
-%   cfg.crack_eccentricity  = 0.75;    % shape filter (0=circle, 1=line)
-%   cfg.vesselness_thresh   = 0.05;    % threshold on [0,1] vesselness map
-%                                      % lower = more sensitive; start at 0.05
-%                                      % raise if too much background noise picked up
+Vane RPS Alignment MATLAB Package
+==================================
 
-% -------------------------------------------------------------------------
-fprintf('Detecting cracks — Frangi vesselness filter ...\n');
+Files
+-----
+1. vane_rps_alignment.m
+   Main function. Keep it on the MATLAB path.
 
-% =========================================================================
-%  LOCAL FUNCTION: Frangi multi-scale vesselness (dark tubular structures)
-% =========================================================================
-% Nested function defined at the bottom of this block — call it as:
-%   V = frangi_dark(img_in, scales, beta, c_frac)
+2. example_vane_alignment.m
+   Template showing required inputs and outputs.
 
-    function V = frangi_dark(I, scales, beta, c_frac)
-        % Returns a vesselness map in [0,1] highlighting dark tubular features.
-        % I      : 2-D double image, values in [0,1]
-        % scales : vector of Gaussian sigma values (px) = crack half-widths
-        % beta   : controls sensitivity to deviation from tubular shape
-        % c_frac : fraction of max Frobenius norm used as noise threshold
+Recommended input files
+-----------------------
+- nominal_vane.stl
+- deform_springback_surface.stl
+- cad_8_corners.csv
+- scan_8_corners.csv
+- wenzel_nominal_targets.csv
 
-        [nr, nc] = size(I);
-        V_all = zeros(nr, nc, numel(scales));
+Each CSV has X,Y,Z columns with no text header unless you modify readmatrix.
 
-        for si = 1:numel(scales)
-            s = scales(si);
+How normals are obtained
+------------------------
+XYZ coordinates alone are insufficient to define a surface normal.
 
-            % Hessian via Gaussian second derivatives at scale s
-            % Use scale-normalised derivatives (multiply by s^2)
-            g   = fspecial('gaussian', ceil(6*s+1), s);
+Preferred order:
+1. Ask WENZEL to export nominal point direction vectors (I,J,K or Nx,Ny,Nz).
+2. Otherwise export the nominal CAD to a fine STL.
+3. The main function finds the closest CAD triangle for each WENZEL target and
+   averages nearby, similarly oriented triangle normals.
 
-            % Second-derivative kernels
-            [x, y] = meshgrid(-(ceil(3*s)):ceil(3*s), -(ceil(3*s)):ceil(3*s));
-            Lxx_k  = (x.^2/s^4 - 1/s^2) .* exp(-(x.^2+y.^2)/(2*s^2));
-            Lyy_k  = (y.^2/s^4 - 1/s^2) .* exp(-(x.^2+y.^2)/(2*s^2));
-            Lxy_k  = (x.*y/s^4)          .* exp(-(x.^2+y.^2)/(2*s^2));
+For a target on a sharp edge or fillet, the normal is ambiguous and will depend
+on tessellation and averaging. Move the target into the interior of the intended
+datum surface whenever possible.
 
-            % Normalise kernels
-            Lxx_k = Lxx_k / sum(abs(Lxx_k(:)));
-            Lyy_k = Lyy_k / sum(abs(Lyy_k(:)));
-            Lxy_k = Lxy_k / sum(abs(Lxy_k(:)));
+Classic 3-2-1 RPS
+-----------------
+For A1,A2,A3,B1,B2,C1, use the actual CAD surface normal at every point.
+Do not manually force A normals to be exactly identical unless that matches the
+WENZEL point definitions.
 
-            % Apply (scale-normalised: multiply by s^2)
-            Lxx = s^2 * imfilter(I, Lxx_k, 'replicate');
-            Lyy = s^2 * imfilter(I, Lyy_k, 'replicate');
-            Lxy = s^2 * imfilter(I, Lxy_k, 'replicate');
+The function reports the rank of the RPS Jacobian. It must be 6 for a fully
+constrained rigid alignment. A very high condition number indicates weak
+geometry or poor target spacing.
 
-            % Eigenvalues of 2x2 Hessian at each pixel
-            % lambda = (Lxx+Lyy)/2 ± sqrt(((Lxx-Lyy)/2)^2 + Lxy^2)
-            tmp   = sqrt(((Lxx - Lyy)/2).^2 + Lxy.^2);
-            lam1  = (Lxx + Lyy)/2 - tmp;   % smaller eigenvalue
-            lam2  = (Lxx + Lyy)/2 + tmp;   % larger eigenvalue
+STL quality
+-----------
+Use a fine enough CAD STL that the local triangle normal represents the exact
+CAD surface. Curved shoulders need finer tessellation than flat datum faces.
 
-            % For DARK tubes: both eigenvalues should be positive
-            % (second derivative is positive = local minimum = dark)
-            % Suppress pixels where lam2 <= 0
-            valid_mask = lam2 > 0;
+Projection
+----------
+After 8-corner coarse alignment, each nominal CAD target is ray-cast in both
+normal directions onto the distorted mesh. The nearest hit is used.
 
-            % Rb: ratio of eigenvalues (elongatedness)
-            Rb = lam1 ./ (lam2 + eps);
+Keep maxProjectionDistance only slightly larger than the expected mismatch.
+A large value can hit the opposite side of a thin vane.
 
-            % S : Frobenius norm of Hessian (signal strength)
-            S  = sqrt(lam1.^2 + lam2.^2);
-            c  = c_frac * max(S(:));
-
-            % Frangi vesselness (Eq. 13 from Frangi 1998, dark tube variant)
-            V_s = exp(-Rb.^2 / (2*beta^2)) .* (1 - exp(-S.^2 / (2*c^2)));
-            V_s(~valid_mask) = 0;
-
-            V_all(:,:,si) = V_s;
-        end
-
-        % Take maximum response across scales
-        V = max(V_all, [], 3);
-
-        % Normalise to [0,1]
-        vmax = max(V(:));
-        if vmax > 0
-            V = V / vmax;
-        end
-    end
-
-% =========================================================================
-%  Step 4a: prepare coating sub-image
-% =========================================================================
-coating_mean = mean(img(coating_mask));
-img_filled   = img;
-img_filled(~coating_mask) = coating_mean;   % neutral fill outside mask
-
-% =========================================================================
-%  Step 4b: run Frangi filter
-% =========================================================================
-V = frangi_dark(img_filled, cfg.frangi_scales, cfg.frangi_beta, cfg.frangi_c_frac);
-
-% Zero outside coating mask
-V(~coating_mask) = 0;
-
-% =========================================================================
-%  Step 4c: threshold vesselness map
-% =========================================================================
-crack_mask_raw = V > cfg.vesselness_thresh;
-crack_mask_raw = bwareaopen(crack_mask_raw, 5);   % remove tiny speckle
-
-% =========================================================================
-%  Step 4d: skeletonise
-% =========================================================================
-if exist('bwskel', 'file')      % R2019a+
-    skeleton = bwskel(crack_mask_raw, 'MinBranchLength', cfg.crack_min_length);
-else
-    skeleton = bwmorph(crack_mask_raw, 'thin', Inf);
-    skeleton = bwareaopen(skeleton, cfg.crack_min_length);
-end
-
-% =========================================================================
-%  Step 4e: label and filter by shape + orientation
-% =========================================================================
-CC_crack    = bwconncomp(skeleton);
-props_crack = regionprops(CC_crack, img, ...
-    'Area', 'Eccentricity', 'Orientation', 'MajorAxisLength', 'BoundingBox');
-
-keep = false(CC_crack.NumObjects, 1);
-for k = 1:CC_crack.NumObjects
-    if props_crack(k).Eccentricity < cfg.crack_eccentricity,  continue; end
-    if props_crack(k).Area         < cfg.crack_min_length,    continue; end
-
-    ang_diff = abs(props_crack(k).Orientation - cfg.crack_expected_angle);
-    ang_diff = min(ang_diff, 180 - ang_diff);
-    if ang_diff <= cfg.crack_angle_tol
-        keep(k) = true;
-    end
-end
-
-crack_skeleton = false(nrows, ncols);
-n_cracks = 0;
-for k = 1:CC_crack.NumObjects
-    if keep(k)
-        n_cracks = n_cracks + 1;
-        crack_skeleton(CC_crack.PixelIdxList{k}) = true;
-    end
-end
-
-fprintf('  Cracks detected: %d segments\n', n_cracks);
-crack_vis = imdilate(crack_skeleton, strel('disk', 1));
-
-% =========================================================================
-%  Step 4f: diagnostic figures
-% =========================================================================
-
-% Figure A: raw vesselness map — use this to tune vesselness_thresh
-figure('Name', 'Frangi vesselness map', 'NumberTitle', 'off');
-tiledlayout(1, 3, 'TileSpacing', 'compact');
-
-nexttile;
-imshow(img, []);
-title('Original SEM (coating region)', 'FontWeight', 'normal');
-
-nexttile;
-imshow(V, []);
-colormap(gca, hot);
-colorbar;
-title(sprintf('Vesselness  (thresh = %.3f)', cfg.vesselness_thresh), ...
-    'FontWeight', 'normal');
-
-nexttile;
-imshow(img, []);
-hold on;
-[cr, cc_] = find(crack_vis);
-if ~isempty(cr)
-    scatter(cc_, cr, 2, 'r', 'filled');
-end
-[br, bc] = find(bwperim(coating_mask));
-scatter(bc, br, 1, 'c', 'filled');
-hold off;
-legend({'Cracks', 'Coating boundary'}, 'TextColor', 'w', 'Color', 'k', ...
-    'Location', 'northeastoutside');
-title('Detected cracks', 'FontWeight', 'normal');
-
-% Figure B: vesselness histogram — helps choose vesselness_thresh
-figure('Name', 'Vesselness histogram', 'NumberTitle', 'off');
-v_vals = V(coating_mask & V > 0);
-histogram(v_vals, 100, 'Normalization', 'probability', 'FaceColor', [0.2 0.4 0.8]);
-xline(cfg.vesselness_thresh, 'r--', sprintf('thresh = %.3f', cfg.vesselness_thresh), ...
-    'LineWidth', 1.5, 'LabelHorizontalAlignment', 'left');
-xlabel('Vesselness score');
-ylabel('Probability');
-title('Distribution inside coating mask — set thresh above the noise floor', ...
-    'FontWeight', 'normal');
-grid on; box off;
-
-% =========================================================================
-%  Variables passed to sections 5-6 (unchanged from original)
-% =========================================================================
-if n_cracks > 0
-    crack_props_keep = props_crack(keep);
-    lengths_nm   = [crack_props_keep.MajorAxisLength] * cfg.nm_per_pixel;
-    orientations = [crack_props_keep.Orientation];
-else
-    lengths_nm   = [];
-    orientations = [];
-end
+If WENZEL exports the actual measured datum point XYZ values in the original scan
+coordinate system, provide:
+    cfg.measuredDatumPointsScan = readmatrix("measured_points.csv");
+Then mesh projection is bypassed.
