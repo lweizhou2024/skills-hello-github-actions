@@ -1,5 +1,78 @@
-https://myuva.sharepoint.com/:b:/r/sites/UVARRXLiGroup2022/Shared Documents/General/Dissertation_Hudyncia_%5BR54%5D_24MB.pdf?csf=1&web=1&e=llAoyp
+%% EXAMPLE_VANE_ALIGNMENT
+% Fill in file names and coordinate arrays, then run this script.
+%
+% CSV files should contain three columns: X, Y, Z.
+% Rows in cad_8_corners.csv and scan_8_corners.csv must correspond.
+% wenzel_nominal_targets.csv contains the CAD-defined datum target XYZ values.
 
-https://virginia.box.com/s/dfhgi2tirk1fgziy238wekhmxh82lt59
+clear;
+clc;
 
- https://web.preveil.com//drive/74b9aab9-cc18-4e66-a337-dce58c31cdcc/0cabb1ae-19db-4247-9d10-5a86fafac878/953620dd-bc26-4e10-9bf6-7f42dd6ee9d3/f
+cfg = struct;
+
+%% Mesh files
+% Export STEP/Parasolid CAD to a sufficiently fine STL first.
+cfg.cadMeshFile  = "nominal_vane.stl";
+cfg.scanMeshFile = "deform_springback_surface.stl";
+
+%% Coarse alignment using your 8 recognizable corners
+cfg.cadCorners  = readmatrix("cad_8_corners.csv");
+cfg.scanCorners = readmatrix("scan_8_corners.csv");
+
+%% CAD target coordinates from WENZEL
+cfg.datumPointsCAD = readmatrix("wenzel_nominal_targets.csv");
+
+%% Final alignment method
+% "rps"   : each point constrains only displacement along its CAD normal
+% "point" : ordinary 3-D point-to-point best fit
+cfg.method = "rps";
+
+%% Normal options
+% Leave datumNormalsCAD undefined to calculate normals from nominal_vane.stl.
+%
+% Better option, when WENZEL can export I,J,K or Nx,Ny,Nz:
+% cfg.datumNormalsCAD = readmatrix("wenzel_nominal_normals.csv");
+
+% Local averaging radius. Empty means 3 x median CAD STL edge length.
+cfg.normalRadius = [];
+
+% Prevent averaging normals across a sharp shoulder/edge.
+cfg.normalMaxAngleDeg = 20;
+
+%% Projection/alignment controls
+% Choose this only slightly larger than expected datum-surface distortion.
+% Too large can intersect the opposite side of a thin component.
+cfg.maxProjectionDistance = 3.0;
+
+cfg.maxIterations = 8;
+cfg.translationTolerance = 1e-6;
+cfg.rotationToleranceDeg = 1e-6;
+cfg.useNearestFallback = true;
+cfg.plot = true;
+
+%% Optional weights
+% Example for classic A1,A2,A3,B1,B2,C1:
+% cfg.weights = [1;1;1;1;1;1];
+
+%% Run
+result = vane_rps_alignment(cfg);
+
+%% Save useful outputs
+writematrix(result.alignedScanVertices,"aligned_scan_vertices.csv");
+writematrix(result.datumNormalsCAD,"derived_CAD_normals.csv");
+writematrix(result.measuredDatumPointsAligned, ...
+    "aligned_measured_datum_points.csv");
+
+T = eye(4);
+T(1:3,1:3) = result.R;
+T(1:3,4) = result.t;
+writematrix(T,"scan_to_CAD_transform.csv");
+
+disp("Final homogeneous transformation:");
+disp(T);
+
+disp("Normal-direction residuals:");
+disp(result.rps.normalResiduals);
+
+disp("Projection method used for each point:");
+disp(result.projectionInfo.mode);
