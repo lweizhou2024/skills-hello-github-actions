@@ -1,5 +1,828 @@
-	
-https://www.dropbox.com/scl/fo/7136bu5c3jjv9nxgdg0hi/AHn5Vk_jyO3jgnAVf_mSuHg?rlkey=kyoaawwsxqnsrjyy4dinz4x3l&st=gvo84mbo&dl=0
+function result = vane_rps_alignment(cfg)
+%VANE_RPS_ALIGNMENT Align a distorted vane mesh to nominal CAD datum targets.
+%
+% This function supports:
+%   1) Coarse rigid alignment from 8 (or more) matching corner points.
+%   2) CAD normal extraction at nominal datum target coordinates.
+%   3) Projection of CAD target points onto the coarse-aligned distorted mesh.
+%   4) Final alignment using either:
+%        - RPS normal-direction constraints, or
+%        - ordinary point-to-point rigid least squares.
+%
+% Coordinate convention:
+%   X_aligned = (R * X_scan.' + t).'
+%
+% REQUIRED cfg fields
+% -------------------
+% cfg.cadMeshFile        : nominal CAD surface mesh, STL file
+% cfg.scanMeshFile       : distorted/springback surface mesh, STL file
+% cfg.cadCorners         : Nc x 3 nominal corner coordinates
+% cfg.scanCorners        : Nc x 3 corresponding distorted corner coordinates
+% cfg.datumPointsCAD     : Nd x 3 nominal datum target coordinates from WENZEL
+%
+% OPTIONAL cfg fields
+% -------------------
+% cfg.method                    : 'rps' (default) or 'point'
+% cfg.datumNormalsCAD           : Nd x 3 normals. If omitted, derive from CAD STL.
+% cfg.weights                   : Nd x 1 positive weights; default ones
+% cfg.maxProjectionDistance     : maximum ray distance in model units; default 5
+% cfg.maxIterations             : projection/alignment iterations; default 8
+% cfg.translationTolerance      : convergence tolerance; default 1e-6
+% cfg.rotationToleranceDeg      : convergence tolerance; default 1e-6 degree
+% cfg.normalRadius              : averaging radius for CAD normals; default
+%                                 3 times median CAD triangle edge length
+% cfg.normalMaxAngleDeg         : do not average across sharper changes; default 20
+% cfg.normalCandidateFaces      : faces considered for closest-point search; default 800
+% cfg.useNearestFallback        : use closest mesh point if normal ray misses; default true
+% cfg.plot                      : show diagnostic plot; default true
+%
+% Optional alternative to mesh projection:
+% cfg.measuredDatumPointsScan   : Nd x 3 measured points in original scan coordinates.
+%                                 If supplied, these points are used directly.
+%
+% OUTPUT result fields
+% --------------------
+% result.R, result.t                : final scan-to-CAD rigid transform
+% result.initial.R, initial.t       : 8-corner coarse transform
+% result.datumPointsCAD             : nominal targets
+% result.datumNormalsCAD            : target normals
+% result.measuredDatumPointsAligned : final measured/projected points
+% result.alignedScanVertices        : transformed distorted mesh vertices
+% result.rps                        : rank, singular values, residuals, RMS
+% result.history                    : iteration diagnostics
+% result.normalInfo                 : CAD normal extraction diagnostics
+% result.projectionInfo             : projection diagnostics
+%
+% IMPORTANT
+% ---------
+% XYZ coordinates alone cannot define a surface normal. If WENZEL does not
+% export nominal direction vectors, the normal is estimated from the nominal
+% CAD triangulation at each target coordinate. Use a sufficiently fine STL,
+% and avoid placing target points on edges, fillets, or surface boundaries.
+%
+% Example:
+%   cfg = struct;
+%   cfg.cadMeshFile = "nominal_vane.stl";
+%   cfg.scanMeshFile = "springback_vane.stl";
+%   cfg.cadCorners = readmatrix("cad_8_corners.csv");
+%   cfg.scanCorners = readmatrix("scan_8_corners.csv");
+%   cfg.datumPointsCAD = readmatrix("wenzel_nominal_targets.csv");
+%   cfg.method = "rps";
+%   result = vane_rps_alignment(cfg);
+%   writematrix(result.alignedScanVertices,"aligned_scan_vertices.csv");
+
+    cfg = applyDefaults(cfg);
+    validateInputs(cfg);
+
+    TRcad = stlread(cfg.cadMeshFile);
+    TRscan = stlread(cfg.scanMeshFile);
+
+    Vcad = TRcad.Points;
+    Fcad = TRcad.ConnectivityList;
+    Vscan = TRscan.Points;
+    Fscan = TRscan.ConnectivityList;
+
+    P = double(cfg.datumPointsCAD);
+    nDatum = size(P,1);
+    w = double(cfg.weights(:));
+    w = w / mean(w);
+
+    % ------------------------------------------------------------
+    % 1. Coarse alignment from matching corners
+    % ------------------------------------------------------------
+    [R0,t0,cornerRMS] = weightedKabsch( ...
+        double(cfg.scanCorners), double(cfg.cadCorners), ...
+        ones(size(cfg.cadCorners,1),1));
+
+    % ------------------------------------------------------------
+    % 2. Obtain nominal CAD normals
+    % ------------------------------------------------------------
+    if isfield(cfg,"datumNormalsCAD") && ~isempty(cfg.datumNormalsCAD)
+        N = normalizeRows(double(cfg.datumNormalsCAD));
+        normalInfo.source = "supplied";
+        normalInfo.surfaceDistance = nan(nDatum,1);
+        normalInfo.faceID = nan(nDatum,1);
+    else
+        [N,normalInfo] = cadNormalsAtPoints( ...
+            P, TRcad, cfg.normalRadius, cfg.normalMaxAngleDeg, ...
+            cfg.normalCandidateFaces);
+        normalInfo.source = "derived_from_CAD_STL";
+    end
+
+    % A normal and its negative represent the same scalar RPS constraint.
+    % Projection is cast in both directions, so normal sign is not required.
+
+    % ------------------------------------------------------------
+    % 3. Iterative target projection and final alignment
+    % ------------------------------------------------------------
+    R = R0;
+    t = t0;
+
+    history = repmat(struct( ...
+        "iteration",[], "deltaTranslation",[], "deltaRotationDeg",[], ...
+        "objective",[], "datumRMS",[], "projectionModes",[]), ...
+        cfg.maxIterations,1);
+
+    finalProjectionInfo = [];
+    finalQ = [];
+
+    for iter = 1:cfg.maxIterations
+        VscanAligned = applyRigid(Vscan,R,t);
+
+        if isfield(cfg,"measuredDatumPointsScan") && ...
+                ~isempty(cfg.measuredDatumPointsScan)
+            Q = applyRigid(double(cfg.measuredDatumPointsScan),R,t);
+            projectionInfo.mode = repmat("supplied_measured_point",nDatum,1);
+            projectionInfo.distance = vecnorm(Q-P,2,2);
+            projectionInfo.hitFace = nan(nDatum,1);
+        else
+            [Q,projectionInfo] = projectTargetsToMesh( ...
+                P,N,VscanAligned,Fscan,cfg.maxProjectionDistance, ...
+                cfg.useNearestFallback,cfg.normalCandidateFaces);
+        end
+
+        switch lower(char(cfg.method))
+            case 'rps'
+                [dR,dt,fitInfo] = fitRPSIncrement(Q,P,N,w);
+            case {'point','point_to_point','kabsch'}
+                [dR,dt,fitRMS] = weightedKabsch(Q,P,w);
+                fitInfo.objective = sum(w .* vecnorm(applyRigid(Q,dR,dt)-P,2,2).^2);
+                fitInfo.residuals = vecnorm(applyRigid(Q,dR,dt)-P,2,2);
+                fitInfo.rms = fitRMS;
+                fitInfo.rank = NaN;
+                fitInfo.singularValues = NaN;
+                fitInfo.conditionNumber = NaN;
+            otherwise
+                error("cfg.method must be 'rps' or 'point'.");
+        end
+
+        % Compose incremental transform with the current scan-to-CAD transform.
+        R = dR * R;
+        t = dR * t + dt;
+
+        deltaRotDeg = rotationAngleDeg(dR);
+        deltaTrans = norm(dt);
+
+        history(iter).iteration = iter;
+        history(iter).deltaTranslation = deltaTrans;
+        history(iter).deltaRotationDeg = deltaRotDeg;
+        history(iter).objective = fitInfo.objective;
+        history(iter).datumRMS = fitInfo.rms;
+        history(iter).projectionModes = projectionInfo.mode;
+
+        finalProjectionInfo = projectionInfo;
+        finalQ = Q;
+
+        if deltaTrans < cfg.translationTolerance && ...
+                deltaRotDeg < cfg.rotationToleranceDeg
+            history = history(1:iter);
+            break;
+        end
+    end
+
+    % Recompute final projected/measured points and residuals in final frame.
+    VscanAligned = applyRigid(Vscan,R,t);
+
+    if isfield(cfg,"measuredDatumPointsScan") && ...
+            ~isempty(cfg.measuredDatumPointsScan)
+        Qfinal = applyRigid(double(cfg.measuredDatumPointsScan),R,t);
+        projectionInfo.mode = repmat("supplied_measured_point",nDatum,1);
+        projectionInfo.distance = vecnorm(Qfinal-P,2,2);
+        projectionInfo.hitFace = nan(nDatum,1);
+    else
+        [Qfinal,projectionInfo] = projectTargetsToMesh( ...
+            P,N,VscanAligned,Fscan,cfg.maxProjectionDistance, ...
+            cfg.useNearestFallback,cfg.normalCandidateFaces);
+    end
+
+    normalResidual = sum((Qfinal-P).*N,2);
+    pointResidual = vecnorm(Qfinal-P,2,2);
+
+    % Linearized RPS observability matrix at final target locations.
+    J = [cross(Qfinal,N,2), N];
+    JW = sqrt(w).*J;
+    sJ = svd(JW,0);
+    rankTol = max(size(JW))*eps(max(sJ));
+    rpsRank = sum(sJ > rankTol);
+
+    if numel(sJ) >= 6 && sJ(end) > 0
+        condJ = sJ(1)/sJ(end);
+    else
+        condJ = Inf;
+    end
+
+    % ------------------------------------------------------------
+    % 4. Package output
+    % ------------------------------------------------------------
+    result.R = R;
+    result.t = t;
+    result.initial.R = R0;
+    result.initial.t = t0;
+    result.initial.cornerRMS = cornerRMS;
+
+    result.datumPointsCAD = P;
+    result.datumNormalsCAD = N;
+    result.measuredDatumPointsAligned = Qfinal;
+    result.alignedScanVertices = VscanAligned;
+    result.scanFaces = Fscan;
+
+    result.rps.normalResiduals = normalResidual;
+    result.rps.pointResiduals = pointResidual;
+    result.rps.normalRMS = sqrt(sum(w.*normalResidual.^2)/sum(w));
+    result.rps.pointRMS = sqrt(sum(w.*pointResidual.^2)/sum(w));
+    result.rps.rank = rpsRank;
+    result.rps.singularValues = sJ;
+    result.rps.conditionNumber = condJ;
+
+    result.history = history;
+    result.normalInfo = normalInfo;
+    result.projectionInfo = projectionInfo;
+
+    fprintf("\nVane alignment complete\n");
+    fprintf("  Method                    : %s\n",string(cfg.method));
+    fprintf("  Initial 8-corner RMS      : %.6g\n",cornerRMS);
+    fprintf("  Final normal-direction RMS: %.6g\n",result.rps.normalRMS);
+    fprintf("  Final 3-D target RMS      : %.6g\n",result.rps.pointRMS);
+    fprintf("  RPS Jacobian rank         : %d of 6\n",rpsRank);
+    fprintf("  RPS condition number      : %.6g\n",condJ);
+
+    if rpsRank < 6
+        warning(['The selected targets/normals do not constrain all six rigid-body ', ...
+                 'degrees of freedom. Check the 3-2-1 point arrangement.']);
+    elseif condJ > 1e6
+        warning(['The alignment is poorly conditioned. Increase point spacing or ', ...
+                 'review datum normal directions.']);
+    end
+
+    if cfg.plot
+        plotAlignment(TRcad,VscanAligned,Fscan,P,Qfinal,N);
+    end
+end
 
 
+% ========================================================================
+% Configuration and validation
+% ========================================================================
+function cfg = applyDefaults(cfg)
+    defaults.method = "rps";
+    defaults.weights = [];
+    defaults.maxProjectionDistance = 5;
+    defaults.maxIterations = 8;
+    defaults.translationTolerance = 1e-6;
+    defaults.rotationToleranceDeg = 1e-6;
+    defaults.normalRadius = [];
+    defaults.normalMaxAngleDeg = 20;
+    defaults.normalCandidateFaces = 800;
+    defaults.useNearestFallback = true;
+    defaults.plot = true;
 
+    names = fieldnames(defaults);
+    for i = 1:numel(names)
+        name = names{i};
+        if ~isfield(cfg,name) || isempty(cfg.(name))
+            cfg.(name) = defaults.(name);
+        end
+    end
+
+    if isfield(cfg,"datumPointsCAD") && isempty(cfg.weights)
+        cfg.weights = ones(size(cfg.datumPointsCAD,1),1);
+    end
+end
+
+
+function validateInputs(cfg)
+    required = ["cadMeshFile","scanMeshFile","cadCorners", ...
+                "scanCorners","datumPointsCAD"];
+
+    for i = 1:numel(required)
+        fieldName = char(required(i));
+        if ~isfield(cfg,fieldName)
+            error("Missing required cfg field: %s",fieldName);
+        end
+    end
+
+    if size(cfg.cadCorners,2) ~= 3 || size(cfg.scanCorners,2) ~= 3
+        error("Corner arrays must have three columns: X, Y, Z.");
+    end
+    if size(cfg.cadCorners,1) ~= size(cfg.scanCorners,1)
+        error("cadCorners and scanCorners must have the same number of rows.");
+    end
+    if size(cfg.cadCorners,1) < 3
+        error("At least three non-collinear corner pairs are required.");
+    end
+    if size(cfg.datumPointsCAD,2) ~= 3
+        error("datumPointsCAD must have three columns: X, Y, Z.");
+    end
+    if numel(cfg.weights) ~= size(cfg.datumPointsCAD,1)
+        error("weights must have one value per datum target.");
+    end
+    if any(cfg.weights <= 0)
+        error("All weights must be positive.");
+    end
+    if isfield(cfg,"datumNormalsCAD") && ~isempty(cfg.datumNormalsCAD)
+        if ~isequal(size(cfg.datumNormalsCAD),size(cfg.datumPointsCAD))
+            error("datumNormalsCAD must be the same size as datumPointsCAD.");
+        end
+    end
+    if isfield(cfg,"measuredDatumPointsScan") && ...
+            ~isempty(cfg.measuredDatumPointsScan)
+        if ~isequal(size(cfg.measuredDatumPointsScan),size(cfg.datumPointsCAD))
+            error(['measuredDatumPointsScan must have the same size as ', ...
+                   'datumPointsCAD.']);
+        end
+    end
+end
+
+
+% ========================================================================
+% Rigid registration
+% ========================================================================
+function [R,t,rmsError] = weightedKabsch(source,target,w)
+% Map source points to target points using a proper rigid transformation.
+
+    source = double(source);
+    target = double(target);
+    w = double(w(:));
+    w = w/sum(w);
+
+    cs = sum(source.*w,1);
+    ct = sum(target.*w,1);
+
+    X = source-cs;
+    Y = target-ct;
+
+    H = X.'*(Y.*w);
+    [U,~,V] = svd(H);
+
+    D = eye(3);
+    if det(V*U.') < 0
+        D(3,3) = -1;
+    else
+        D(3,3) = 1;
+    end
+    R = V*D*U.';
+    t = ct.'-R*cs.';
+
+    fitted = applyRigid(source,R,t);
+    err2 = sum((fitted-target).^2,2);
+    rmsError = sqrt(sum(w.*err2));
+end
+
+
+function [R,t,info] = fitRPSIncrement(Q,P,N,w)
+% Solve min sum_i w_i [n_i dot (R*q_i+t-p_i)]^2.
+% A linearized solution supplies a robust starting point, followed by
+% derivative-free nonlinear refinement using base-MATLAB fminsearch.
+
+    Q = double(Q);
+    P = double(P);
+    N = normalizeRows(double(N));
+    w = double(w(:));
+
+    % Small-rotation linearization:
+    % n dot (omega x q + t) = n dot (p-q)
+    % omega coefficient is q x n.
+    J = [cross(Q,N,2), N];
+    b = sum((P-Q).*N,2);
+
+    JW = sqrt(w).*J;
+    bW = sqrt(w).*b;
+
+    if rank(JW) < 6
+        warning("Linearized RPS system has rank below 6.");
+    end
+
+    xLinear = pinv(JW)*bW;
+    omega0 = xLinear(1:3);
+    t0 = xLinear(4:6);
+
+    characteristicLength = sqrt(mean(sum((Q-mean(Q,1)).^2,2)));
+    if characteristicLength < eps
+        characteristicLength = 1;
+    end
+
+    x0 = [omega0; t0/characteristicLength];
+
+    objective = @(x) rpsObjective( ...
+        x,Q,P,N,w,characteristicLength);
+
+    opts = optimset( ...
+        "Display","off", ...
+        "TolX",1e-11, ...
+        "TolFun",1e-16, ...
+        "MaxIter",4000, ...
+        "MaxFunEvals",12000);
+
+    [xBest,fval,exitflag,output] = fminsearch(objective,x0,opts);
+
+    R = rotationVectorToMatrix(xBest(1:3));
+    t = characteristicLength*xBest(4:6);
+
+    Qfit = applyRigid(Q,R,t);
+    residual = sum((Qfit-P).*N,2);
+
+    sJ = svd(JW,0);
+    rankTol = max(size(JW))*eps(max(sJ));
+    r = sum(sJ>rankTol);
+
+    if numel(sJ)>=6 && sJ(end)>0
+        conditionNumber = sJ(1)/sJ(end);
+    else
+        conditionNumber = Inf;
+    end
+
+    info.objective = fval;
+    info.residuals = residual;
+    info.rms = sqrt(sum(w.*residual.^2)/sum(w));
+    info.rank = r;
+    info.singularValues = sJ;
+    info.conditionNumber = conditionNumber;
+    info.exitflag = exitflag;
+    info.output = output;
+end
+
+
+function value = rpsObjective(x,Q,P,N,w,L)
+    R = rotationVectorToMatrix(x(1:3));
+    t = L*x(4:6);
+    Qfit = applyRigid(Q,R,t);
+    residual = sum((Qfit-P).*N,2);
+    value = sum(w.*residual.^2);
+end
+
+
+function R = rotationVectorToMatrix(omega)
+% Rodrigues exponential map. omega direction is rotation axis; norm is angle.
+
+    theta = norm(omega);
+    if theta < 1e-14
+        K = skew(omega);
+        R = eye(3)+K+0.5*(K*K);
+        return;
+    end
+
+    axis = omega/theta;
+    K = skew(axis);
+    R = eye(3)+sin(theta)*K+(1-cos(theta))*(K*K);
+end
+
+
+function K = skew(v)
+    K = [  0   -v(3)  v(2);
+          v(3)  0    -v(1);
+         -v(2) v(1)   0   ];
+end
+
+
+function Xout = applyRigid(X,R,t)
+    Xout = (R*X.'+t).';
+end
+
+
+function angleDeg = rotationAngleDeg(R)
+    c = max(-1,min(1,(trace(R)-1)/2));
+    angleDeg = acosd(c);
+end
+
+
+% ========================================================================
+% CAD normal extraction
+% ========================================================================
+function [N,info] = cadNormalsAtPoints(P,TR,radius,maxAngleDeg,nCandidates)
+% Estimate a local CAD surface normal at each nominal target point.
+%
+% 1. Find the nearest triangle by exact point-to-triangle distance among
+%    candidate faces selected by centroid distance.
+% 2. Use the nearest triangle normal as a seed.
+% 3. Average nearby face normals only if their angle to the seed is below
+%    maxAngleDeg. This avoids averaging across a sharp edge.
+
+    V = TR.Points;
+    F = TR.ConnectivityList;
+    faceN = faceNormal(TR);
+    C = (V(F(:,1),:)+V(F(:,2),:)+V(F(:,3),:))/3;
+
+    if isempty(radius)
+        radius = 3*estimateMedianEdgeLength(V,F);
+    end
+
+    nPoints = size(P,1);
+    N = zeros(nPoints,3);
+    info.faceID = zeros(nPoints,1);
+    info.surfaceDistance = zeros(nPoints,1);
+    info.closestSurfacePoint = zeros(nPoints,3);
+    info.normalRadius = radius*ones(nPoints,1);
+
+    cosLimit = cosd(maxAngleDeg);
+
+    for i = 1:nPoints
+        [closestPoint,faceID,distance] = nearestPointOnMesh( ...
+            P(i,:),V,F,C,nCandidates);
+
+        seed = faceN(faceID,:);
+        if norm(seed)<eps
+            error("Degenerate CAD triangle at face %d.",faceID);
+        end
+        seed = seed/norm(seed);
+
+        dCentroid = vecnorm(C-closestPoint,2,2);
+        neighbors = find(dCentroid<=radius);
+
+        if isempty(neighbors)
+            neighbors = faceID;
+        end
+
+        neighborNormals = faceN(neighbors,:);
+
+        % Align inconsistent triangle normal signs to the seed.
+        signFlip = sign(neighborNormals*seed.');
+        signFlip(signFlip==0) = 1;
+        neighborNormals = neighborNormals.*signFlip;
+
+        angularOK = (neighborNormals*seed.')>=cosLimit;
+        neighbors = neighbors(angularOK);
+        neighborNormals = neighborNormals(angularOK,:);
+
+        if isempty(neighbors)
+            localN = seed;
+        else
+            dist = vecnorm(C(neighbors,:)-closestPoint,2,2);
+            weights = 1./max(dist,0.05*radius);
+            localN = sum(neighborNormals.*weights,1);
+            localN = localN/norm(localN);
+        end
+
+        N(i,:) = localN;
+        info.faceID(i) = faceID;
+        info.surfaceDistance(i) = distance;
+        info.closestSurfacePoint(i,:) = closestPoint;
+    end
+end
+
+
+function lengthMedian = estimateMedianEdgeLength(V,F)
+    nFaces = size(F,1);
+    sampleCount = min(nFaces,20000);
+    if sampleCount<nFaces
+        index = round(linspace(1,nFaces,sampleCount));
+        Fs = F(index,:);
+    else
+        Fs = F;
+    end
+
+    e1 = vecnorm(V(Fs(:,2),:)-V(Fs(:,1),:),2,2);
+    e2 = vecnorm(V(Fs(:,3),:)-V(Fs(:,2),:),2,2);
+    e3 = vecnorm(V(Fs(:,1),:)-V(Fs(:,3),:),2,2);
+    lengthMedian = median([e1;e2;e3]);
+
+    if ~isfinite(lengthMedian) || lengthMedian<=0
+        error("Could not estimate a valid CAD mesh edge length.");
+    end
+end
+
+
+% ========================================================================
+% Projection from CAD target points to distorted scan mesh
+% ========================================================================
+function [Q,info] = projectTargetsToMesh( ...
+        P,N,V,F,maxDistance,useFallback,nCandidates)
+
+    nPoints = size(P,1);
+    Q = zeros(nPoints,3);
+    info.mode = strings(nPoints,1);
+    info.distance = zeros(nPoints,1);
+    info.hitFace = nan(nPoints,1);
+
+    C = (V(F(:,1),:)+V(F(:,2),:)+V(F(:,3),:))/3;
+
+    for i = 1:nPoints
+        [hitPlus,tPlus,facePlus] = rayMeshNearestHit( ...
+            P(i,:), N(i,:), V,F,maxDistance);
+
+        [hitMinus,tMinus,faceMinus] = rayMeshNearestHit( ...
+            P(i,:),-N(i,:), V,F,maxDistance);
+
+        plusValid = all(isfinite(hitPlus));
+        minusValid = all(isfinite(hitMinus));
+
+        if plusValid || minusValid
+            if plusValid && (~minusValid || tPlus<=tMinus)
+                Q(i,:) = hitPlus;
+                info.distance(i) = tPlus;
+                info.hitFace(i) = facePlus;
+                info.mode(i) = "normal_ray_plus";
+            else
+                Q(i,:) = hitMinus;
+                info.distance(i) = tMinus;
+                info.hitFace(i) = faceMinus;
+                info.mode(i) = "normal_ray_minus";
+            end
+        elseif useFallback
+            [q,faceID,distance] = nearestPointOnMesh( ...
+                P(i,:),V,F,C,nCandidates);
+            Q(i,:) = q;
+            info.distance(i) = distance;
+            info.hitFace(i) = faceID;
+            info.mode(i) = "nearest_surface_fallback";
+        else
+            error(['No scan intersection found for datum point %d within ', ...
+                   'maxProjectionDistance = %.6g.'],i,maxDistance);
+        end
+    end
+end
+
+
+function [hit,tHit,faceID] = rayMeshNearestHit(origin,direction,V,F,maxDistance)
+% Vectorized Moller-Trumbore ray/triangle intersection.
+
+    direction = direction/norm(direction);
+
+    v0 = V(F(:,1),:);
+    v1 = V(F(:,2),:);
+    v2 = V(F(:,3),:);
+
+    e1 = v1-v0;
+    e2 = v2-v0;
+
+    d = repmat(direction,size(F,1),1);
+    h = cross(d,e2,2);
+    a = sum(e1.*h,2);
+
+    tolerance = 1e-12;
+    valid = abs(a)>tolerance;
+
+    invA = zeros(size(a));
+    invA(valid) = 1./a(valid);
+
+    s = origin-v0;
+    u = invA.*sum(s.*h,2);
+
+    q = cross(s,e1,2);
+    v = invA.*sum(d.*q,2);
+    rayT = invA.*sum(e2.*q,2);
+
+    baryTolerance = 1e-9;
+    valid = valid & ...
+            u>=-baryTolerance & ...
+            v>=-baryTolerance & ...
+            (u+v)<=1+baryTolerance & ...
+            rayT>=0 & rayT<=maxDistance;
+
+    IDs = find(valid);
+
+    if isempty(IDs)
+        hit = [NaN NaN NaN];
+        tHit = Inf;
+        faceID = NaN;
+        return;
+    end
+
+    [tHit,local] = min(rayT(IDs));
+    faceID = IDs(local);
+    hit = origin+tHit*direction;
+end
+
+
+% ========================================================================
+% Closest point on triangle mesh
+% ========================================================================
+function [bestPoint,bestFace,bestDistance] = nearestPointOnMesh( ...
+        point,V,F,faceCentroids,nCandidates)
+
+    d2c = sum((faceCentroids-point).^2,2);
+    nCandidates = min(nCandidates,numel(d2c));
+
+    if nCandidates<numel(d2c)
+        [~,candidateIDs] = mink(d2c,nCandidates);
+    else
+        candidateIDs = (1:numel(d2c)).';
+    end
+
+    bestD2 = Inf;
+    bestPoint = [NaN NaN NaN];
+    bestFace = NaN;
+
+    for j = 1:numel(candidateIDs)
+        faceID = candidateIDs(j);
+        tri = V(F(faceID,:),:);
+        q = closestPointTriangle(point,tri(1,:),tri(2,:),tri(3,:));
+        d2 = sum((q-point).^2);
+
+        if d2<bestD2
+            bestD2 = d2;
+            bestPoint = q;
+            bestFace = faceID;
+        end
+    end
+
+    bestDistance = sqrt(bestD2);
+end
+
+
+function q = closestPointTriangle(p,a,b,c)
+% Closest point on triangle from:
+% Christer Ericson, Real-Time Collision Detection, section 5.1.5.
+
+    ab = b-a;
+    ac = c-a;
+    ap = p-a;
+
+    d1 = dot(ab,ap);
+    d2 = dot(ac,ap);
+    if d1<=0 && d2<=0
+        q = a;
+        return;
+    end
+
+    bp = p-b;
+    d3 = dot(ab,bp);
+    d4 = dot(ac,bp);
+    if d3>=0 && d4<=d3
+        q = b;
+        return;
+    end
+
+    vc = d1*d4-d3*d2;
+    if vc<=0 && d1>=0 && d3<=0
+        v = d1/(d1-d3);
+        q = a+v*ab;
+        return;
+    end
+
+    cp = p-c;
+    d5 = dot(ab,cp);
+    d6 = dot(ac,cp);
+    if d6>=0 && d5<=d6
+        q = c;
+        return;
+    end
+
+    vb = d5*d2-d1*d6;
+    if vb<=0 && d2>=0 && d6<=0
+        w = d2/(d2-d6);
+        q = a+w*ac;
+        return;
+    end
+
+    va = d3*d6-d5*d4;
+    if va<=0 && (d4-d3)>=0 && (d5-d6)>=0
+        w = (d4-d3)/((d4-d3)+(d5-d6));
+        q = b+w*(c-b);
+        return;
+    end
+
+    denom = 1/(va+vb+vc);
+    v = vb*denom;
+    w = vc*denom;
+    q = a+ab*v+ac*w;
+end
+
+
+% ========================================================================
+% Plotting and utilities
+% ========================================================================
+function X = normalizeRows(X)
+    lengths = vecnorm(X,2,2);
+    if any(lengths<eps)
+        error("A zero-length normal vector was supplied or calculated.");
+    end
+    X = X./lengths;
+end
+
+
+function plotAlignment(TRcad,VscanAligned,Fscan,P,Q,N)
+    figure("Name","Vane datum alignment");
+    hold on;
+    axis equal;
+    grid on;
+    view(3);
+
+    trisurf(TRcad.ConnectivityList,TRcad.Points(:,1), ...
+        TRcad.Points(:,2),TRcad.Points(:,3), ...
+        "FaceAlpha",0.12,"EdgeColor","none");
+
+    trisurf(Fscan,VscanAligned(:,1),VscanAligned(:,2), ...
+        VscanAligned(:,3), ...
+        "FaceAlpha",0.20,"EdgeColor","none");
+
+    scatter3(P(:,1),P(:,2),P(:,3),55,"filled");
+    scatter3(Q(:,1),Q(:,2),Q(:,3),35,"filled");
+
+    scale = max(vecnorm(max(TRcad.Points)-min(TRcad.Points)))*0.03;
+    quiver3(P(:,1),P(:,2),P(:,3), ...
+        scale*N(:,1),scale*N(:,2),scale*N(:,3),0, ...
+        "LineWidth",1.2);
+
+    for i = 1:size(P,1)
+        plot3([P(i,1),Q(i,1)],[P(i,2),Q(i,2)], ...
+              [P(i,3),Q(i,3)],"k-");
+        text(P(i,1),P(i,2),P(i,3),sprintf("  %d",i));
+    end
+
+    xlabel("X");
+    ylabel("Y");
+    zlabel("Z");
+    legend("Nominal CAD","Aligned distorted mesh", ...
+           "CAD targets","Measured/projected points","CAD normals");
+    title("OB datum-target alignment");
+end
