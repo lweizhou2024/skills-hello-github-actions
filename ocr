@@ -1,400 +1,95 @@
-[cellText, cellImages, gridInfo] = ...
-    readNumericTableCells("cropped_table.png");
-
-disp(cellText)
-
-function [cellText, cellImages, gridInfo] = readNumericTableCells(imageFile)
-%READNUMERICTABLECELLS Split a cropped table into cells for OCR.
-%
-% Intended characters:
-%   digits 0-9
-%   decimal point .
-%   minus sign -
-%   plus/minus ±
-%   degree sign °
-%   minute signs ' or ′
-%
-% Assumptions:
-%   - The input image contains only the cropped table region.
-%   - Rows and columns are approximately equally spaced.
-%   - Grid lines are approximately horizontal and vertical.
-%
-% Outputs:
-%   cellText   - string array of OCR results
-%   cellImages - cell array containing processed cell images
-%   gridInfo   - detected row and column boundaries
-
-arguments
-    imageFile {mustBeTextScalar}
-end
-
-%% Read and convert to grayscale
-I = imread(imageFile);
+I = imread("cropped_table.png");
 
 if size(I,3) == 3
-    Igray = rgb2gray(I);
-else
-    Igray = I;
+    I = rgb2gray(I);
 end
 
-Igray = im2uint8(mat2gray(Igray));
+numRows = 4;
+numCols = 6;
 
-%% Optional deskew
-% This handles a small rotation of the table.
-Igray = deskewTableImage(Igray);
+[imageHeight, imageWidth] = size(I);
 
-%% Convert dark text and lines to foreground = 1
-BW = imbinarize(Igray, "adaptive", ...
-    "ForegroundPolarity", "dark", ...
-    "Sensitivity", 0.50);
+cellHeight = imageHeight / numRows;
+cellWidth  = imageWidth  / numCols;
 
-% Remove isolated noise
-BW = bwareaopen(BW, 3);
+result = strings(numRows,numCols);
+cellImages = cell(numRows,numCols);
 
-%% Detect horizontal and vertical grid lines
+for r = 1:numRows
+    for c = 1:numCols
 
-imageHeight = size(BW,1);
-imageWidth  = size(BW,2);
+        % Theoretical cell boundaries
+        x1 = round((c-1)*cellWidth) + 1;
+        x2 = round(c*cellWidth);
 
-% Line elements should be longer than any character stroke.
-horizontalLength = max(15, round(0.25 * imageWidth));
-verticalLength   = max(15, round(0.25 * imageHeight));
+        y1 = round((r-1)*cellHeight) + 1;
+        y2 = round(r*cellHeight);
 
-horizontalLines = imopen(BW, ...
-    strel("line", horizontalLength, 0));
+        % Crop inside the grid lines
+        marginX = round(0.06 * cellWidth);
+        marginY = round(0.10 * cellHeight);
 
-verticalLines = imopen(BW, ...
-    strel("line", verticalLength, 90));
+        x1 = x1 + marginX;
+        x2 = x2 - marginX;
+        y1 = y1 + marginY;
+        y2 = y2 - marginY;
 
-% Slightly strengthen detected lines
-horizontalLines = imdilate(horizontalLines, ...
-    strel("rectangle", [3 1]));
+        cellImage = I(y1:y2,x1:x2);
 
-verticalLines = imdilate(verticalLines, ...
-    strel("rectangle", [1 3]));
+        % Enlarge without converting to binary
+        cellImage = imresize(cellImage,4,"bicubic");
 
-%% Obtain projections of the detected lines
+        % Improve contrast gently
+        cellImage = imadjust(cellImage);
 
-horizontalProjection = sum(horizontalLines, 2);
-verticalProjection   = sum(verticalLines, 1);
+        % Add white padding
+        cellImage = padarray(cellImage,[30 30],255,"both");
 
-% Normalize projections
-horizontalProjection = horizontalProjection ./ ...
-    max(max(horizontalProjection), 1);
+        cellImages{r,c} = cellImage;
 
-verticalProjection = verticalProjection ./ ...
-    max(max(verticalProjection), 1);
+        ocrResult = ocr(cellImage, ...
+            TextLayout="word", ...
+            CharacterSet=['0123456789.-+±°', ...
+                          char(39), char(8242)]);
 
-%% Find line center positions
-
-rowLineCenters = findProjectionPeaks( ...
-    horizontalProjection, 0.20);
-
-colLineCenters = findProjectionPeaks( ...
-    verticalProjection(:), 0.20);
-
-% If outside borders are weak or missing, regularize using equal spacing.
-rowLineCenters = regularizeGridLines( ...
-    rowLineCenters, imageHeight);
-
-colLineCenters = regularizeGridLines( ...
-    colLineCenters, imageWidth);
-
-%% Validate
-if numel(rowLineCenters) < 2
-    error("Could not identify at least two horizontal boundaries.");
-end
-
-if numel(colLineCenters) < 2
-    error("Could not identify at least two vertical boundaries.");
-end
-
-numberOfRows = numel(rowLineCenters) - 1;
-numberOfCols = numel(colLineCenters) - 1;
-
-cellText = strings(numberOfRows, numberOfCols);
-cellImages = cell(numberOfRows, numberOfCols);
-
-%% Remove grid lines from the complete image
-allGridLines = horizontalLines | verticalLines;
-
-% Dilate slightly to remove thick or anti-aliased line edges.
-allGridLines = imdilate(allGridLines, ...
-    strel("disk", 1));
-
-BWwithoutLines = BW & ~allGridLines;
-
-%% Crop and OCR each cell
-
-for r = 1:numberOfRows
-    for c = 1:numberOfCols
-
-        topBoundary    = rowLineCenters(r);
-        bottomBoundary = rowLineCenters(r+1);
-
-        leftBoundary   = colLineCenters(c);
-        rightBoundary  = colLineCenters(c+1);
-
-        cellHeight = bottomBoundary - topBoundary;
-        cellWidth  = rightBoundary - leftBoundary;
-
-        % Crop slightly inside each cell to avoid border remnants.
-        verticalMargin   = max(1, round(0.08 * cellHeight));
-        horizontalMargin = max(1, round(0.05 * cellWidth));
-
-        y1 = max(1, topBoundary    + verticalMargin);
-        y2 = min(imageHeight, bottomBoundary - verticalMargin);
-
-        x1 = max(1, leftBoundary   + horizontalMargin);
-        x2 = min(imageWidth, rightBoundary  - horizontalMargin);
-
-        if y2 <= y1 || x2 <= x1
-            cellText(r,c) = "";
-            continue
-        end
-
-        cellBW = BWwithoutLines(y1:y2, x1:x2);
-
-        %% Remove tiny fragments
-        cellBW = bwareaopen(cellBW, 2);
-
-        %% Repair characters broken by grid-line removal
-        % A very small closing reconnects broken strokes.
-        cellBW = imclose(cellBW, strel("disk", 1));
-
-        %% Remove objects touching the cell edge
-        % Useful when a remaining grid fragment enters the crop.
-        cellBW = imclearborder(cellBW);
-
-        %% Crop tightly around characters
-        cellBW = cropToForeground(cellBW, 3);
-
-        %% Enlarge
-        upscaleFactor = 4;
-        cellBW = imresize(cellBW, upscaleFactor, "nearest");
-
-        %% Add white padding around characters
-        padding = 20;
-        paddedBW = padarray(cellBW, ...
-            [padding padding], 0, "both");
-
-        % OCR expects dark characters on a light image.
-        ocrImage = uint8(~paddedBW) * 255;
-
-        cellImages{r,c} = ocrImage;
-
-        %% MATLAB OCR
-        %
-        % CharacterSet is only a hint. Include both common minute symbols.
-        allowedCharacters = ...
-            ['0123456789.-+±°', char(39), char(8242)];
-
-        result = ocr(ocrImage, ...
-            "TextLayout", "word", ...
-            "CharacterSet", allowedCharacters);
-
-        rawText = string(result.Text);
-
-        %% Clean OCR output
-        cellText(r,c) = cleanAngleNumberText(rawText);
+        result(r,c) = cleanDrawingNumber(ocrResult.Text);
     end
 end
 
-%% Return diagnostic information
-gridInfo.rowLineCenters = rowLineCenters;
-gridInfo.colLineCenters = colLineCenters;
-gridInfo.horizontalProjection = horizontalProjection;
-gridInfo.verticalProjection = verticalProjection;
-gridInfo.binaryImage = BW;
-gridInfo.binaryWithoutLines = BWwithoutLines;
+function text = cleanDrawingNumber(text)
+
+text = strip(string(text));
+text = regexprep(text,"\s+","");
+
+% Normalize different prime/apostrophe symbols
+text = replace(text,["'", "’", "‘", "`"],"′");
+
+% Normalize degree variants
+text = replace(text,["º","˚"],"°");
+
+% Normalize minus variants
+text = replace(text,["−","–","—"],"-");
+
+% Common numeric OCR substitutions
+text = replace(text,["O","o"],"0");
+text = replace(text,["I","l","|"],"1");
+
+% Retain only expected characters
+text = regexprep(text,"[^0-9\.\-\+±°′]","");
 
 end
 
-function centers = findProjectionPeaks(projection, threshold)
-% Find centers of continuous projection regions above a threshold.
+%%%%%%%%%%%%%%%%%%%
 
-projection = projection(:);
+figure
 
-mask = projection >= threshold;
-
-changes = diff([false; mask; false]);
-
-starts = find(changes == 1);
-ends   = find(changes == -1) - 1;
-
-centers = zeros(numel(starts),1);
-
-for k = 1:numel(starts)
-    range = starts(k):ends(k);
-
-    weights = projection(range);
-
-    if sum(weights) > 0
-        centers(k) = round(sum(range(:) .* weights) / sum(weights));
-    else
-        centers(k) = round(mean(range));
+for r = 1:numRows
+    for c = 1:numCols
+        subplot(numRows,numCols,(r-1)*numCols+c)
+        imshow(cellImages{r,c})
+        title(result(r,c))
     end
 end
 
-centers = unique(centers);
-end
 
-function regularized = regularizeGridLines(detected, imageLength)
-% Regularize approximately equally spaced grid lines.
-%
-% Removes duplicate detections and fills in occasional missing lines.
-
-detected = sort(unique(round(detected(:))));
-
-if numel(detected) < 2
-    regularized = detected;
-    return
-end
-
-spacing = diff(detected);
-
-% Ignore very small gaps caused by detecting both edges of a thick line.
-typicalSpacing = median(spacing);
-
-keep = [true; spacing > 0.35 * typicalSpacing];
-detected = detected(keep);
-
-if numel(detected) < 2
-    regularized = detected;
-    return
-end
-
-spacing = diff(detected);
-typicalSpacing = median(spacing);
-
-% Fill gaps that are close to integer multiples of the normal cell size.
-regularized = detected(1);
-
-for k = 1:numel(detected)-1
-    gap = detected(k+1) - detected(k);
-
-    numberOfIntervals = max(1, round(gap / typicalSpacing));
-
-    newPositions = detected(k) + ...
-        (1:numberOfIntervals)' .* gap ./ numberOfIntervals;
-
-    regularized = [regularized; round(newPositions)]; %#ok<AGROW>
-end
-
-regularized = unique(regularized);
-
-% Add an inferred outer border if the first/last line is missing.
-if regularized(1) > 0.6 * typicalSpacing
-    regularized = [ ...
-        max(1, round(regularized(1) - typicalSpacing)); ...
-        regularized];
-end
-
-if imageLength - regularized(end) > 0.6 * typicalSpacing
-    regularized = [ ...
-        regularized; ...
-        min(imageLength, round(regularized(end) + typicalSpacing))];
-end
-
-regularized = unique(regularized);
-end
-
-function output = cropToForeground(BW, margin)
-% Crop a binary image around foreground pixels.
-
-[rowIndex, colIndex] = find(BW);
-
-if isempty(rowIndex)
-    output = false(20,20);
-    return
-end
-
-y1 = max(1, min(rowIndex) - margin);
-y2 = min(size(BW,1), max(rowIndex) + margin);
-
-x1 = max(1, min(colIndex) - margin);
-x2 = min(size(BW,2), max(colIndex) + margin);
-
-output = BW(y1:y2, x1:x2);
-end
-
-function text = cleanAngleNumberText(rawText)
-% Normalize OCR output for numeric and angular values.
-
-text = strip(string(rawText));
-
-% Remove spaces and line breaks.
-text = regexprep(text, "\s+", "");
-
-% Normalize common apostrophe and prime variants to Unicode prime.
-text = replace(text, ["’", "‘", "`", "'"], "′");
-
-% Normalize common degree-sign OCR mistakes.
-text = replace(text, ["º", "˚"], "°");
-
-% Normalize dash variants.
-text = replace(text, ["–", "—", "−"], "-");
-
-% Common OCR substitutions in numeric cells.
-text = replace(text, "O", "0");
-text = replace(text, "o", "0");
-
-% Sometimes I or l is recognized instead of 1.
-text = replace(text, "I", "1");
-text = replace(text, "l", "1");
-text = replace(text, "|", "1");
-
-% Remove characters outside the allowed set.
-text = regexprep(text, "[^0-9\.\-\+±°′]", "");
-
-% Prevent repeated degree or prime symbols.
-text = regexprep(text, "°+", "°");
-text = regexprep(text, "′+", "′");
-end
-
-function Iout = deskewTableImage(Iin)
-% Estimate and correct a small table rotation using the Hough transform.
-
-BW = imbinarize(Iin, "adaptive", ...
-    "ForegroundPolarity", "dark");
-
-edges = edge(BW, "canny");
-
-[H, theta, rho] = hough(edges);
-
-peaks = houghpeaks(H, 15, ...
-    "Threshold", ceil(0.25 * max(H(:))));
-
-lines = houghlines(edges, theta, rho, peaks, ...
-    "FillGap", 20, ...
-    "MinLength", round(0.25 * max(size(Iin))));
-
-angles = [];
-
-for k = 1:numel(lines)
-    p1 = lines(k).point1;
-    p2 = lines(k).point2;
-
-    angle = atan2d(p2(2)-p1(2), p2(1)-p1(1));
-
-    % Convert nearly vertical lines to equivalent horizontal deviation.
-    if angle > 45
-        angle = angle - 90;
-    elseif angle < -45
-        angle = angle + 90;
-    end
-
-    if abs(angle) <= 10
-        angles(end+1) = angle; %#ok<AGROW>
-    end
-end
-
-if isempty(angles)
-    Iout = Iin;
-else
-    rotationAngle = median(angles);
-    Iout = imrotate(Iin, rotationAngle, ...
-        "bicubic", "crop");
-end
-end
-
+disp(result)
