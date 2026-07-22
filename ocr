@@ -1,95 +1,102 @@
-I = imread("cropped_table.png");
+%% File names
+stlFile = 'model.stl';
+txtFile = 'points_vectors.txt';
 
-if size(I,3) == 3
-    I = rgb2gray(I);
-end
+%% Read STL file
+TR = stlread(stlFile);
 
-numRows = 4;
-numCols = 6;
-
-[imageHeight, imageWidth] = size(I);
-
-cellHeight = imageHeight / numRows;
-cellWidth  = imageWidth  / numCols;
-
-result = strings(numRows,numCols);
-cellImages = cell(numRows,numCols);
-
-for r = 1:numRows
-    for c = 1:numCols
-
-        % Theoretical cell boundaries
-        x1 = round((c-1)*cellWidth) + 1;
-        x2 = round(c*cellWidth);
-
-        y1 = round((r-1)*cellHeight) + 1;
-        y2 = round(r*cellHeight);
-
-        % Crop inside the grid lines
-        marginX = round(0.06 * cellWidth);
-        marginY = round(0.10 * cellHeight);
-
-        x1 = x1 + marginX;
-        x2 = x2 - marginX;
-        y1 = y1 + marginY;
-        y2 = y2 - marginY;
-
-        cellImage = I(y1:y2,x1:x2);
-
-        % Enlarge without converting to binary
-        cellImage = imresize(cellImage,4,"bicubic");
-
-        % Improve contrast gently
-        cellImage = imadjust(cellImage);
-
-        % Add white padding
-        cellImage = padarray(cellImage,[30 30],255,"both");
-
-        cellImages{r,c} = cellImage;
-
-        ocrResult = ocr(cellImage, ...
-            TextLayout="word", ...
-            CharacterSet=['0123456789.-+±°', ...
-                          char(39), char(8242)]);
-
-        result(r,c) = cleanDrawingNumber(ocrResult.Text);
+% Depending on the MATLAB version, stlread may return either a
+% triangulation object or a structure.
+if isa(TR, 'triangulation')
+    faces    = TR.ConnectivityList;
+    vertices = TR.Points;
+elseif isstruct(TR)
+    if isfield(TR, 'ConnectivityList')
+        faces = TR.ConnectivityList;
+    elseif isfield(TR, 'faces')
+        faces = TR.faces;
+    else
+        error('Could not find STL face connectivity.');
     end
-end
 
-function text = cleanDrawingNumber(text)
-
-text = strip(string(text));
-text = regexprep(text,"\s+","");
-
-% Normalize different prime/apostrophe symbols
-text = replace(text,["'", "’", "‘", "`"],"′");
-
-% Normalize degree variants
-text = replace(text,["º","˚"],"°");
-
-% Normalize minus variants
-text = replace(text,["−","–","—"],"-");
-
-% Common numeric OCR substitutions
-text = replace(text,["O","o"],"0");
-text = replace(text,["I","l","|"],"1");
-
-% Retain only expected characters
-text = regexprep(text,"[^0-9\.\-\+±°′]","");
-
-end
-
-%%%%%%%%%%%%%%%%%%%
-
-figure
-
-for r = 1:numRows
-    for c = 1:numCols
-        subplot(numRows,numCols,(r-1)*numCols+c)
-        imshow(cellImages{r,c})
-        title(result(r,c))
+    if isfield(TR, 'Points')
+        vertices = TR.Points;
+    elseif isfield(TR, 'vertices')
+        vertices = TR.vertices;
+    else
+        error('Could not find STL vertices.');
     end
+else
+    error('Unrecognized output from stlread.');
 end
 
+%% Read point and vector data
+% Expected format for each line:
+% x  y  z  ux  uy  uz
+data = readmatrix(txtFile);
 
-disp(result)
+% Remove empty or invalid lines
+data = data(all(isfinite(data(:,1:6)), 2), :);
+
+if size(data, 2) < 6
+    error('The text file must contain at least six numeric columns.');
+end
+
+points  = data(:, 1:3);
+vectors = data(:, 4:6);
+
+%% Normalize the vectors
+% This ensures that vectors are unit vectors even if the input contains
+% small numerical errors.
+vectorLength = vecnorm(vectors, 2, 2);
+
+validVector = vectorLength > eps;
+vectors(validVector, :) = ...
+    vectors(validVector, :) ./ vectorLength(validVector);
+
+%% Choose vector display length
+% Use approximately 5% of the STL model size.
+modelRange = max(vertices, [], 1) - min(vertices, [], 1);
+modelSize  = norm(modelRange);
+
+vectorScale = 0.05 * modelSize;
+
+%% Plot STL
+figure;
+hold on;
+
+patch( ...
+    'Faces', faces, ...
+    'Vertices', vertices, ...
+    'FaceColor', [0.75 0.80 0.85], ...
+    'EdgeColor', 'none', ...
+    'FaceAlpha', 0.7);
+
+%% Plot points
+scatter3( ...
+    points(:,1), points(:,2), points(:,3), ...
+    35, 'filled');
+
+%% Plot vectors
+quiver3( ...
+    points(:,1), points(:,2), points(:,3), ...
+    vectors(:,1), vectors(:,2), vectors(:,3), ...
+    vectorScale, ...
+    'LineWidth', 1.5, ...
+    'MaxHeadSize', 0.5);
+
+%% Plot settings
+axis equal;
+grid on;
+view(3);
+
+xlabel('X');
+ylabel('Y');
+zlabel('Z');
+
+title('STL Model with Points and Unit Vectors');
+
+camlight headlight;
+lighting gouraud;
+
+hold off;
