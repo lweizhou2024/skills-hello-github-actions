@@ -1,337 +1,370 @@
-function TRout = closeCurvedBlockSTL(curvedStl, outStl, yBack, tol)
-%CLOSECURVEDBLOCKSTL Close a finely meshed curved -Y face with five coarse planes.
+function TRout = closeCurvedBlockSTL_v3(curvedStl, outStl, yBack, mergeTol)
+%CLOSECURVEDBLOCKSTL_V3 Close a fine curved -Y surface with five coarse faces.
 %
-% Assumptions
-% ----------
-% 1. curvedStl contains ONLY the curved face.
-% 2. The curved face replaces the negative-Y face of an otherwise
-%    axis-aligned rectangular block.
-% 3. Its boundary lies on:
-%       x = xMin, x = xMax, z = zMin, z = zMax
-% 4. The opposite flat face is y = yBack, with yBack greater than all
-%    Y coordinates on the curved surface.
+% This version does NOT identify side chains by coordinate tolerance.
+% Instead, it:
+%   1) orders the complete free-boundary loop,
+%   2) finds the four corner vertices in the X-Z projection,
+%   3) splits the loop topologically at those corners,
+%   4) classifies the four complete chains as xMin/xMax/zMin/zMax,
+%   5) triangulates each entire side polygon without adding transition rows.
 %
-% Usage
-% -----
-% TR = closeCurvedBlockSTL("curved_face.stl", ...
-%                          "closed_block.stl", ...
-%                          25.0, 1e-7);
+% Assumptions:
+%   - Input STL contains only one connected curved face.
+%   - Curved face points generally toward -Y.
+%   - Its X-Z projection has a rectangular outer boundary.
+%   - The opposite face is y = yBack.
 %
-% The four side faces use only:
-%   - the existing fine boundary vertices of the curved face, and
-%   - the four corners on y = yBack.
-% No transition rows or extra near-boundary vertices are created.
+% Example:
+%   TR = closeCurvedBlockSTL_v3("curved_face.stl", ...
+%        "closed_block.stl", 25.0, 1e-7);
 
     arguments
         curvedStl (1,1) string
         outStl    (1,1) string
         yBack     (1,1) double
-        tol       (1,1) double = 1e-7
+        mergeTol  (1,1) double = 1e-7
     end
 
-    %% Read the fine curved surface
+    %% Read curved surface
     TRc = stlread(curvedStl);
     Vc = TRc.Points;
     Fc = TRc.ConnectivityList;
 
-    if yBack <= max(Vc(:,2)) + tol
-        error("yBack must be greater than every Y coordinate of the curved surface.");
+    if yBack <= max(Vc(:,2)) + mergeTol
+        error("yBack must be greater than every Y coordinate on the curved face.");
     end
 
-    %% Make curved-face normals point generally toward -Y
-    Fc = orientTriangles(Vc, Fc, [0 -1 0]);
+    Fc = orientTriangles(Vc,Fc,[0 -1 0]);
 
-    %% Find and order the single outside boundary loop
-    boundaryEdges = freeBoundary(triangulation(Fc, Vc));
-    loop = orderSingleBoundaryLoop(boundaryEdges);
-    Vloop = Vc(loop,:);
+    %% Extract and order the one free-boundary loop
+    Efree = freeBoundary(triangulation(Fc,Vc));
+    loop = orderSingleBoundaryLoop(Efree);
+    Ploop = Vc(loop,:);
 
-    xMin = min(Vloop(:,1));
-    xMax = max(Vloop(:,1));
-    zMin = min(Vloop(:,3));
-    zMax = max(Vloop(:,3));
+    fprintf("Total curved-face boundary points: %d\n",numel(loop));
 
-    scale = max([xMax-xMin, yBack-min(Vc(:,2)), zMax-zMin, 1]);
-    planeTol = max(tol, 1e-9*scale);
+    %% Split complete loop into four chains using four geometric corners
+    chains = splitLoopAtXZCorners(Vc,loop);
 
-    %% Start with the curved surface
+    fprintf("xMin chain points: %d\n",numel(chains.xMin));
+    fprintf("xMax chain points: %d\n",numel(chains.xMax));
+    fprintf("zMin chain points: %d\n",numel(chains.zMin));
+    fprintf("zMax chain points: %d\n",numel(chains.zMax));
+
+    %% Start output with curved face
     Vall = Vc;
     Fall = Fc;
 
-    %% Add the four axis-aligned side faces
-    % x = xMin, outward normal -X
-    [Vf,Ff] = makeSideFace(Vc, loop, ...
-        abs(Vloop(:,1)-xMin) <= planeTol, yBack, 1, [-1 0 0]);
+    %% Build four complete side faces
+    [Vf,Ff] = makeSideFromChain(Vc,chains.xMin,yBack,1,[-1 0 0]);
     [Vall,Fall] = appendMesh(Vall,Fall,Vf,Ff);
 
-    % x = xMax, outward normal +X
-    [Vf,Ff] = makeSideFace(Vc, loop, ...
-        abs(Vloop(:,1)-xMax) <= planeTol, yBack, 1, [1 0 0]);
+    [Vf,Ff] = makeSideFromChain(Vc,chains.xMax,yBack,1,[ 1 0 0]);
     [Vall,Fall] = appendMesh(Vall,Fall,Vf,Ff);
 
-    % z = zMin, outward normal -Z
-    [Vf,Ff] = makeSideFace(Vc, loop, ...
-        abs(Vloop(:,3)-zMin) <= planeTol, yBack, 3, [0 0 -1]);
+    [Vf,Ff] = makeSideFromChain(Vc,chains.zMin,yBack,3,[0 0 -1]);
     [Vall,Fall] = appendMesh(Vall,Fall,Vf,Ff);
 
-    % z = zMax, outward normal +Z
-    [Vf,Ff] = makeSideFace(Vc, loop, ...
-        abs(Vloop(:,3)-zMax) <= planeTol, yBack, 3, [0 0 1]);
+    [Vf,Ff] = makeSideFromChain(Vc,chains.zMax,yBack,3,[0 0  1]);
     [Vall,Fall] = appendMesh(Vall,Fall,Vf,Ff);
 
-    %% Add the coarse +Y back face using only two triangles
+    %% Back face: use the four actual chain corner coordinates
+    xMin = min(Ploop(:,1));
+    xMax = max(Ploop(:,1));
+    zMin = min(Ploop(:,3));
+    zMax = max(Ploop(:,3));
+
     Vback = [xMin yBack zMin;
              xMax yBack zMin;
              xMax yBack zMax;
              xMin yBack zMax];
 
-    Fback = [1 2 3;
-             1 3 4];
-    Fback = orientTriangles(Vback, Fback, [0 1 0]);
-
+    Fback = orientTriangles(Vback,[1 2 3; 1 3 4],[0 1 0]);
     [Vall,Fall] = appendMesh(Vall,Fall,Vback,Fback);
 
-    %% Merge coincident vertices from independently constructed faces
-    [Vout,~,map] = uniquetol(Vall, tol, ...
-        "ByRows", true, "DataScale", 1);
+    %% Merge coincident vertices
+    [Vout,~,map] = uniquetol(Vall,mergeTol,"ByRows",true,"DataScale",1);
     Fout = map(Fall);
 
-    % Remove any triangles collapsed by vertex merging.
     keep = Fout(:,1) ~= Fout(:,2) & ...
            Fout(:,2) ~= Fout(:,3) & ...
            Fout(:,3) ~= Fout(:,1);
     Fout = Fout(keep,:);
 
-    %% Remove duplicate triangles, independent of orientation
-    Fs = sort(Fout,2);
-    [~,ia] = unique(Fs,"rows","stable");
+    [~,ia] = unique(sort(Fout,2),"rows","stable");
     Fout = Fout(ia,:);
 
     TRout = triangulation(Fout,Vout);
 
-    %% Watertightness check: every undirected edge must occur exactly twice
-    E = [Fout(:,[1 2]);
-         Fout(:,[2 3]);
-         Fout(:,[3 1])];
+    %% Check topology
+    E = [Fout(:,[1 2]); Fout(:,[2 3]); Fout(:,[3 1])];
     E = sort(E,2);
     [~,~,ie] = unique(E,"rows");
-    edgeUse = accumarray(ie,1);
+    useCount = accumarray(ie,1);
 
-    nOpen = nnz(edgeUse == 1);
-    nNonmanifold = nnz(edgeUse > 2);
+    nOpen = nnz(useCount == 1);
+    nNonmanifold = nnz(useCount > 2);
 
-    fprintf("Output vertices:  %d\n",size(Vout,1));
-    fprintf("Output triangles: %d\n",size(Fout,1));
-    fprintf("Open edges:       %d\n",nOpen);
-    fprintf("Nonmanifold edges:%d\n",nNonmanifold);
+    fprintf("Output vertices:       %d\n",size(Vout,1));
+    fprintf("Output triangles:      %d\n",size(Fout,1));
+    fprintf("Open edges:            %d\n",nOpen);
+    fprintf("Nonmanifold edges:     %d\n",nNonmanifold);
 
     if nOpen ~= 0 || nNonmanifold ~= 0
-        warning("The result is not watertight. Check the curved-face boundary and tolerance.");
+        warning("Output is not watertight. See diagnostic plot and chain counts.");
     end
 
-    %% Write binary STL
-    stlwrite(TRout,outStl);   % MATLAB writes binary STL by default
+    stlwrite(TRout,outStl);
 
-    %% Plot for inspection
-    figure;
-    trisurf(TRout, ...
-        "FaceColor",[0.80 0.85 0.90], ...
-        "EdgeColor",[0.20 0.20 0.20]);
-    axis equal;
+    %% Diagnostic plots
+    figure("Name","Boundary-chain diagnosis");
+    hold on;
+    plot3(Vc(chains.xMin,1),Vc(chains.xMin,2),Vc(chains.xMin,3),"o-");
+    plot3(Vc(chains.xMax,1),Vc(chains.xMax,2),Vc(chains.xMax,3),"o-");
+    plot3(Vc(chains.zMin,1),Vc(chains.zMin,2),Vc(chains.zMin,3),"o-");
+    plot3(Vc(chains.zMax,1),Vc(chains.zMax,2),Vc(chains.zMax,3),"o-");
+    axis equal; grid on;
+    xlabel("X"); ylabel("Y"); zlabel("Z");
+    legend("xMin","xMax","zMin","zMax","Location","best");
+    title("Complete boundary chains used for side faces");
+    view(3);
+
+    figure("Name","Closed STL");
+    trisurf(TRout,"FaceColor",[0.8 0.85 0.9],"EdgeColor",[0.2 0.2 0.2]);
+    axis equal; grid on;
     xlabel("X"); ylabel("Y"); zlabel("Z");
     title("Closed STL surface mesh");
     view(3);
 end
 
 
-function [Vface,Fface] = makeSideFace(Vc, loop, mask, yBack, constantAxis, desiredNormal)
-% Extract one contiguous curved-boundary chain and connect it directly to
-% the two corresponding back-face corners.
-%
-% This routine deliberately avoids POLYSHAPE and DELAUNAY triangulation.
-% It constructs a fan using every curved-boundary vertex, so a boundary
-% whose Y coordinate varies while X or Z remains constant cannot be
-% simplified down to only a few triangles.
+function chains = splitLoopAtXZCorners(V,loop)
+% Find four rectangle corners in normalized X-Z projection, then split the
+% ordered loop at those indices. No coordinate-equality mask is used.
 
-    run = longestCircularRun(mask);
+    P = V(loop,:);
+    x = P(:,1);
+    z = P(:,3);
 
-    if numel(run) < 2
-        error("Could not identify a side-boundary chain.");
+    x0 = min(x); x1 = max(x);
+    z0 = min(z); z1 = max(z);
+
+    dx = x1-x0;
+    dz = z1-z0;
+    if dx <= 0 || dz <= 0
+        error("Boundary has zero X or Z extent.");
     end
 
-    chainIds = loop(run);
-    chain = Vc(chainIds,:);
+    xn = (x-x0)/dx;
+    zn = (z-z0)/dz;
 
-    % Remove only repeated consecutive 3-D points. Do not simplify
-    % collinear points because all curved-face boundary vertices must be
-    % retained in the watertight STL.
-    localScale = max(max(abs(chain),[],"all"),1);
-    d = vecnorm(diff(chain,1,1),2,2);
-    chain = chain([true; d > 10*eps(localScale)],:);
+    targets = [0 0; 1 0; 1 1; 0 1];
+    idx = zeros(4,1);
 
-    if size(chain,1) < 2
-        error("The extracted side boundary has fewer than two distinct points.");
+    for k = 1:4
+        d2 = (xn-targets(k,1)).^2 + (zn-targets(k,2)).^2;
+        [~,idx(k)] = min(d2);
     end
 
-    % Enforce the nominal constant coordinate only within numerical noise.
-    % The Y coordinate is intentionally allowed to vary along the chain.
-    switch constantAxis
-        case 1
-            chain(:,1) = mean(chain(:,1));
-        case 3
-            chain(:,3) = mean(chain(:,3));
-        otherwise
-            error("constantAxis must be 1 or 3.");
+    if numel(unique(idx)) ~= 4
+        error(["Could not identify four distinct X-Z corner vertices. " ...
+               "The input may include extra faces, multiple boundary loops, " ...
+               "or its X-Z outline may not be rectangular."]);
     end
 
-    pStart = chain(1,:);
-    pEnd   = chain(end,:);
+    % Split loop into four cyclic paths between consecutive corner indices.
+    idxSorted = sort(idx);
+    C = cell(4,1);
+    n = numel(loop);
 
-    qEnd = pEnd;
-    qEnd(2) = yBack;
-
-    qStart = pStart;
-    qStart(2) = yBack;
-
-    % Vertices are ordered as:
-    %   curved chain p1 ... pn, back corner at pn, back corner at p1.
-    Vface = [chain;
-             qEnd;
-             qStart];
-
-    n = size(chain,1);
-    iQEnd   = n + 1;
-    iQStart = n + 2;
-
-    % Fan from qStart. This creates one triangle for every consecutive pair
-    % of curved-boundary points, plus one triangle along the back edge.
-    % Therefore n curved-edge points produce exactly n side triangles.
-    Fface = zeros(n,3);
-    for i = 1:n-1
-        Fface(i,:) = [iQStart, i, i+1];
+    for k = 1:4
+        i1 = idxSorted(k);
+        if k < 4
+            i2 = idxSorted(k+1);
+            pos = i1:i2;
+        else
+            i2 = idxSorted(1);
+            pos = [i1:n, 1:i2];
+        end
+        C{k} = loop(pos(:));
     end
-    Fface(n,:) = [iQStart, n, iQEnd];
 
-    Fface = orientTriangles(Vface,Fface,desiredNormal);
+    % Classify each whole chain by which X-Z coordinate varies least.
+    meanX = zeros(4,1); meanZ = zeros(4,1);
+    rangeX = zeros(4,1); rangeZ = zeros(4,1);
 
-    fprintf("Side normal [%g %g %g]: boundary points = %d, triangles = %d\n", ...
-        desiredNormal(1),desiredNormal(2),desiredNormal(3),n,size(Fface,1));
+    for k = 1:4
+        Q = V(C{k},:);
+        meanX(k) = mean(Q(:,1));
+        meanZ(k) = mean(Q(:,3));
+        rangeX(k) = (max(Q(:,1))-min(Q(:,1)))/dx;
+        rangeZ(k) = (max(Q(:,3))-min(Q(:,3)))/dz;
+    end
+
+    xCandidates = find(rangeX <= rangeZ);
+    zCandidates = find(rangeZ < rangeX);
+
+    % Normally exactly two of each. Fall back to relative scores if needed.
+    if numel(xCandidates) ~= 2 || numel(zCandidates) ~= 2
+        score = rangeX-rangeZ;
+        [~,ord] = sort(score);
+        xCandidates = ord(1:2);      % X varies less
+        zCandidates = ord(3:4);      % Z varies less
+    end
+
+    [~,a] = min(meanX(xCandidates));
+    [~,b] = max(meanX(xCandidates));
+    iXMin = xCandidates(a);
+    iXMax = xCandidates(b);
+
+    [~,a] = min(meanZ(zCandidates));
+    [~,b] = max(meanZ(zCandidates));
+    iZMin = zCandidates(a);
+    iZMax = zCandidates(b);
+
+    chains.xMin = C{iXMin};
+    chains.xMax = C{iXMax};
+    chains.zMin = C{iZMin};
+    chains.zMax = C{iZMax};
 end
 
 
-function run = longestCircularRun(mask)
-% Return indices of the longest TRUE run in a circular logical vector.
+function [Vface,Fface] = makeSideFromChain(V,chainIds,yBack,constantAxis,normal)
+% Form a planar polygon from one COMPLETE curved-face boundary chain and
+% the two matching back corners, then triangulate it with constrained edges.
 
-    mask = mask(:);
-    n = numel(mask);
+    chain = V(chainIds,:);
 
-    if all(mask)
-        run = (1:n).';
-        return
+    % Remove only exact/nearly exact consecutive duplicates.
+    s = max(max(abs(chain),[],"all"),1);
+    keep = [true; vecnorm(diff(chain,1,1),2,2) > 20*eps(s)];
+    chain = chain(keep,:);
+
+    if size(chain,1) < 2
+        error("A side chain has fewer than two distinct points.");
     end
 
-    doubled = [mask; mask];
-    bestStart = [];
-    bestLength = 0;
-    i = 1;
-
-    while i <= 2*n
-        if doubled(i)
-            j = i;
-            while j <= 2*n && doubled(j)
-                j = j + 1;
-            end
-            len = j-i;
-
-            if len > bestLength && i <= n
-                bestStart = i;
-                bestLength = min(len,n);
-            end
-            i = j;
-        else
-            i = i+1;
-        end
+    % Snap only the nominal constant coordinate to its mean. Y remains free.
+    if constantAxis == 1
+        chain(:,1) = mean(chain(:,1));
+        uv = chain(:,[2 3]);          % Y-Z plane
+    elseif constantAxis == 3
+        chain(:,3) = mean(chain(:,3));
+        uv = chain(:,[1 2]);          % X-Y plane
+    else
+        error("constantAxis must be 1 or 3.");
     end
 
-    if isempty(bestStart)
-        run = zeros(0,1);
-        return
+    qEnd = chain(end,:);   qEnd(2) = yBack;
+    qStart = chain(1,:);   qStart(2) = yBack;
+
+    poly3 = [chain; qEnd; qStart];
+
+    if constantAxis == 1
+        poly2 = poly3(:,[2 3]);
+    else
+        poly2 = poly3(:,[1 2]);
     end
 
-    run = mod((bestStart:bestStart+bestLength-1)-1,n)+1;
-    run = run(:);
+    % Ensure the polygon is not self-intersecting because of chain direction.
+    if polygonSignedArea(poly2) < 0
+        poly3 = flipud(poly3);
+        poly2 = flipud(poly2);
+    end
+
+    n = size(poly2,1);
+    constraints = [(1:n-1)' (2:n)'; n 1];
+    DT = delaunayTriangulation(poly2,constraints);
+
+    Fcand = DT.ConnectivityList;
+    Pcand = DT.Points;
+
+    ctr = (Pcand(Fcand(:,1),:) + Pcand(Fcand(:,2),:) + Pcand(Fcand(:,3),:))/3;
+    [in,on] = inpolygon(ctr(:,1),ctr(:,2),poly2(:,1),poly2(:,2));
+    F2 = Fcand(in|on,:);
+
+    % DT should use exactly the supplied polygon vertices; guard against any
+    % unexpected extra points by mapping from the 2-D plane back to 3-D.
+    Vface = zeros(size(Pcand,1),3);
+    if constantAxis == 1
+        Vface(:,1) = mean(chain(:,1));
+        Vface(:,2) = Pcand(:,1);
+        Vface(:,3) = Pcand(:,2);
+    else
+        Vface(:,1) = Pcand(:,1);
+        Vface(:,2) = Pcand(:,2);
+        Vface(:,3) = mean(chain(:,3));
+    end
+
+    Fface = orientTriangles(Vface,F2,normal);
+
+    fprintf("Side [%g %g %g]: %d chain points, %d triangles\n", ...
+        normal(1),normal(2),normal(3),size(chain,1),size(Fface,1));
+end
+
+
+function A = polygonSignedArea(P)
+    x = P(:,1); y = P(:,2);
+    A = 0.5*sum(x.*circshift(y,-1)-y.*circshift(x,-1));
 end
 
 
 function loop = orderSingleBoundaryLoop(E)
-% Order an undirected edge list representing one closed loop.
-%
-% Returns vertex IDs once each; the first vertex is not repeated at the end.
-
     if isempty(E)
         error("The curved surface has no free boundary.");
     end
 
     G = graph(E(:,1),E(:,2));
+    active = find(degree(G)>0);
 
-    active = find(degree(G) > 0);
-    if any(degree(G,active) ~= 2)
-        error("Boundary is not one or more simple closed loops.");
+    if any(degree(G,active)~=2)
+        error("The free boundary is not a simple closed loop.");
     end
 
-    bins = conncomp(G);
-    activeBins = unique(bins(active));
-
-    if numel(activeBins) ~= 1
-        error("Expected one curved-face boundary loop, but found %d.",numel(activeBins));
+    comp = conncomp(G);
+    if numel(unique(comp(active)))~=1
+        error("Expected exactly one free-boundary loop.");
     end
 
-    start = active(1);
     loop = zeros(numel(active),1);
-    loop(1) = start;
-
+    loop(1) = active(1);
     prev = 0;
-    curr = start;
+    curr = loop(1);
 
     for k = 2:numel(active)
-        nbr = neighbors(G,curr);
-
-        if prev == 0
-            next = nbr(1);
+        nb = neighbors(G,curr);
+        if prev==0
+            nxt = nb(1);
         else
-            next = nbr(nbr ~= prev);
-            if isempty(next)
+            nxt = nb(nb~=prev);
+            if isempty(nxt)
                 error("Boundary traversal failed.");
             end
-            next = next(1);
+            nxt = nxt(1);
         end
-
-        loop(k) = next;
-        prev = curr;
-        curr = next;
+        loop(k)=nxt;
+        prev=curr;
+        curr=nxt;
     end
 
-    if ~ismember(start,neighbors(G,curr))
+    if ~ismember(loop(1),neighbors(G,curr))
         error("Boundary traversal did not close.");
     end
 end
 
 
 function F = orientTriangles(V,F,desiredNormal)
-% Flip triangles so their normals have a positive dot product with
-% desiredNormal.
-
-    e1 = V(F(:,2),:) - V(F(:,1),:);
-    e2 = V(F(:,3),:) - V(F(:,1),:);
+    e1 = V(F(:,2),:)-V(F(:,1),:);
+    e2 = V(F(:,3),:)-V(F(:,1),:);
     N = cross(e1,e2,2);
-
-    flip = N*desiredNormal(:) < 0;
-    F(flip,[2 3]) = F(flip,[3 2]);
+    flip = N*desiredNormal(:)<0;
+    F(flip,[2 3])=F(flip,[3 2]);
 end
 
 
 function [Vall,Fall] = appendMesh(Vall,Fall,Vnew,Fnew)
-    offset = size(Vall,1);
-    Vall = [Vall; Vnew];
-    Fall = [Fall; Fnew + offset];
+    off = size(Vall,1);
+    Vall = [Vall;Vnew];
+    Fall = [Fall;Fnew+off];
 end
