@@ -185,13 +185,26 @@ function [Vface,Fface] = makeSideFace(Vc, loop, mask, yBack, constantAxis, desir
             error("constantAxis must be 1 or 3.");
     end
 
-    pg = polyshape(polygon2(:,1),polygon2(:,2),"Simplify",false);
+% Triangulate while preserving every polygon boundary vertex.
+nPoly = size(polygon2,1);
 
-    if isempty(pg.Vertices)
-        error("Side polygon is invalid. Check boundary ordering and tolerance.");
-    end
+constraints = [(1:nPoly-1).' (2:nPoly).';
+               nPoly          1];
 
-    [F2,P2] = triangulation(pg);
+dt = delaunayTriangulation(polygon2,constraints);
+
+Fcandidate = dt.ConnectivityList;
+P2 = dt.Points;
+
+% Keep only triangles inside the side-face polygon.
+centers = (P2(Fcandidate(:,1),:) + ...
+           P2(Fcandidate(:,2),:) + ...
+           P2(Fcandidate(:,3),:)) / 3;
+
+[in,on] = inpolygon(centers(:,1),centers(:,2), ...
+                    polygon2(:,1),polygon2(:,2));
+
+F2 = Fcandidate(in | on,:);
 
     % Map triangulated 2-D vertices back to the 3-D plane.
     Vface = zeros(size(P2,1),3);
