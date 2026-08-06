@@ -1,249 +1,428 @@
-[corners, info] = extractTangCorners(stl, 1e-5);
-patch('Faces',stl.faces, ...
-      'Vertices',stl.vertices, ...
-      'FaceColor',[0.8 0.8 0.8], ...
-      'EdgeColor','none');
-
-axis equal
-hold on
-scatter3(corners(:,1),corners(:,2),corners(:,3),80,'r','filled');
-
-for k = 1:8
-    text(corners(k,1),corners(k,2),corners(k,3), ...
-        sprintf('  %d',k),'Color','b','FontSize',12);
-end
-
-camlight
-lighting gouraud
-
-
-function [corners, info] = extractTangCorners(stlData, tol)
-%EXTRACTTANGCORNERS Find and order the 8 corners of rectangular tang end faces.
+function [corners, info] = extractTangCorners_v2(stlData, tol, angleDeg)
+%EXTRACTTANGCORNERS_V2 Extract corners from both rectangular tang end faces.
 %
-% [CORNERS,INFO] = extractTangCorners(STLDATA)
-% [CORNERS,INFO] = extractTangCorners(STLDATA,TOL)
+% [corners,info] = extractTangCorners_v2(stlData)
+% [corners,info] = extractTangCorners_v2(stlData,tol,angleDeg)
 %
-% STLDATA can be either:
-%   1) a structure with fields .vertices and .faces (case-insensitive), or
-%   2) a triangulation object.
+% stlData can be:
+%   1. A structure containing .faces and .vertices
+%   2. A MATLAB triangulation object
 %
-% CORNERS is 8-by-3. Rows 1:4 belong to the end having the larger mean z;
-% rows 5:8 belong to the other end. Within each end the order is:
+% corners is an 8-by-3 array ordered as:
+%
+% Higher-z tang end:
 %   1  larger x, larger y
 %   2  larger x, smaller y
 %   3  smaller x, larger y
 %   4  smaller x, smaller y
 %
-% The method merges duplicated STL vertices, groups neighboring coplanar
-% triangles, reduces each planar boundary to its true polygon corners, and
-% selects the two rectangular patches at the z ends. The end planes may be
-% inclined relative to the z axis.
+% Lower-z tang end:
+%   5  larger x, larger y
+%   6  larger x, smaller y
+%   7  smaller x, larger y
+%   8  smaller x, smaller y
 %
-% TOL is a coordinate tolerance. Its default is 1e-7 times the STL bounding
-% box diagonal (with a small absolute lower bound).
+% The search starts from the global maximum- and minimum-z vertices.
+% Therefore, a rectangular shoulder face should not be selected merely
+% because it is more planar than the tang end.
+%
+% tol:
+%   Coordinate tolerance used to merge duplicated STL vertices.
+%
+% angleDeg:
+%   Maximum normal-angle variation allowed while growing the end cap.
+%   Default is 8 degrees.
 
     [V,F] = getMeshArrays(stlData);
-    V = double(V); F = double(F);
+
+    V = double(V);
+    F = double(F);
 
     if size(V,2) ~= 3 || size(F,2) ~= 3
-        error('Vertices and faces must both have three columns.');
+        error('vertices and faces must each have three columns.');
     end
 
-    boxDiag = norm(max(V,[],1) - min(V,[],1));
+    modelSize = norm(max(V,[],1) - min(V,[],1));
+
     if nargin < 2 || isempty(tol)
-        tol = max(1e-12, 1e-7*boxDiag);
+        tol = max(1e-12,1e-7*modelSize);
     end
 
-    % Collapse duplicated STL vertices by tolerance-sized coordinate bins.
-    Q = round(V/tol);
-    [~,~,oldToNew] = unique(Q,'rows');
-    nUnique = max(oldToNew);
-    Vu = zeros(nUnique,3);
-    counts = accumarray(oldToNew,1);
+    if nargin < 3 || isempty(angleDeg)
+        angleDeg = 8;
+    end
+
+    %% Merge geometrically duplicated STL vertices
+
+    key = round(V/tol);
+
+    [~,~,map] = unique(key,'rows');
+
+    numberUnique = max(map);
+    count = accumarray(map,1);
+
+    Vu = zeros(numberUnique,3);
+
     for j = 1:3
-        Vu(:,j) = accumarray(oldToNew,V(:,j))./counts;
+        Vu(:,j) = accumarray(map,V(:,j))./count;
     end
-    Fu = reshape(oldToNew(F(:)),size(F));
 
-    % Remove zero-area triangles, if any.
-    e1 = Vu(Fu(:,2),:) - Vu(Fu(:,1),:);
-    e2 = Vu(Fu(:,3),:) - Vu(Fu(:,1),:);
-    cr = cross(e1,e2,2);
-    twiceArea = sqrt(sum(cr.^2,2));
-    keep = twiceArea > max(tol^2,eps);
-    Fu = Fu(keep,:); cr = cr(keep,:); twiceArea = twiceArea(keep);
-    N = cr./twiceArea(:,[1 1 1]);
+    Fu = reshape(map(F(:)),size(F));
 
-    % Connect triangles sharing an edge, but only if they are coplanar.
-    nt = size(Fu,1);
-    edges = [sort(Fu(:,[1 2]),2); sort(Fu(:,[2 3]),2); ...
-             sort(Fu(:,[3 1]),2)];
-    triId = repmat((1:nt)',3,1);
-    [edgesSorted,ord] = sortrows(edges,[1 2]);
-    triSorted = triId(ord);
-    parent = (1:nt)';
-    angleTol = 1e-6;                 % based on 1-abs(dot(n1,n2))
-    planeTol = 5*tol;
-    k = 1;
-    while k <= size(edgesSorted,1)
-        q = k;
-        while q < size(edgesSorted,1) && ...
-              all(edgesSorted(q+1,:) == edgesSorted(k,:))
-            q = q + 1;
-        end
-        if q > k
-            ids = unique(triSorted(k:q));
-            for a = 1:numel(ids)-1
-                for b = a+1:numel(ids)
-                    i = ids(a); j = ids(b);
-                    parallel = 1-abs(dot(N(i,:),N(j,:))) <= angleTol;
-                    d = abs(dot(N(i,:),Vu(Fu(j,1),:)-Vu(Fu(i,1),:)));
-                    if parallel && d <= planeTol
-                        parent = unionSets(parent,i,j);
-                    end
-                end
+    %% Calculate triangle normals
+
+    edge1 = Vu(Fu(:,2),:) - Vu(Fu(:,1),:);
+    edge2 = Vu(Fu(:,3),:) - Vu(Fu(:,1),:);
+
+    normalVector = cross(edge1,edge2,2);
+    normalMagnitude = sqrt(sum(normalVector.^2,2));
+
+    goodTriangle = normalMagnitude > max(tol^2,eps);
+
+    Fu = Fu(goodTriangle,:);
+    normalVector = normalVector(goodTriangle,:);
+    normalMagnitude = normalMagnitude(goodTriangle);
+
+    N = normalVector./normalMagnitude(:,[1 1 1]);
+
+    %% Create triangle adjacency information
+
+    neighbors = triangleNeighbors(Fu);
+
+    %% Find the two tang end caps
+
+    [highCorners,highInfo] = growEndCap( ...
+        Vu,Fu,N,neighbors,+1,tol,modelSize,angleDeg);
+
+    [lowCorners,lowInfo] = growEndCap( ...
+        Vu,Fu,N,neighbors,-1,tol,modelSize,angleDeg);
+
+    %% Put corners into requested order
+
+    highCorners = orderXY(highCorners);
+    lowCorners  = orderXY(lowCorners);
+
+    corners = [highCorners;lowCorners];
+
+    info.highEnd = highInfo;
+    info.lowEnd = lowInfo;
+    info.tolerance = tol;
+    info.angleDeg = angleDeg;
+end
+
+
+function [C,out] = growEndCap( ...
+    V,F,N,neighbors,zSign,tol,modelSize,angleDeg)
+% Start from one global z extremity and grow the connected end cap.
+
+    %% Find vertices at the requested z extremity
+
+    if zSign > 0
+        zExtreme = max(V(:,3));
+
+        extremeVertices = find( ...
+            V(:,3) >= zExtreme - 5*tol);
+    else
+        zExtreme = min(V(:,3));
+
+        extremeVertices = find( ...
+            V(:,3) <= zExtreme + 5*tol);
+    end
+
+    %% Find all triangles touching those vertices
+
+    touchingExtreme = ismember(F,extremeVertices);
+    touchingTriangles = find(any(touchingExtreme,2));
+
+    if isempty(touchingTriangles)
+        error(['No triangle was found at one z extremity. ', ...
+               'Try increasing tol.']);
+    end
+
+    %% Select the end-cap seed triangle
+
+    % At an end corner, both end-cap and tang-side triangles can occur.
+    % The end-cap triangle is assumed to have the largest absolute
+    % z component of its normal.
+
+    [largestNormalZ,index] = ...
+        max(abs(N(touchingTriangles,3)));
+
+    seedTriangle = touchingTriangles(index);
+
+    if largestNormalZ < 0.10
+        error(['The triangles at the z extremity have almost no ', ...
+               'z-normal component. The tang end may be nearly ', ...
+               'parallel to the stacking axis.']);
+    end
+
+    referenceNormal = N(seedTriangle,:);
+    referencePoint = V(F(seedTriangle,1),:);
+
+    %% Grow the connected end-cap surface
+
+    cosineLimit = cos(angleDeg*pi/180);
+
+    % This prevents the surface growth from crossing a sharp shoulder.
+    planeTolerance = max(50*tol,1e-4*modelSize);
+
+    used = false(size(F,1),1);
+    used(seedTriangle) = true;
+
+    queue = seedTriangle;
+    queuePosition = 1;
+
+    while queuePosition <= numel(queue)
+
+        currentTriangle = queue(queuePosition);
+        queuePosition = queuePosition + 1;
+
+        adjacentTriangles = neighbors{currentTriangle};
+
+        for j = 1:numel(adjacentTriangles)
+
+            candidateTriangle = adjacentTriangles(j);
+
+            if used(candidateTriangle)
+                continue
+            end
+
+            % Triangle winding may be inconsistent, so use abs(dot).
+            normalOK = abs(dot( ...
+                N(candidateTriangle,:),referenceNormal)) ...
+                >= cosineLimit;
+
+            candidatePoints = ...
+                V(F(candidateTriangle,:),:);
+
+            planeDistance = abs( ...
+                (candidatePoints-referencePoint)* ...
+                referenceNormal');
+
+            planeOK = max(planeDistance) <= planeTolerance;
+
+            if normalOK && planeOK
+                used(candidateTriangle) = true;
+
+                queue(end+1) = candidateTriangle; %#ok<AGROW>
             end
         end
-        k = q + 1;
-    end
-    for i = 1:nt
-        parent(i) = findRoot(parent,i);
-    end
-    componentIds = unique(parent);
-
-    % Retain planar components whose convex boundary simplifies to 4 corners.
-    cand = struct('corners',{},'meanZ',{},'area',{},'normal',{},'triangles',{});
-    for ic = 1:numel(componentIds)
-        ids = find(parent == componentIds(ic));
-        vids = unique(Fu(ids,:));
-        P = Vu(vids,:);
-        if size(P,1) < 4, continue; end
-
-        % Align triangle normals before averaging; some STL exporters do not
-        % use consistent triangle winding.
-        Nc = N(ids,:);
-        flip = Nc*Nc(1,:)' < 0;
-        Nc(flip,:) = -Nc(flip,:);
-        n = sum(Nc.*twiceArea(ids,[1 1 1]),1);
-        if norm(n) == 0, continue; end
-        n = n/norm(n);
-        if abs(n(3)) < 0.25, continue; end % reject tang faces parallel to z
-
-        ctr = mean(P,1);
-        [~,~,vv] = svd(P-ctr,0);
-        uv = (P-ctr)*vv(:,1:2);
-        try
-            h = convhull(uv(:,1),uv(:,2));
-        catch
-            continue
-        end
-        h(end) = [];
-        h = removeCollinearHullPoints(h,uv,tol);
-        if numel(h) ~= 4, continue; end
-
-        C = P(h,:);
-        A = polyarea(uv(h,1),uv(h,2));
-        cand(end+1).corners = C; %#ok<AGROW>
-        cand(end).meanZ = mean(C(:,3));
-        cand(end).area = A;
-        cand(end).normal = n;
-        cand(end).triangles = ids;
     end
 
-    if numel(cand) < 2
-        error(['Could not find two rectangular end-face patches. Try a larger ',...
-               'tol, or inspect whether the end faces are planar and closed.']);
+    endTriangles = find(used);
+
+    endVertexIDs = unique(F(endTriangles,:));
+    endPoints = V(endVertexIDs,:);
+
+    if size(endPoints,1) < 4
+        error(['The detected tang end contains fewer than four ', ...
+               'vertices. Try increasing angleDeg or tol.']);
     end
 
-    % Highest and lowest rectangular patches. Area breaks near-equal z ties.
-    z = [cand.meanZ]';
-    ar = [cand.area]';
-    zRange = max(Vu(:,3))-min(Vu(:,3));
-    zTie = max(10*tol,1e-9*max(zRange,1));
-    hiPool = find(z >= max(z)-zTie);
-    loPool = find(z <= min(z)+zTie);
-    [~,ii] = max(ar(hiPool)); hi = hiPool(ii);
-    [~,ii] = max(ar(loPool)); lo = loPool(ii);
-    if hi == lo
-        error('The two end faces could not be distinguished by their z positions.');
+    %% Project the end cap onto its best-fit plane
+
+    center = mean(endPoints,1);
+
+    [~,~,basis] = svd(endPoints-center,0);
+
+    localCoordinates = ...
+        (endPoints-center)*basis(:,1:2);
+
+    %% Find the outer boundary
+
+    hullIndices = convhull( ...
+        localCoordinates(:,1), ...
+        localCoordinates(:,2));
+
+    % convhull repeats the first index at the end.
+    hullIndices(end) = [];
+
+    %% Remove intermediate collinear edge points
+
+    lineTolerance = max( ...
+        10*tol,1e-6*modelSize);
+
+    hullIndices = removeCollinear( ...
+        hullIndices,localCoordinates,lineTolerance);
+
+    if numel(hullIndices) ~= 4
+        error(['The surface grown from the z extreme has %d ', ...
+               'boundary corners instead of 4. Try calling ', ...
+               'extractTangCorners_v2(stl,[],15).'], ...
+               numel(hullIndices));
     end
 
-    highCorners = orderXY(cand(hi).corners);
-    lowCorners  = orderXY(cand(lo).corners);
-    corners = [highCorners; lowCorners];
+    C = endPoints(hullIndices,:);
 
-    info.highEnd = cand(hi);
-    info.lowEnd = cand(lo);
-    info.tolerance = tol;
-    info.uniqueVertices = Vu;
+    %% Diagnostic output
+
+    out.seedTriangle = seedTriangle;
+    out.triangles = endTriangles;
+    out.vertexIDs = endVertexIDs;
+    out.vertices = endPoints;
+    out.normal = referenceNormal;
+    out.zExtreme = zExtreme;
 end
+
+
+function neighbors = triangleNeighbors(F)
+% Build a list of triangles sharing an edge.
+
+    numberTriangles = size(F,1);
+
+    edges = [
+        sort(F(:,[1 2]),2)
+        sort(F(:,[2 3]),2)
+        sort(F(:,[3 1]),2)];
+
+    triangleID = repmat( ...
+        (1:numberTriangles)',3,1);
+
+    [edges,sortIndex] = sortrows(edges,[1 2]);
+
+    triangleID = triangleID(sortIndex);
+
+    neighbors = cell(numberTriangles,1);
+
+    firstEdge = 1;
+
+    while firstEdge <= size(edges,1)
+
+        lastEdge = firstEdge;
+
+        while lastEdge < size(edges,1) && ...
+                all(edges(lastEdge+1,:) == ...
+                    edges(firstEdge,:))
+
+            lastEdge = lastEdge + 1;
+        end
+
+        triangleGroup = unique( ...
+            triangleID(firstEdge:lastEdge));
+
+        if numel(triangleGroup) > 1
+
+            for j = 1:numel(triangleGroup)
+
+                currentTriangle = triangleGroup(j);
+
+                otherTriangles = ...
+                    triangleGroup( ...
+                    triangleGroup ~= currentTriangle);
+
+                neighbors{currentTriangle} = [
+                    neighbors{currentTriangle}, ...
+                    otherTriangles'];
+            end
+        end
+
+        firstEdge = lastEdge + 1;
+    end
+end
+
+
+function hullIndices = removeCollinear( ...
+    hullIndices,coordinates,lineTolerance)
+% Remove mesh nodes located between the true rectangular corners.
+
+    changed = true;
+
+    while changed && numel(hullIndices) > 4
+
+        changed = false;
+        numberHullPoints = numel(hullIndices);
+
+        for j = 1:numberHullPoints
+
+            previousIndex = ...
+                mod(j-2,numberHullPoints)+1;
+
+            nextIndex = ...
+                mod(j,numberHullPoints)+1;
+
+            pointA = coordinates( ...
+                hullIndices(previousIndex),:);
+
+            pointB = coordinates( ...
+                hullIndices(j),:);
+
+            pointC = coordinates( ...
+                hullIndices(nextIndex),:);
+
+            lineAC = pointC-pointA;
+
+            if norm(lineAC) == 0
+                distance = norm(pointB-pointA);
+            else
+                distance = abs( ...
+                    lineAC(1)*(pointA(2)-pointB(2)) - ...
+                    lineAC(2)*(pointA(1)-pointB(1))) ...
+                    /norm(lineAC);
+            end
+
+            if distance <= lineTolerance
+                hullIndices(j) = [];
+                changed = true;
+                break
+            end
+        end
+    end
+end
+
 
 function C = orderXY(C)
-% Use all 24 assignments so small mesh noise cannot upset x/y grouping.
-    p = perms(1:4);
-    best = inf; bestOrder = [];
-    for k = 1:size(p,1)
-        T = C(p(k,:),:);
-        % Desired signs: (++), (+-), (-+), (--).
-        penalty = (T(1,1)-T(2,1))^2 + (T(3,1)-T(4,1))^2 + ...
-                  (T(1,2)-T(3,2))^2 + (T(2,2)-T(4,2))^2;
-        penalty = penalty + max(0,T(3,1)-T(1,1))^2 + ...
-                  max(0,T(4,1)-T(2,1))^2 + ...
-                  max(0,T(2,2)-T(1,2))^2 + ...
-                  max(0,T(4,2)-T(3,2))^2;
-        if penalty < best
-            best = penalty; bestOrder = p(k,:);
-        end
-    end
-    C = C(bestOrder,:);
+% Order:
+%   1  larger x, larger y
+%   2  larger x, smaller y
+%   3  smaller x, larger y
+%   4  smaller x, smaller y
+
+    [~,xOrder] = sort(C(:,1),'descend');
+
+    largerX = C(xOrder(1:2),:);
+    smallerX = C(xOrder(3:4),:);
+
+    [~,yOrder] = sort( ...
+        largerX(:,2),'descend');
+
+    largerX = largerX(yOrder,:);
+
+    [~,yOrder] = sort( ...
+        smallerX(:,2),'descend');
+
+    smallerX = smallerX(yOrder,:);
+
+    C = [largerX;smallerX];
 end
 
-function h = removeCollinearHullPoints(h,uv,tol3d)
-    changed = true;
-    scale = max(max(uv,[],1)-min(uv,[],1));
-    lineTol = max(10*tol3d,1e-8*max(scale,1));
-    while changed && numel(h) > 3
-        changed = false;
-        m = numel(h);
-        for i = 1:m
-            ip = mod(i-2,m)+1; in = mod(i,m)+1;
-            a = uv(h(ip),:); b = uv(h(i),:); c = uv(h(in),:);
-            ac = c-a;
-            if norm(ac) == 0
-                dist = norm(b-a);
-            else
-                dist = abs(ac(1)*(a(2)-b(2))-ac(2)*(a(1)-b(1)))/norm(ac);
-            end
-            if dist <= lineTol
-                h(i) = []; changed = true; break
-            end
-        end
-    end
-end
 
-function parent = unionSets(parent,a,b)
-    ra = findRoot(parent,a); rb = findRoot(parent,b);
-    if ra ~= rb, parent(rb) = ra; end
-end
+function [V,F] = getMeshArrays(stlData)
+% Accept a triangulation or an STL structure.
 
-function r = findRoot(parent,a)
-    r = a;
-    while parent(r) ~= r, r = parent(r); end
-end
+    if isa(stlData,'triangulation')
+        V = stlData.Points;
+        F = stlData.ConnectivityList;
+        return
+    end
 
-function [V,F] = getMeshArrays(s)
-    if isa(s,'triangulation')
-        V = s.Points; F = s.ConnectivityList; return
+    if ~isstruct(stlData)
+        error(['Input must be an STL structure ', ...
+               'or a triangulation object.']);
     end
-    if ~isstruct(s)
-        error(['Input must be an STL structure or triangulation. Read the STL ',...
-               'using your existing stlread function, then pass its output here.']);
+
+    fieldNames = fieldnames(stlData);
+
+    vertexField = find( ...
+        strcmpi(fieldNames,'vertices'),1);
+
+    faceField = find( ...
+        strcmpi(fieldNames,'faces'),1);
+
+    if isempty(vertexField) || isempty(faceField)
+        error(['The input structure must contain ', ...
+               'faces and vertices fields.']);
     end
-    names = fieldnames(s);
-    iv = find(strcmpi(names,'vertices'),1);
-    iff = find(strcmpi(names,'faces'),1);
-    if isempty(iv) || isempty(iff)
-        error('The structure must contain fields named vertices and faces.');
-    end
-    V = s.(names{iv}); F = s.(names{iff});
+
+    V = stlData.(fieldNames{vertexField});
+    F = stlData.(fieldNames{faceField});
 end
