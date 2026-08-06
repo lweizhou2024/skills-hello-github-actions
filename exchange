@@ -1,31 +1,41 @@
 function [corners,info] = extractTangCorners(stlData,angleDeg)
-%EXTRACTTANGCORNERS Extract 8 corners from two rectangular tang end faces.
+%EXTRACTTANGCORNERS Extract tang-end corners from an airfoil STL.
 %
 % [corners,info] = extractTangCorners(stlData)
 % [corners,info] = extractTangCorners(stlData,angleDeg)
 %
+% The tang end cross section is assumed to have:
+%   - one straight boundary edge on the larger-x side;
+%   - one straight boundary edge on the smaller-x side;
+%   - two curved boundaries following the airfoil shape.
+%
+% The four corners of each end face are defined as the endpoints of the
+% two straight side edges.
+%
+% INPUT
+% -----
 % stlData:
 %   Output from MATLAB's built-in stlread.
 %
 % angleDeg:
-%   Permitted variation between end-face triangle normals.
+%   Maximum normal variation used when growing the end face.
 %   Default = 8 degrees.
 %
-% corners order:
-%
-% Higher-z end:
+% OUTPUT ORDER
+% ------------
+% Higher-z tang end:
 %   1  larger x, larger y
 %   2  larger x, smaller y
 %   3  smaller x, larger y
 %   4  smaller x, smaller y
 %
-% Lower-z end:
+% Lower-z tang end:
 %   5  larger x, larger y
 %   6  larger x, smaller y
 %   7  smaller x, larger y
 %   8  smaller x, smaller y
 
-    %% Read mesh data
+    %% Read the STL data
 
     [V,F] = getMeshArrays(stlData);
 
@@ -40,6 +50,10 @@ function [corners,info] = extractTangCorners(stlData,angleDeg)
         angleDeg = 8;
     end
 
+    if angleDeg <= 0 || angleDeg >= 90
+        error('angleDeg must be between 0 and 90 degrees.');
+    end
+
     modelRange = max(V,[],1)-min(V,[],1);
     modelSize = norm(modelRange);
 
@@ -49,7 +63,7 @@ function [corners,info] = extractTangCorners(stlData,angleDeg)
 
     coordinateTolerance = max(1e-12,1e-8*modelSize);
 
-    %% Remove degenerate triangles and calculate normals
+    %% Remove degenerate triangles and calculate triangle normals
 
     edge1 = V(F(:,2),:)-V(F(:,1),:);
     edge2 = V(F(:,3),:)-V(F(:,1),:);
@@ -65,20 +79,23 @@ function [corners,info] = extractTangCorners(stlData,angleDeg)
     normalVector = normalVector(goodTriangle,:);
     normalMagnitude = normalMagnitude(goodTriangle);
 
-    N = normalVector./normalMagnitude(:,[1 1 1]);
+    triangleNormals = ...
+        normalVector./normalMagnitude(:,[1 1 1]);
 
-    %% Find triangles that share edges
+    %% Find triangle neighbors
 
     neighbors = triangleNeighbors(F);
 
-    %% Extract the two end caps
+    %% Extract the high-z tang end
 
     [highCorners,highInfo] = growEndCap( ...
-        V,F,N,neighbors,+1, ...
+        V,F,triangleNormals,neighbors,+1, ...
         coordinateTolerance,modelSize,angleDeg);
 
+    %% Extract the low-z tang end
+
     [lowCorners,lowInfo] = growEndCap( ...
-        V,F,N,neighbors,-1, ...
+        V,F,triangleNormals,neighbors,-1, ...
         coordinateTolerance,modelSize,angleDeg);
 
     %% Put corners in requested order
@@ -90,19 +107,21 @@ function [corners,info] = extractTangCorners(stlData,angleDeg)
         highCorners
         lowCorners];
 
-    %% Diagnostic results
+    %% Diagnostic output
 
     info.highEnd = highInfo;
     info.lowEnd = lowInfo;
+
     info.angleDeg = angleDeg;
+    info.coordinateTolerance = coordinateTolerance;
 end
 
 
 function [cornerPoints,endInfo] = growEndCap( ...
     V,F,N,neighbors,zSign,coordinateTolerance,modelSize,angleDeg)
-% Start at the global z extremity and grow the connected end cap.
+% Start from one global z extremity and grow its connected end face.
 
-    %% Find vertices at the selected z extremity
+    %% Locate vertices at the requested z extremity
 
     if zSign > 0
 
@@ -144,7 +163,7 @@ function [cornerPoints,endInfo] = growEndCap( ...
     referenceNormal = N(seedTriangle,:);
     referencePoint = V(F(seedTriangle,1),:);
 
-    %% Grow connected triangles belonging to the same end face
+    %% Grow the connected end-face triangles
 
     cosineLimit = cos(angleDeg*pi/180);
 
@@ -201,239 +220,299 @@ function [cornerPoints,endInfo] = growEndCap( ...
         end
     end
 
-    %% Get all points on the detected end face
+    %% Extract the end-face boundary edges
 
     endTriangleIDs = find(usedTriangle);
 
-    endVertexIDs = unique(F(endTriangleIDs,:));
+    [boundaryEdges,boundaryVertexIDs] = ...
+        findBoundaryEdges(F(endTriangleIDs,:));
 
-    endPoints = V(endVertexIDs,:);
+    boundaryPoints = V(boundaryVertexIDs,:);
 
-    if size(endPoints,1) < 4
-        error('The detected end face contains fewer than four vertices.');
+    if size(boundaryPoints,1) < 4
+
+        error(['The detected end face has fewer than four ', ...
+               'boundary vertices.']);
     end
 
-    %% Project the end face onto a best-fit plane
+    %% Detect the straight larger-x side
 
-    faceCenter = mean(endPoints,1);
+    [largeXEndpoints,largeXInfo] = ...
+        findStraightSide( ...
+        boundaryPoints,+1,modelSize);
 
-    centeredPoints = endPoints-faceCenter;
+    %% Detect the straight smaller-x side
 
-    [~,~,planeBasis] = svd(centeredPoints,0);
+    [smallXEndpoints,smallXInfo] = ...
+        findStraightSide( ...
+        boundaryPoints,-1,modelSize);
 
-    coordinates2D = ...
-        centeredPoints*planeBasis(:,1:2);
+    %% Combine the four endpoints
 
-    %% Calculate the outer boundary
+    cornerPoints = [
+        largeXEndpoints
+        smallXEndpoints];
 
-    hullIndices = convhull( ...
-        coordinates2D(:,1), ...
-        coordinates2D(:,2));
-
-    hullIndices(end) = [];
-
-    %% Fit a rectangle and select the four actual corner vertices
-
-    [cornerPoints,rectangleInfo] = ...
-        fitRectangleCorners( ...
-        endPoints,coordinates2D,hullIndices);
-
-    %% Diagnostic results
+    %% Diagnostic output
 
     endInfo.seedTriangle = seedTriangle;
     endInfo.triangleIDs = endTriangleIDs;
-    endInfo.vertexIDs = endVertexIDs;
-    endInfo.vertices = endPoints;
-    endInfo.referenceNormal = referenceNormal;
+
+    endInfo.boundaryEdges = boundaryEdges;
+    endInfo.boundaryVertexIDs = boundaryVertexIDs;
+    endInfo.boundaryPoints = boundaryPoints;
+
+    endInfo.largeXSide = largeXInfo;
+    endInfo.smallXSide = smallXInfo;
+
     endInfo.zExtreme = zExtreme;
-    endInfo.coordinates2D = coordinates2D;
-    endInfo.hullIndices = hullIndices;
-    endInfo.rectangle = rectangleInfo;
+    endInfo.referenceNormal = referenceNormal;
 end
 
 
-function [cornerPoints,rectangleInfo] = ...
-    fitRectangleCorners(points3D,coordinates2D,hullIndices)
-% Fit a minimum-area rectangle and select actual boundary corner vertices.
+function [sideEndpoints,sideInfo] = ...
+    findStraightSide(boundaryPoints,xSign,modelSize)
+% Find one straight side of the end-face boundary.
+%
+% xSign = +1:
+%   Search for the straight edge on the larger-x side.
+%
+% xSign = -1:
+%   Search for the straight edge on the smaller-x side.
 
-    hull2D = coordinates2D(hullIndices,:);
+    x = boundaryPoints(:,1);
 
-    numberHullPoints = size(hull2D,1);
+    minimumX = min(x);
+    maximumX = max(x);
 
-    bestArea = inf;
-    bestAngle = [];
-    bestLimits = [];
+    xRange = maximumX-minimumX;
 
-    %% Test the orientation of each convex-hull edge
+    if xRange <= eps
+        error('The end-face boundary has zero x range.');
+    end
 
-    for j = 1:numberHullPoints
+    %% Restrict the search to the appropriate x-side region
 
-        nextPoint = mod(j,numberHullPoints)+1;
+    % A relatively wide band permits a slightly inclined straight side.
 
-        edgeVector = ...
-            hull2D(nextPoint,:)-hull2D(j,:);
+    sideBandFraction = 0.30;
 
-        if norm(edgeVector) <= eps
-            continue
+    if xSign > 0
+
+        candidateIndex = find( ...
+            x >= maximumX-sideBandFraction*xRange);
+
+    else
+
+        candidateIndex = find( ...
+            x <= minimumX+sideBandFraction*xRange);
+    end
+
+    candidatePoints = ...
+        boundaryPoints(candidateIndex,:);
+
+    if size(candidatePoints,1) < 2
+
+        error(['Not enough boundary points were found on one ', ...
+               'x side of the tang end.']);
+    end
+
+    %% Test lines through all candidate point pairs
+
+    lineTolerance = max( ...
+        1e-7*modelSize, ...
+        1e-5*xRange);
+
+    bestScore = -inf;
+    bestPoint1 = [];
+    bestPoint2 = [];
+    bestInlier = [];
+    bestDirection = [];
+
+    numberCandidatePoints = ...
+        size(candidatePoints,1);
+
+    for j = 1:numberCandidatePoints-1
+
+        for k = j+1:numberCandidatePoints
+
+            point1 = candidatePoints(j,:);
+            point2 = candidatePoints(k,:);
+
+            lineDirection = point2-point1;
+            lineLength = norm(lineDirection);
+
+            if lineLength <= lineTolerance
+                continue
+            end
+
+            unitDirection = ...
+                lineDirection/lineLength;
+
+            %% The side edge should run mainly in the y direction
+
+            xyLength = norm(unitDirection(1:2));
+
+            if xyLength <= eps
+                continue
+            end
+
+            yDirectionFraction = ...
+                abs(unitDirection(2))/xyLength;
+
+            if yDirectionFraction < 0.50
+                continue
+            end
+
+            %% Calculate distances from every boundary point to this line
+
+            vectorFromLine = ...
+                boundaryPoints-point1;
+
+            projection = ...
+                vectorFromLine*unitDirection';
+
+            closestPoint = ...
+                point1 + projection*unitDirection;
+
+            lineDistance = sqrt(sum( ...
+                (boundaryPoints-closestPoint).^2,2));
+
+            inlier = ...
+                lineDistance <= lineTolerance;
+
+            if sum(inlier) < 2
+                continue
+            end
+
+            inlierPoints = ...
+                boundaryPoints(inlier,:);
+
+            meanInlierX = ...
+                mean(inlierPoints(:,1));
+
+            %% Reject lines that are not on the requested outer side
+
+            normalizedX = ...
+                (meanInlierX-minimumX)/xRange;
+
+            if xSign > 0
+
+                outerPositionScore = normalizedX;
+
+                if normalizedX < 0.60
+                    continue
+                end
+
+            else
+
+                outerPositionScore = 1-normalizedX;
+
+                if normalizedX > 0.40
+                    continue
+                end
+            end
+
+            %% Measure the length covered by collinear inlier points
+
+            inlierProjection = ...
+                (inlierPoints-point1)*unitDirection';
+
+            lineSpan = ...
+                max(inlierProjection)-min(inlierProjection);
+
+            numberInliers = sum(inlier);
+
+            % Long straight lines on the appropriate outer side receive
+            % the largest score. The inlier term favors a subdivided
+            % straight edge over a chord through two curved-edge points.
+
+            score = lineSpan* ...
+                (1+0.10*max(numberInliers-2,0))* ...
+                (0.5+outerPositionScore);
+
+            if score > bestScore
+
+                bestScore = score;
+                bestPoint1 = point1;
+                bestPoint2 = point2;
+                bestInlier = inlier;
+                bestDirection = unitDirection;
+            end
         end
-
-        edgeAngle = atan2( ...
-            edgeVector(2),edgeVector(1));
-
-        testAngle = mod(edgeAngle,pi/2);
-
-        cosineAngle = cos(testAngle);
-        sineAngle = sin(testAngle);
-
-        rotationMatrix = [
-             cosineAngle,  sineAngle
-            -sineAngle,    cosineAngle];
-
-        rotatedPoints = ...
-            coordinates2D*rotationMatrix';
-
-        minimum1 = min(rotatedPoints(:,1));
-        maximum1 = max(rotatedPoints(:,1));
-
-        minimum2 = min(rotatedPoints(:,2));
-        maximum2 = max(rotatedPoints(:,2));
-
-        rectangleArea = ...
-            (maximum1-minimum1)* ...
-            (maximum2-minimum2);
-
-        if rectangleArea < bestArea
-
-            bestArea = rectangleArea;
-            bestAngle = testAngle;
-
-            bestLimits = [
-                minimum1,maximum1
-                minimum2,maximum2];
-        end
     end
 
-    if isempty(bestAngle)
-        error('Could not fit a rectangle to the end face.');
+    if isempty(bestPoint1)
+
+        error(['A straight boundary edge could not be found on ', ...
+               'one x side of the tang end.']);
     end
 
-    %% Rotate all end-face points to the fitted rectangle coordinates
+    %% Use the endpoints of the fitted straight-line run
 
-    cosineAngle = cos(bestAngle);
-    sineAngle = sin(bestAngle);
+    straightPoints = ...
+        boundaryPoints(bestInlier,:);
 
-    rotationMatrix = [
-         cosineAngle,  sineAngle
-        -sineAngle,    cosineAngle];
+    straightProjection = ...
+        (straightPoints-bestPoint1)*bestDirection';
 
-    rotatedPoints = ...
-        coordinates2D*rotationMatrix';
+    [~,minimumIndex] = min(straightProjection);
+    [~,maximumIndex] = max(straightProjection);
 
-    minimum1 = bestLimits(1,1);
-    maximum1 = bestLimits(1,2);
+    endpoint1 = straightPoints(minimumIndex,:);
+    endpoint2 = straightPoints(maximumIndex,:);
 
-    minimum2 = bestLimits(2,1);
-    maximum2 = bestLimits(2,2);
+    %% Put larger-y endpoint first
 
-    center1 = 0.5*(minimum1+maximum1);
-    center2 = 0.5*(minimum2+maximum2);
+    if endpoint1(2) >= endpoint2(2)
 
-    halfWidth1 = 0.5*(maximum1-minimum1);
-    halfWidth2 = 0.5*(maximum2-minimum2);
+        sideEndpoints = [
+            endpoint1
+            endpoint2];
 
-    if halfWidth1 <= eps || halfWidth2 <= eps
-        error('The fitted end-face rectangle has zero width.');
+    else
+
+        sideEndpoints = [
+            endpoint2
+            endpoint1];
     end
 
-    %% Normalize the rectangle coordinates
+    %% Diagnostic output
 
-    normalizedCoordinates = zeros(size(rotatedPoints));
+    sideInfo.endpoints = sideEndpoints;
+    sideInfo.inlierPoints = straightPoints;
+    sideInfo.direction = bestDirection;
+    sideInfo.score = bestScore;
+    sideInfo.lineTolerance = lineTolerance;
+    sideInfo.initialPoint1 = bestPoint1;
+    sideInfo.initialPoint2 = bestPoint2;
+end
 
-    normalizedCoordinates(:,1) = ...
-        (rotatedPoints(:,1)-center1)/halfWidth1;
 
-    normalizedCoordinates(:,2) = ...
-        (rotatedPoints(:,2)-center2)/halfWidth2;
+function [boundaryEdges,boundaryVertexIDs] = ...
+    findBoundaryEdges(endFaces)
+% Find edges used by exactly one triangle within the selected end face.
 
-    %% Select corners by support in four diagonal directions
+    allEdges = [
+        sort(endFaces(:,[1 2]),2)
+        sort(endFaces(:,[2 3]),2)
+        sort(endFaces(:,[3 1]),2)];
 
-    % Only convex-hull vertices are allowed.
-    hullCoordinates = ...
-        normalizedCoordinates(hullIndices,:);
+    [uniqueEdges,~,edgeMap] = ...
+        unique(allEdges,'rows');
 
-    % Target directions in rectangle coordinates:
-    %   (+,+), (+,-), (-,+), (-,-)
+    edgeCount = accumarray(edgeMap,1);
 
-    targetDirections = [
-         1, 1
-         1,-1
-        -1, 1
-        -1,-1];
+    boundaryEdges = ...
+        uniqueEdges(edgeCount == 1,:);
 
-    selectedLocalIndex = zeros(4,1);
-    selectedPointIndex = zeros(4,1);
-    cornerScore = zeros(4,1);
-
-    availableHullPoint = true(numel(hullIndices),1);
-
-    for j = 1:4
-
-        score = ...
-            hullCoordinates*targetDirections(j,:)';
-
-        score(~availableHullPoint) = -inf;
-
-        [cornerScore(j),selectedLocalIndex(j)] = max(score);
-
-        selectedPointIndex(j) = ...
-            hullIndices(selectedLocalIndex(j));
-
-        availableHullPoint(selectedLocalIndex(j)) = false;
-    end
-
-    cornerPoints = ...
-        points3D(selectedPointIndex,:);
-
-    %% Calculate distance from ideal rectangle corners
-
-    idealCorners = targetDirections;
-
-    selectedNormalizedCoordinates = ...
-        normalizedCoordinates(selectedPointIndex,:);
-
-    normalizedCornerError = sqrt(sum( ...
-        (selectedNormalizedCoordinates-idealCorners).^2,2));
-
-    if any(normalizedCornerError > 0.10)
-
-        warning(['One or more selected vertices are relatively far ', ...
-                 'from the fitted rectangle corners. Maximum ', ...
-                 'normalized error = %g.'], ...
-                 max(normalizedCornerError));
-    end
-
-    %% Diagnostic results
-
-    rectangleInfo.angleRadians = bestAngle;
-    rectangleInfo.angleDegrees = bestAngle*180/pi;
-    rectangleInfo.area = bestArea;
-    rectangleInfo.limits = bestLimits;
-
-    rectangleInfo.selectedPointIndex = ...
-        selectedPointIndex;
-
-    rectangleInfo.selectedNormalizedCoordinates = ...
-        selectedNormalizedCoordinates;
-
-    rectangleInfo.normalizedCornerError = ...
-        normalizedCornerError;
-
-    rectangleInfo.cornerScore = cornerScore;
+    boundaryVertexIDs = ...
+        unique(boundaryEdges(:));
 end
 
 
 function neighbors = triangleNeighbors(F)
-% Find triangles sharing an entire mesh edge.
+% Find triangles that share a complete edge.
 
     numberTriangles = size(F,1);
 
@@ -448,9 +527,11 @@ function neighbors = triangleNeighbors(F)
     [edges,sortingIndex] = ...
         sortrows(edges,[1 2]);
 
-    triangleID = triangleID(sortingIndex);
+    triangleID = ...
+        triangleID(sortingIndex);
 
-    neighbors = cell(numberTriangles,1);
+    neighbors = ...
+        cell(numberTriangles,1);
 
     firstEdge = 1;
 
@@ -490,7 +571,11 @@ end
 
 
 function orderedCorners = orderXY(cornerPoints)
-% Order corners using global x and y coordinates.
+% Order corners according to global x and y coordinates.
+
+    if size(cornerPoints,1) ~= 4
+        error('Exactly four corner points are required.');
+    end
 
     [~,xOrder] = ...
         sort(cornerPoints(:,1),'descend');
@@ -520,7 +605,7 @@ end
 
 
 function [V,F] = getMeshArrays(stlData)
-% Read arrays from MATLAB stlread output.
+% Read mesh arrays from MATLAB's built-in stlread output.
 
     if isa(stlData,'triangulation')
 
