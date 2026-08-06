@@ -1,171 +1,87 @@
-function [corners,info] = extractTangCorners_v3(stlData,tol,angleDeg)
-%EXTRACTTANGCORNERS_V3 Extract corners from two rectangular tang end faces.
+function [corners,info] = extractTangCorners(stlData,angleDeg)
+%EXTRACTTANGCORNERS Extract 8 corners from two rectangular tang end faces.
 %
-% [corners,info] = extractTangCorners_v3(stlData)
-% [corners,info] = extractTangCorners_v3(stlData,tol)
-% [corners,info] = extractTangCorners_v3(stlData,tol,angleDeg)
+% [corners,info] = extractTangCorners(stlData)
+% [corners,info] = extractTangCorners(stlData,angleDeg)
 %
-% INPUT
-% -----
 % stlData:
-%   Output from MATLAB's built-in stlread, normally a triangulation object.
-%   A structure containing .faces and .vertices is also accepted.
-%
-% tol:
-%   Coordinate tolerance used only to merge duplicated STL vertices.
-%   Leave empty to use the default:
-%
-%       1e-7 * model bounding-box diagonal
+%   Output from MATLAB's built-in stlread.
 %
 % angleDeg:
-%   Maximum angle between neighboring end-face triangle normals.
+%   Permitted variation between end-face triangle normals.
 %   Default = 8 degrees.
 %
-% OUTPUT
-% ------
-% corners:
-%   8-by-3 array with the following row order:
+% corners order:
 %
-%   Higher-z end:
-%       1   larger x, larger y
-%       2   larger x, smaller y
-%       3   smaller x, larger y
-%       4   smaller x, smaller y
+% Higher-z end:
+%   1  larger x, larger y
+%   2  larger x, smaller y
+%   3  smaller x, larger y
+%   4  smaller x, smaller y
 %
-%   Lower-z end:
-%       5   larger x, larger y
-%       6   larger x, smaller y
-%       7   smaller x, larger y
-%       8   smaller x, smaller y
-%
-% info:
-%   Diagnostic information about the detected end faces and fitted
-%   rectangles.
-%
-% METHOD
-% ------
-% 1. Merge geometrically duplicated STL vertices.
-% 2. Start separately from the global maximum-z and minimum-z vertices.
-% 3. At each end, select the triangle with the largest absolute z-normal.
-% 4. Grow the connected end-face surface.
-% 5. Project the detected face onto its best-fit plane.
-% 6. Fit a minimum-area rectangle to the projected boundary.
-% 7. Select the actual STL vertex nearest each fitted rectangle corner.
-%
-% This method does not require the end face to be perpendicular to z.
+% Lower-z end:
+%   5  larger x, larger y
+%   6  larger x, smaller y
+%   7  smaller x, larger y
+%   8  smaller x, smaller y
 
-    %% Get mesh arrays
+    %% Read mesh data
 
     [V,F] = getMeshArrays(stlData);
 
     V = double(V);
     F = double(F);
 
-    if size(V,2) ~= 3
-        error('The vertex array must have three columns.');
+    if size(V,2) ~= 3 || size(F,2) ~= 3
+        error('Vertices and faces must each have three columns.');
     end
 
-    if size(F,2) ~= 3
-        error('The face array must have three columns.');
-    end
-
-    if any(F(:) < 1) || any(F(:) > size(V,1))
-        error('The face array contains invalid vertex indices.');
-    end
-
-    %% Default settings
-
-    boundingBoxSize = max(V,[],1) - min(V,[],1);
-    modelSize = norm(boundingBoxSize);
-
-    if modelSize <= 0
-        error('The STL has zero model size.');
-    end
-
-    if nargin < 2 || isempty(tol)
-        tol = max(1e-12,1e-7*modelSize);
-    end
-
-    if nargin < 3 || isempty(angleDeg)
+    if nargin < 2 || isempty(angleDeg)
         angleDeg = 8;
     end
 
-    if tol <= 0
-        error('tol must be greater than zero.');
+    modelRange = max(V,[],1)-min(V,[],1);
+    modelSize = norm(modelRange);
+
+    if modelSize <= 0
+        error('The STL model has zero size.');
     end
 
-    if angleDeg <= 0 || angleDeg >= 90
-        error('angleDeg must be between 0 and 90 degrees.');
-    end
-
-    %% Merge geometrically duplicated vertices
-
-    coordinateKey = round(V/tol);
-
-    [~,~,oldToNew] = unique(coordinateKey,'rows');
-
-    numberUniqueVertices = max(oldToNew);
-
-    vertexCount = accumarray(oldToNew,1);
-
-    uniqueVertices = zeros(numberUniqueVertices,3);
-
-    for direction = 1:3
-
-        coordinateSum = accumarray( ...
-            oldToNew,V(:,direction));
-
-        uniqueVertices(:,direction) = ...
-            coordinateSum./vertexCount;
-    end
-
-    uniqueFaces = reshape( ...
-        oldToNew(F(:)),size(F));
-
-    V = uniqueVertices;
-    F = uniqueFaces;
+    coordinateTolerance = max(1e-12,1e-8*modelSize);
 
     %% Remove degenerate triangles and calculate normals
 
-    edge1 = V(F(:,2),:) - V(F(:,1),:);
-    edge2 = V(F(:,3),:) - V(F(:,1),:);
+    edge1 = V(F(:,2),:)-V(F(:,1),:);
+    edge2 = V(F(:,3),:)-V(F(:,1),:);
 
-    triangleCrossProduct = cross(edge1,edge2,2);
+    normalVector = cross(edge1,edge2,2);
 
-    twiceTriangleArea = sqrt( ...
-        sum(triangleCrossProduct.^2,2));
+    normalMagnitude = sqrt(sum(normalVector.^2,2));
 
     goodTriangle = ...
-        twiceTriangleArea > max(tol^2,eps);
+        normalMagnitude > max(coordinateTolerance^2,eps);
 
     F = F(goodTriangle,:);
-    triangleCrossProduct = ...
-        triangleCrossProduct(goodTriangle,:);
+    normalVector = normalVector(goodTriangle,:);
+    normalMagnitude = normalMagnitude(goodTriangle);
 
-    twiceTriangleArea = ...
-        twiceTriangleArea(goodTriangle);
+    N = normalVector./normalMagnitude(:,[1 1 1]);
 
-    triangleNormals = ...
-        triangleCrossProduct ./ ...
-        twiceTriangleArea(:,[1 1 1]);
-
-    %% Determine triangle adjacency
+    %% Find triangles that share edges
 
     neighbors = triangleNeighbors(F);
 
-    %% Detect the higher-z end face
+    %% Extract the two end caps
 
     [highCorners,highInfo] = growEndCap( ...
-        V,F,triangleNormals,neighbors, ...
-        +1,tol,modelSize,angleDeg);
-
-    %% Detect the lower-z end face
+        V,F,N,neighbors,+1, ...
+        coordinateTolerance,modelSize,angleDeg);
 
     [lowCorners,lowInfo] = growEndCap( ...
-        V,F,triangleNormals,neighbors, ...
-        -1,tol,modelSize,angleDeg);
+        V,F,N,neighbors,-1, ...
+        coordinateTolerance,modelSize,angleDeg);
 
-    %% Order the coordinates
+    %% Put corners in requested order
 
     highCorners = orderXY(highCorners);
     lowCorners = orderXY(lowCorners);
@@ -174,85 +90,67 @@ function [corners,info] = extractTangCorners_v3(stlData,tol,angleDeg)
         highCorners
         lowCorners];
 
-    %% Diagnostic output
+    %% Diagnostic results
 
     info.highEnd = highInfo;
     info.lowEnd = lowInfo;
-
-    info.tolerance = tol;
     info.angleDeg = angleDeg;
-    info.modelSize = modelSize;
 end
 
 
 function [cornerPoints,endInfo] = growEndCap( ...
-    V,F,N,neighbors,zSign,tol,modelSize,angleDeg)
-%GROWENDCAP Start at one z extreme and grow the connected end face.
+    V,F,N,neighbors,zSign,coordinateTolerance,modelSize,angleDeg)
+% Start at the global z extremity and grow the connected end cap.
 
-    %% Find vertices at the requested z extremity
+    %% Find vertices at the selected z extremity
 
     if zSign > 0
 
         zExtreme = max(V(:,3));
 
         extremeVertexIDs = find( ...
-            V(:,3) >= zExtreme-5*tol);
+            V(:,3) >= zExtreme-5*coordinateTolerance);
 
     else
 
         zExtreme = min(V(:,3));
 
         extremeVertexIDs = find( ...
-            V(:,3) <= zExtreme+5*tol);
+            V(:,3) <= zExtreme+5*coordinateTolerance);
     end
 
-    %% Find triangles touching an extreme vertex
-
-    touchingExtremeVertex = ...
-        ismember(F,extremeVertexIDs);
+    %% Find triangles touching the extreme vertices
 
     touchingTriangles = find( ...
-        any(touchingExtremeVertex,2));
+        any(ismember(F,extremeVertexIDs),2));
 
     if isempty(touchingTriangles)
-
-        error(['No triangles were found at one z extremity. ', ...
-               'Try increasing tol slightly.']);
+        error('No triangle was found at one z extremity.');
     end
 
-    %% Choose the initial end-face triangle
+    %% Choose the most z-facing triangle as the seed
 
-    % At an end corner, triangles from both the cap and tang sides may
-    % touch the extreme vertex. The cap triangle normally has the largest
-    % absolute z component in its normal.
-
-    [largestNormalZ,localSeedIndex] = ...
+    [largestNormalZ,index] = ...
         max(abs(N(touchingTriangles,3)));
 
-    seedTriangle = ...
-        touchingTriangles(localSeedIndex);
+    seedTriangle = touchingTriangles(index);
 
     if largestNormalZ < 0.10
 
-        error(['The triangles at a z extremity have almost no ', ...
-               'z-normal component. The tang end may be nearly ', ...
-               'parallel to the stacking axis.']);
+        error(['The tang end appears nearly parallel to the ', ...
+               'z stacking axis.']);
     end
 
     referenceNormal = N(seedTriangle,:);
+    referencePoint = V(F(seedTriangle,1),:);
 
-    referencePoint = ...
-        V(F(seedTriangle,1),:);
-
-    %% Grow the connected end-face surface
+    %% Grow connected triangles belonging to the same end face
 
     cosineLimit = cos(angleDeg*pi/180);
 
-    % This plane tolerance is separate from the vertex-merging tolerance.
-    % It allows small STL surface noise without merging distinct vertices.
-
     planeTolerance = max( ...
-        50*tol,1e-4*modelSize);
+        50*coordinateTolerance, ...
+        1e-4*modelSize);
 
     usedTriangle = false(size(F,1),1);
     usedTriangle(seedTriangle) = true;
@@ -279,18 +177,9 @@ function [cornerPoints,endInfo] = growEndCap( ...
                 continue
             end
 
-            %% Compare triangle normal
-
-            % abs(dot) allows inconsistent STL triangle winding.
-
-            normalDotProduct = abs(dot( ...
+            normalOK = abs(dot( ...
                 N(candidateTriangle,:), ...
-                referenceNormal));
-
-            normalOK = ...
-                normalDotProduct >= cosineLimit;
-
-            %% Compare distance from the initial cap plane
+                referenceNormal)) >= cosineLimit;
 
             candidatePoints = ...
                 V(F(candidateTriangle,:),:);
@@ -302,8 +191,6 @@ function [cornerPoints,endInfo] = growEndCap( ...
             planeOK = ...
                 max(planeDistance) <= planeTolerance;
 
-            %% Add acceptable neighboring triangle
-
             if normalOK && planeOK
 
                 usedTriangle(candidateTriangle) = true;
@@ -314,129 +201,85 @@ function [cornerPoints,endInfo] = growEndCap( ...
         end
     end
 
+    %% Get all points on the detected end face
+
     endTriangleIDs = find(usedTriangle);
 
-    endVertexIDs = unique( ...
-        F(endTriangleIDs,:));
+    endVertexIDs = unique(F(endTriangleIDs,:));
 
     endPoints = V(endVertexIDs,:);
 
     if size(endPoints,1) < 4
-
-        error(['The detected end surface contains fewer than ', ...
-               'four vertices. Try increasing angleDeg.']);
+        error('The detected end face contains fewer than four vertices.');
     end
 
-    %% Project the end face onto its best-fit plane
+    %% Project the end face onto a best-fit plane
 
     faceCenter = mean(endPoints,1);
 
-    centeredPoints = ...
-        endPoints-faceCenter;
+    centeredPoints = endPoints-faceCenter;
 
-    [~,~,planeBasis] = ...
-        svd(centeredPoints,0);
+    [~,~,planeBasis] = svd(centeredPoints,0);
 
     coordinates2D = ...
         centeredPoints*planeBasis(:,1:2);
 
-    %% Find the convex hull
+    %% Calculate the outer boundary
 
     hullIndices = convhull( ...
         coordinates2D(:,1), ...
         coordinates2D(:,2));
 
-    % convhull repeats the first point.
     hullIndices(end) = [];
 
-    if numel(hullIndices) < 4
-
-        error(['The detected end-face boundary contains fewer ', ...
-               'than four convex-hull vertices.']);
-    end
-
-    %% Fit a rectangle and select actual corner vertices
+    %% Fit a rectangle and select the four actual corner vertices
 
     [cornerPoints,rectangleInfo] = ...
         fitRectangleCorners( ...
         endPoints,coordinates2D,hullIndices);
 
-    %% Save diagnostic information
+    %% Diagnostic results
 
     endInfo.seedTriangle = seedTriangle;
-
-    endInfo.triangleIDs = ...
-        endTriangleIDs;
-
-    endInfo.vertexIDs = ...
-        endVertexIDs;
-
-    endInfo.vertices = ...
-        endPoints;
-
-    endInfo.referenceNormal = ...
-        referenceNormal;
-
-    endInfo.zExtreme = ...
-        zExtreme;
-
-    endInfo.planeTolerance = ...
-        planeTolerance;
-
-    endInfo.faceCenter = ...
-        faceCenter;
-
-    endInfo.planeBasis = ...
-        planeBasis;
-
-    endInfo.coordinates2D = ...
-        coordinates2D;
-
-    endInfo.hullIndices = ...
-        hullIndices;
-
-    endInfo.rectangle = ...
-        rectangleInfo;
+    endInfo.triangleIDs = endTriangleIDs;
+    endInfo.vertexIDs = endVertexIDs;
+    endInfo.vertices = endPoints;
+    endInfo.referenceNormal = referenceNormal;
+    endInfo.zExtreme = zExtreme;
+    endInfo.coordinates2D = coordinates2D;
+    endInfo.hullIndices = hullIndices;
+    endInfo.rectangle = rectangleInfo;
 end
 
 
 function [cornerPoints,rectangleInfo] = ...
     fitRectangleCorners(points3D,coordinates2D,hullIndices)
-%FITRECTANGLECORNERS Fit a minimum-area rectangle to the end-face boundary.
-%
-% This avoids trying to remove every nearly collinear STL boundary point.
-% The fitted rectangle corners are then matched to actual STL vertices.
+% Fit a minimum-area rectangle and select actual boundary corner vertices.
 
-    hull2D = ...
-        coordinates2D(hullIndices,:);
+    hull2D = coordinates2D(hullIndices,:);
 
-    numberHullPoints = ...
-        size(hull2D,1);
+    numberHullPoints = size(hull2D,1);
 
     bestArea = inf;
     bestAngle = [];
     bestLimits = [];
 
-    %% Test the direction of every hull edge
+    %% Test the orientation of each convex-hull edge
 
     for j = 1:numberHullPoints
 
-        nextPoint = ...
-            mod(j,numberHullPoints)+1;
+        nextPoint = mod(j,numberHullPoints)+1;
 
         edgeVector = ...
-            hull2D(nextPoint,:) - hull2D(j,:);
+            hull2D(nextPoint,:)-hull2D(j,:);
 
-        edgeLength = norm(edgeVector);
-
-        if edgeLength <= eps
+        if norm(edgeVector) <= eps
             continue
         end
 
         edgeAngle = atan2( ...
             edgeVector(2),edgeVector(1));
 
-        % A rectangle orientation repeats every 90 degrees.
         testAngle = mod(edgeAngle,pi/2);
 
         cosineAngle = cos(testAngle);
@@ -449,21 +292,15 @@ function [cornerPoints,rectangleInfo] = ...
         rotatedPoints = ...
             coordinates2D*rotationMatrix';
 
-        minimumCoordinate1 = ...
-            min(rotatedPoints(:,1));
+        minimum1 = min(rotatedPoints(:,1));
+        maximum1 = max(rotatedPoints(:,1));
 
-        maximumCoordinate1 = ...
-            max(rotatedPoints(:,1));
-
-        minimumCoordinate2 = ...
-            min(rotatedPoints(:,2));
-
-        maximumCoordinate2 = ...
-            max(rotatedPoints(:,2));
+        minimum2 = min(rotatedPoints(:,2));
+        maximum2 = max(rotatedPoints(:,2));
 
         rectangleArea = ...
-            (maximumCoordinate1-minimumCoordinate1)* ...
-            (maximumCoordinate2-minimumCoordinate2);
+            (maximum1-minimum1)* ...
+            (maximum2-minimum2);
 
         if rectangleArea < bestArea
 
@@ -471,32 +308,16 @@ function [cornerPoints,rectangleInfo] = ...
             bestAngle = testAngle;
 
             bestLimits = [
-                minimumCoordinate1,maximumCoordinate1
-                minimumCoordinate2,maximumCoordinate2];
+                minimum1,maximum1
+                minimum2,maximum2];
         end
     end
 
     if isempty(bestAngle)
-
-        error(['A rectangle could not be fitted to the ', ...
-               'detected end-face boundary.']);
+        error('Could not fit a rectangle to the end face.');
     end
 
-    %% Define fitted rectangle corners in rotated coordinates
-
-    minimumCoordinate1 = bestLimits(1,1);
-    maximumCoordinate1 = bestLimits(1,2);
-
-    minimumCoordinate2 = bestLimits(2,1);
-    maximumCoordinate2 = bestLimits(2,2);
-
-    fittedCornersRotated = [
-        maximumCoordinate1, maximumCoordinate2
-        maximumCoordinate1, minimumCoordinate2
-        minimumCoordinate1, maximumCoordinate2
-        minimumCoordinate1, minimumCoordinate2];
-
-    %% Transform fitted corners back to projected face coordinates
+    %% Rotate all end-face points to the fitted rectangle coordinates
 
     cosineAngle = cos(bestAngle);
     sineAngle = sin(bestAngle);
@@ -505,68 +326,89 @@ function [cornerPoints,rectangleInfo] = ...
          cosineAngle,  sineAngle
         -sineAngle,    cosineAngle];
 
-    fittedCorners2D = ...
-        fittedCornersRotated*rotationMatrix;
+    rotatedPoints = ...
+        coordinates2D*rotationMatrix';
 
-    %% Match each fitted corner to an actual boundary vertex
+    minimum1 = bestLimits(1,1);
+    maximum1 = bestLimits(1,2);
 
-    numberPoints = size(points3D,1);
+    minimum2 = bestLimits(2,1);
+    maximum2 = bestLimits(2,2);
 
-    isHullPoint = false(numberPoints,1);
-    isHullPoint(hullIndices) = true;
+    center1 = 0.5*(minimum1+maximum1);
+    center2 = 0.5*(minimum2+maximum2);
 
-    availablePoint = isHullPoint;
+    halfWidth1 = 0.5*(maximum1-minimum1);
+    halfWidth2 = 0.5*(maximum2-minimum2);
 
+    if halfWidth1 <= eps || halfWidth2 <= eps
+        error('The fitted end-face rectangle has zero width.');
+    end
+
+    %% Normalize the rectangle coordinates
+
+    normalizedCoordinates = zeros(size(rotatedPoints));
+
+    normalizedCoordinates(:,1) = ...
+        (rotatedPoints(:,1)-center1)/halfWidth1;
+
+    normalizedCoordinates(:,2) = ...
+        (rotatedPoints(:,2)-center2)/halfWidth2;
+
+    %% Select corners by support in four diagonal directions
+
+    % Only convex-hull vertices are allowed.
+    hullCoordinates = ...
+        normalizedCoordinates(hullIndices,:);
+
+    % Target directions in rectangle coordinates:
+    %   (+,+), (+,-), (-,+), (-,-)
+
+    targetDirections = [
+         1, 1
+         1,-1
+        -1, 1
+        -1,-1];
+
+    selectedLocalIndex = zeros(4,1);
     selectedPointIndex = zeros(4,1);
-    cornerError = zeros(4,1);
-    cornerPoints = zeros(4,3);
+    cornerScore = zeros(4,1);
+
+    availableHullPoint = true(numel(hullIndices),1);
 
     for j = 1:4
 
-        coordinateDifference = ...
-            coordinates2D - fittedCorners2D(j,:);
+        score = ...
+            hullCoordinates*targetDirections(j,:)';
 
-        distanceSquared = ...
-            sum(coordinateDifference.^2,2);
+        score(~availableHullPoint) = -inf;
 
-        % Only boundary points can be selected.
-        distanceSquared(~availablePoint) = inf;
+        [cornerScore(j),selectedLocalIndex(j)] = max(score);
 
-        [minimumDistanceSquared,selectedPointIndex(j)] = ...
-            min(distanceSquared);
+        selectedPointIndex(j) = ...
+            hullIndices(selectedLocalIndex(j));
 
-        if ~isfinite(minimumDistanceSquared)
-
-            error(['A unique STL boundary point could not be ', ...
-                   'assigned to every fitted rectangle corner.']);
-        end
-
-        cornerPoints(j,:) = ...
-            points3D(selectedPointIndex(j),:);
-
-        cornerError(j) = ...
-            sqrt(minimumDistanceSquared);
-
-        % Prevent the same STL vertex from being selected twice.
-        availablePoint(selectedPointIndex(j)) = false;
+        availableHullPoint(selectedLocalIndex(j)) = false;
     end
 
-    %% Check quality of fitted corners
+    cornerPoints = ...
+        points3D(selectedPointIndex,:);
 
-    faceRange = ...
-        max(coordinates2D,[],1) - ...
-        min(coordinates2D,[],1);
+    %% Calculate distance from ideal rectangle corners
 
-    faceScale = norm(faceRange);
+    idealCorners = targetDirections;
 
-    normalizedCornerError = ...
-        cornerError/max(faceScale,eps);
+    selectedNormalizedCoordinates = ...
+        normalizedCoordinates(selectedPointIndex,:);
 
-    if any(normalizedCornerError > 0.02)
+    normalizedCornerError = sqrt(sum( ...
+        (selectedNormalizedCoordinates-idealCorners).^2,2));
 
-        warning(['One or more fitted corners are relatively far ', ...
-                 'from an actual STL boundary vertex. Maximum ', ...
-                 'normalized corner error = %g.'], ...
+    if any(normalizedCornerError > 0.10)
+
+        warning(['One or more selected vertices are relatively far ', ...
+                 'from the fitted rectangle corners. Maximum ', ...
+                 'normalized error = %g.'], ...
                  max(normalizedCornerError));
     end
 
@@ -574,25 +416,24 @@ function [cornerPoints,rectangleInfo] = ...
 
     rectangleInfo.angleRadians = bestAngle;
     rectangleInfo.angleDegrees = bestAngle*180/pi;
-
     rectangleInfo.area = bestArea;
-
-    rectangleInfo.fittedCorners2D = ...
-        fittedCorners2D;
+    rectangleInfo.limits = bestLimits;
 
     rectangleInfo.selectedPointIndex = ...
         selectedPointIndex;
 
-    rectangleInfo.cornerError = ...
-        cornerError;
+    rectangleInfo.selectedNormalizedCoordinates = ...
+        selectedNormalizedCoordinates;
 
     rectangleInfo.normalizedCornerError = ...
         normalizedCornerError;
+
+    rectangleInfo.cornerScore = cornerScore;
 end
 
 
 function neighbors = triangleNeighbors(F)
-%TRIANGLENEIGHBORS Find triangles that share an entire edge.
+% Find triangles sharing an entire mesh edge.
 
     numberTriangles = size(F,1);
 
@@ -607,11 +448,9 @@ function neighbors = triangleNeighbors(F)
     [edges,sortingIndex] = ...
         sortrows(edges,[1 2]);
 
-    triangleID = ...
-        triangleID(sortingIndex);
+    triangleID = triangleID(sortingIndex);
 
-    neighbors = ...
-        cell(numberTriangles,1);
+    neighbors = cell(numberTriangles,1);
 
     firstEdge = 1;
 
@@ -651,17 +490,7 @@ end
 
 
 function orderedCorners = orderXY(cornerPoints)
-%ORDERXY Order four corners using global x and y coordinates.
-%
-% Output order:
-%   1  larger x, larger y
-%   2  larger x, smaller y
-%   3  smaller x, larger y
-%   4  smaller x, smaller y
-
-    if size(cornerPoints,1) ~= 4
-        error('Exactly four corner points are required.');
-    end
+% Order corners using global x and y coordinates.
 
     [~,xOrder] = ...
         sort(cornerPoints(:,1),'descend');
@@ -672,17 +501,17 @@ function orderedCorners = orderXY(cornerPoints)
     smallerXPoints = ...
         cornerPoints(xOrder(3:4),:);
 
-    [~,largerXYOrder] = ...
+    [~,yOrder] = ...
         sort(largerXPoints(:,2),'descend');
 
     largerXPoints = ...
-        largerXPoints(largerXYOrder,:);
+        largerXPoints(yOrder,:);
 
-    [~,smallerXYOrder] = ...
+    [~,yOrder] = ...
         sort(smallerXPoints(:,2),'descend');
 
     smallerXPoints = ...
-        smallerXPoints(smallerXYOrder,:);
+        smallerXPoints(yOrder,:);
 
     orderedCorners = [
         largerXPoints
@@ -691,7 +520,7 @@ end
 
 
 function [V,F] = getMeshArrays(stlData)
-%GETMESHARRAYS Read arrays from stlread output.
+% Read arrays from MATLAB stlread output.
 
     if isa(stlData,'triangulation')
 
@@ -703,8 +532,8 @@ function [V,F] = getMeshArrays(stlData)
 
     if ~isstruct(stlData)
 
-        error(['Input must be either a triangulation object ', ...
-               'or a structure containing faces and vertices.']);
+        error(['Input must be a triangulation object or a ', ...
+               'structure containing faces and vertices.']);
     end
 
     fieldNames = fieldnames(stlData);
@@ -717,7 +546,7 @@ function [V,F] = getMeshArrays(stlData)
 
     if isempty(vertexField) || isempty(faceField)
 
-        error(['The input structure must contain fields named ', ...
+        error(['The structure must contain fields named ', ...
                'vertices and faces.']);
     end
 
