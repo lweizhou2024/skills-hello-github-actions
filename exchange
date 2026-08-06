@@ -1,29 +1,249 @@
-filename = 'myVideo.mp4';
-v = VideoReader(filename);
+[corners, info] = extractTangCorners(stl, 1e-5);
+patch('Faces',stl.faces, ...
+      'Vertices',stl.vertices, ...
+      'FaceColor',[0.8 0.8 0.8], ...
+      'EdgeColor','none');
 
-frameNumber = 0;
+axis equal
+hold on
+scatter3(corners(:,1),corners(:,2),corners(:,3),80,'r','filled');
 
-figure;
+for k = 1:8
+    text(corners(k,1),corners(k,2),corners(k,3), ...
+        sprintf('  %d',k),'Color','b','FontSize',12);
+end
 
-while hasFrame(v)
-    try
-        frame = readFrame(v);
-        frameNumber = frameNumber + 1;
+camlight
+lighting gouraud
 
-        % Display every 10th decoded frame
-        if mod(frameNumber, 10) == 1
-            imshow(frame);
-            title(sprintf('Decoded frame %d, time %.3f s', ...
-                frameNumber, v.CurrentTime));
-            drawnow;
+
+function [corners, info] = extractTangCorners(stlData, tol)
+%EXTRACTTANGCORNERS Find and order the 8 corners of rectangular tang end faces.
+%
+% [CORNERS,INFO] = extractTangCorners(STLDATA)
+% [CORNERS,INFO] = extractTangCorners(STLDATA,TOL)
+%
+% STLDATA can be either:
+%   1) a structure with fields .vertices and .faces (case-insensitive), or
+%   2) a triangulation object.
+%
+% CORNERS is 8-by-3. Rows 1:4 belong to the end having the larger mean z;
+% rows 5:8 belong to the other end. Within each end the order is:
+%   1  larger x, larger y
+%   2  larger x, smaller y
+%   3  smaller x, larger y
+%   4  smaller x, smaller y
+%
+% The method merges duplicated STL vertices, groups neighboring coplanar
+% triangles, reduces each planar boundary to its true polygon corners, and
+% selects the two rectangular patches at the z ends. The end planes may be
+% inclined relative to the z axis.
+%
+% TOL is a coordinate tolerance. Its default is 1e-7 times the STL bounding
+% box diagonal (with a small absolute lower bound).
+
+    [V,F] = getMeshArrays(stlData);
+    V = double(V); F = double(F);
+
+    if size(V,2) ~= 3 || size(F,2) ~= 3
+        error('Vertices and faces must both have three columns.');
+    end
+
+    boxDiag = norm(max(V,[],1) - min(V,[],1));
+    if nargin < 2 || isempty(tol)
+        tol = max(1e-12, 1e-7*boxDiag);
+    end
+
+    % Collapse duplicated STL vertices by tolerance-sized coordinate bins.
+    Q = round(V/tol);
+    [~,~,oldToNew] = unique(Q,'rows');
+    nUnique = max(oldToNew);
+    Vu = zeros(nUnique,3);
+    counts = accumarray(oldToNew,1);
+    for j = 1:3
+        Vu(:,j) = accumarray(oldToNew,V(:,j))./counts;
+    end
+    Fu = reshape(oldToNew(F(:)),size(F));
+
+    % Remove zero-area triangles, if any.
+    e1 = Vu(Fu(:,2),:) - Vu(Fu(:,1),:);
+    e2 = Vu(Fu(:,3),:) - Vu(Fu(:,1),:);
+    cr = cross(e1,e2,2);
+    twiceArea = sqrt(sum(cr.^2,2));
+    keep = twiceArea > max(tol^2,eps);
+    Fu = Fu(keep,:); cr = cr(keep,:); twiceArea = twiceArea(keep);
+    N = cr./twiceArea(:,[1 1 1]);
+
+    % Connect triangles sharing an edge, but only if they are coplanar.
+    nt = size(Fu,1);
+    edges = [sort(Fu(:,[1 2]),2); sort(Fu(:,[2 3]),2); ...
+             sort(Fu(:,[3 1]),2)];
+    triId = repmat((1:nt)',3,1);
+    [edgesSorted,ord] = sortrows(edges,[1 2]);
+    triSorted = triId(ord);
+    parent = (1:nt)';
+    angleTol = 1e-6;                 % based on 1-abs(dot(n1,n2))
+    planeTol = 5*tol;
+    k = 1;
+    while k <= size(edgesSorted,1)
+        q = k;
+        while q < size(edgesSorted,1) && ...
+              all(edgesSorted(q+1,:) == edgesSorted(k,:))
+            q = q + 1;
         end
+        if q > k
+            ids = unique(triSorted(k:q));
+            for a = 1:numel(ids)-1
+                for b = a+1:numel(ids)
+                    i = ids(a); j = ids(b);
+                    parallel = 1-abs(dot(N(i,:),N(j,:))) <= angleTol;
+                    d = abs(dot(N(i,:),Vu(Fu(j,1),:)-Vu(Fu(i,1),:)));
+                    if parallel && d <= planeTol
+                        parent = unionSets(parent,i,j);
+                    end
+                end
+            end
+        end
+        k = q + 1;
+    end
+    for i = 1:nt
+        parent(i) = findRoot(parent,i);
+    end
+    componentIds = unique(parent);
 
-    catch ME
-        fprintf('Reading failed near frame %d, time %.3f seconds.\n', ...
-            frameNumber + 1, v.CurrentTime);
-        fprintf('Error: %s\n', ME.message);
-        break
+    % Retain planar components whose convex boundary simplifies to 4 corners.
+    cand = struct('corners',{},'meanZ',{},'area',{},'normal',{},'triangles',{});
+    for ic = 1:numel(componentIds)
+        ids = find(parent == componentIds(ic));
+        vids = unique(Fu(ids,:));
+        P = Vu(vids,:);
+        if size(P,1) < 4, continue; end
+
+        % Align triangle normals before averaging; some STL exporters do not
+        % use consistent triangle winding.
+        Nc = N(ids,:);
+        flip = Nc*Nc(1,:)' < 0;
+        Nc(flip,:) = -Nc(flip,:);
+        n = sum(Nc.*twiceArea(ids,[1 1 1]),1);
+        if norm(n) == 0, continue; end
+        n = n/norm(n);
+        if abs(n(3)) < 0.25, continue; end % reject tang faces parallel to z
+
+        ctr = mean(P,1);
+        [~,~,vv] = svd(P-ctr,0);
+        uv = (P-ctr)*vv(:,1:2);
+        try
+            h = convhull(uv(:,1),uv(:,2));
+        catch
+            continue
+        end
+        h(end) = [];
+        h = removeCollinearHullPoints(h,uv,tol);
+        if numel(h) ~= 4, continue; end
+
+        C = P(h,:);
+        A = polyarea(uv(h,1),uv(h,2));
+        cand(end+1).corners = C; %#ok<AGROW>
+        cand(end).meanZ = mean(C(:,3));
+        cand(end).area = A;
+        cand(end).normal = n;
+        cand(end).triangles = ids;
+    end
+
+    if numel(cand) < 2
+        error(['Could not find two rectangular end-face patches. Try a larger ',...
+               'tol, or inspect whether the end faces are planar and closed.']);
+    end
+
+    % Highest and lowest rectangular patches. Area breaks near-equal z ties.
+    z = [cand.meanZ]';
+    ar = [cand.area]';
+    zRange = max(Vu(:,3))-min(Vu(:,3));
+    zTie = max(10*tol,1e-9*max(zRange,1));
+    hiPool = find(z >= max(z)-zTie);
+    loPool = find(z <= min(z)+zTie);
+    [~,ii] = max(ar(hiPool)); hi = hiPool(ii);
+    [~,ii] = max(ar(loPool)); lo = loPool(ii);
+    if hi == lo
+        error('The two end faces could not be distinguished by their z positions.');
+    end
+
+    highCorners = orderXY(cand(hi).corners);
+    lowCorners  = orderXY(cand(lo).corners);
+    corners = [highCorners; lowCorners];
+
+    info.highEnd = cand(hi);
+    info.lowEnd = cand(lo);
+    info.tolerance = tol;
+    info.uniqueVertices = Vu;
+end
+
+function C = orderXY(C)
+% Use all 24 assignments so small mesh noise cannot upset x/y grouping.
+    p = perms(1:4);
+    best = inf; bestOrder = [];
+    for k = 1:size(p,1)
+        T = C(p(k,:),:);
+        % Desired signs: (++), (+-), (-+), (--).
+        penalty = (T(1,1)-T(2,1))^2 + (T(3,1)-T(4,1))^2 + ...
+                  (T(1,2)-T(3,2))^2 + (T(2,2)-T(4,2))^2;
+        penalty = penalty + max(0,T(3,1)-T(1,1))^2 + ...
+                  max(0,T(4,1)-T(2,1))^2 + ...
+                  max(0,T(2,2)-T(1,2))^2 + ...
+                  max(0,T(4,2)-T(3,2))^2;
+        if penalty < best
+            best = penalty; bestOrder = p(k,:);
+        end
+    end
+    C = C(bestOrder,:);
+end
+
+function h = removeCollinearHullPoints(h,uv,tol3d)
+    changed = true;
+    scale = max(max(uv,[],1)-min(uv,[],1));
+    lineTol = max(10*tol3d,1e-8*max(scale,1));
+    while changed && numel(h) > 3
+        changed = false;
+        m = numel(h);
+        for i = 1:m
+            ip = mod(i-2,m)+1; in = mod(i,m)+1;
+            a = uv(h(ip),:); b = uv(h(i),:); c = uv(h(in),:);
+            ac = c-a;
+            if norm(ac) == 0
+                dist = norm(b-a);
+            else
+                dist = abs(ac(1)*(a(2)-b(2))-ac(2)*(a(1)-b(1)))/norm(ac);
+            end
+            if dist <= lineTol
+                h(i) = []; changed = true; break
+            end
+        end
     end
 end
 
-fprintf('Successfully decoded %d frames.\n', frameNumber);
+function parent = unionSets(parent,a,b)
+    ra = findRoot(parent,a); rb = findRoot(parent,b);
+    if ra ~= rb, parent(rb) = ra; end
+end
+
+function r = findRoot(parent,a)
+    r = a;
+    while parent(r) ~= r, r = parent(r); end
+end
+
+function [V,F] = getMeshArrays(s)
+    if isa(s,'triangulation')
+        V = s.Points; F = s.ConnectivityList; return
+    end
+    if ~isstruct(s)
+        error(['Input must be an STL structure or triangulation. Read the STL ',...
+               'using your existing stlread function, then pass its output here.']);
+    end
+    names = fieldnames(s);
+    iv = find(strcmpi(names,'vertices'),1);
+    iff = find(strcmpi(names,'faces'),1);
+    if isempty(iv) || isempty(iff)
+        error('The structure must contain fields named vertices and faces.');
+    end
+    V = s.(names{iv}); F = s.(names{iff});
+end
