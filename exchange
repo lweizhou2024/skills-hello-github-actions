@@ -1,640 +1,499 @@
-function [corners,info] = extractTangCorners(stlData,angleDeg)
-%EXTRACTTANGCORNERS Extract tang-end corners from an airfoil STL.
+[largeXEndpoints,smallXEndpoints,sideInfo] = ...
+    findTwoStraightSides( ...
+    boundaryEdges,V,modelSize);
+
+largeXInfo = sideInfo.largeX;
+smallXInfo = sideInfo.smallX;
+
+
+function [largeXEndpoints,smallXEndpoints,sideInfo] = ...
+    findTwoStraightSides(boundaryEdges,V,modelSize)
+%FINDTWOSTRAIGHTSIDES Find the two straight side runs of the boundary.
 %
-% [corners,info] = extractTangCorners(stlData)
-% [corners,info] = extractTangCorners(stlData,angleDeg)
-%
-% The tang end cross section is assumed to have:
-%   - one straight boundary edge on the larger-x side;
-%   - one straight boundary edge on the smaller-x side;
-%   - two curved boundaries following the airfoil shape.
-%
-% The four corners of each end face are defined as the endpoints of the
-% two straight side edges.
-%
-% INPUT
-% -----
-% stlData:
-%   Output from MATLAB's built-in stlread.
-%
-% angleDeg:
-%   Maximum normal variation used when growing the end face.
-%   Default = 8 degrees.
-%
-% OUTPUT ORDER
-% ------------
-% Higher-z tang end:
-%   1  larger x, larger y
-%   2  larger x, smaller y
-%   3  smaller x, larger y
-%   4  smaller x, smaller y
-%
-% Lower-z tang end:
-%   5  larger x, larger y
-%   6  larger x, smaller y
-%   7  smaller x, larger y
-%   8  smaller x, smaller y
+% The boundary is first ordered into a continuous loop. Consecutive
+% collinear edges are merged into straight runs. The two long runs that
+% extend mainly in y and lie on opposite x sides are selected.
 
-    %% Read the STL data
+    %% Order boundary vertices into a continuous loop
 
-    [V,F] = getMeshArrays(stlData);
+    boundaryVertexLoop = ...
+        orderBoundaryLoop(boundaryEdges);
 
-    V = double(V);
-    F = double(F);
+    P = V(boundaryVertexLoop,:);
 
-    if size(V,2) ~= 3 || size(F,2) ~= 3
-        error('Vertices and faces must each have three columns.');
+    numberPoints = size(P,1);
+
+    if numberPoints < 4
+        error('The end-face boundary has fewer than four vertices.');
     end
 
-    if nargin < 2 || isempty(angleDeg)
-        angleDeg = 8;
+    %% Boundary dimensions
+
+    xRange = max(P(:,1))-min(P(:,1));
+    yRange = max(P(:,2))-min(P(:,2));
+
+    if xRange <= eps || yRange <= eps
+        error('The end-face boundary has zero x or y range.');
     end
 
-    if angleDeg <= 0 || angleDeg >= 90
-        error('angleDeg must be between 0 and 90 degrees.');
-    end
+    xCenter = 0.5*(max(P(:,1))+min(P(:,1)));
 
-    modelRange = max(V,[],1)-min(V,[],1);
-    modelSize = norm(modelRange);
+    %% Settings for grouping consecutive collinear edges
 
-    if modelSize <= 0
-        error('The STL model has zero size.');
-    end
+    lineAngleToleranceDeg = 2.0;
 
-    coordinateTolerance = max(1e-12,1e-8*modelSize);
+    cosineLimit = ...
+        cos(lineAngleToleranceDeg*pi/180);
 
-    %% Remove degenerate triangles and calculate triangle normals
-
-    edge1 = V(F(:,2),:)-V(F(:,1),:);
-    edge2 = V(F(:,3),:)-V(F(:,1),:);
-
-    normalVector = cross(edge1,edge2,2);
-
-    normalMagnitude = sqrt(sum(normalVector.^2,2));
-
-    goodTriangle = ...
-        normalMagnitude > max(coordinateTolerance^2,eps);
-
-    F = F(goodTriangle,:);
-    normalVector = normalVector(goodTriangle,:);
-    normalMagnitude = normalMagnitude(goodTriangle);
-
-    triangleNormals = ...
-        normalVector./normalMagnitude(:,[1 1 1]);
-
-    %% Find triangle neighbors
-
-    neighbors = triangleNeighbors(F);
-
-    %% Extract the high-z tang end
-
-    [highCorners,highInfo] = growEndCap( ...
-        V,F,triangleNormals,neighbors,+1, ...
-        coordinateTolerance,modelSize,angleDeg);
-
-    %% Extract the low-z tang end
-
-    [lowCorners,lowInfo] = growEndCap( ...
-        V,F,triangleNormals,neighbors,-1, ...
-        coordinateTolerance,modelSize,angleDeg);
-
-    %% Put corners in requested order
-
-    highCorners = orderXY(highCorners);
-    lowCorners = orderXY(lowCorners);
-
-    corners = [
-        highCorners
-        lowCorners];
-
-    %% Diagnostic output
-
-    info.highEnd = highInfo;
-    info.lowEnd = lowInfo;
-
-    info.angleDeg = angleDeg;
-    info.coordinateTolerance = coordinateTolerance;
-end
-
-
-function [cornerPoints,endInfo] = growEndCap( ...
-    V,F,N,neighbors,zSign,coordinateTolerance,modelSize,angleDeg)
-% Start from one global z extremity and grow its connected end face.
-
-    %% Locate vertices at the requested z extremity
-
-    if zSign > 0
-
-        zExtreme = max(V(:,3));
-
-        extremeVertexIDs = find( ...
-            V(:,3) >= zExtreme-5*coordinateTolerance);
-
-    else
-
-        zExtreme = min(V(:,3));
-
-        extremeVertexIDs = find( ...
-            V(:,3) <= zExtreme+5*coordinateTolerance);
-    end
-
-    %% Find triangles touching the extreme vertices
-
-    touchingTriangles = find( ...
-        any(ismember(F,extremeVertexIDs),2));
-
-    if isempty(touchingTriangles)
-        error('No triangle was found at one z extremity.');
-    end
-
-    %% Choose the most z-facing triangle as the seed
-
-    [largestNormalZ,index] = ...
-        max(abs(N(touchingTriangles,3)));
-
-    seedTriangle = touchingTriangles(index);
-
-    if largestNormalZ < 0.10
-
-        error(['The tang end appears nearly parallel to the ', ...
-               'z stacking axis.']);
-    end
-
-    referenceNormal = N(seedTriangle,:);
-    referencePoint = V(F(seedTriangle,1),:);
-
-    %% Grow the connected end-face triangles
-
-    cosineLimit = cos(angleDeg*pi/180);
-
-    planeTolerance = max( ...
-        50*coordinateTolerance, ...
-        1e-4*modelSize);
-
-    usedTriangle = false(size(F,1),1);
-    usedTriangle(seedTriangle) = true;
-
-    triangleQueue = seedTriangle;
-    queuePosition = 1;
-
-    while queuePosition <= numel(triangleQueue)
-
-        currentTriangle = ...
-            triangleQueue(queuePosition);
-
-        queuePosition = queuePosition+1;
-
-        adjacentTriangles = ...
-            neighbors{currentTriangle};
-
-        for j = 1:numel(adjacentTriangles)
-
-            candidateTriangle = ...
-                adjacentTriangles(j);
-
-            if usedTriangle(candidateTriangle)
-                continue
-            end
-
-            normalOK = abs(dot( ...
-                N(candidateTriangle,:), ...
-                referenceNormal)) >= cosineLimit;
-
-            candidatePoints = ...
-                V(F(candidateTriangle,:),:);
-
-            planeDistance = abs( ...
-                (candidatePoints-referencePoint)* ...
-                referenceNormal');
-
-            planeOK = ...
-                max(planeDistance) <= planeTolerance;
-
-            if normalOK && planeOK
-
-                usedTriangle(candidateTriangle) = true;
-
-                triangleQueue(end+1) = ...
-                    candidateTriangle; %#ok<AGROW>
-            end
-        end
-    end
-
-    %% Extract the end-face boundary edges
-
-    endTriangleIDs = find(usedTriangle);
-
-    [boundaryEdges,boundaryVertexIDs] = ...
-        findBoundaryEdges(F(endTriangleIDs,:));
-
-    boundaryPoints = V(boundaryVertexIDs,:);
-
-    if size(boundaryPoints,1) < 4
-
-        error(['The detected end face has fewer than four ', ...
-               'boundary vertices.']);
-    end
-
-    %% Detect the straight larger-x side
-
-    [largeXEndpoints,largeXInfo] = ...
-        findStraightSide( ...
-        boundaryPoints,+1,modelSize);
-
-    %% Detect the straight smaller-x side
-
-    [smallXEndpoints,smallXInfo] = ...
-        findStraightSide( ...
-        boundaryPoints,-1,modelSize);
-
-    %% Combine the four endpoints
-
-    cornerPoints = [
-        largeXEndpoints
-        smallXEndpoints];
-
-    %% Diagnostic output
-
-    endInfo.seedTriangle = seedTriangle;
-    endInfo.triangleIDs = endTriangleIDs;
-
-    endInfo.boundaryEdges = boundaryEdges;
-    endInfo.boundaryVertexIDs = boundaryVertexIDs;
-    endInfo.boundaryPoints = boundaryPoints;
-
-    endInfo.largeXSide = largeXInfo;
-    endInfo.smallXSide = smallXInfo;
-
-    endInfo.zExtreme = zExtreme;
-    endInfo.referenceNormal = referenceNormal;
-end
-
-
-function [sideEndpoints,sideInfo] = ...
-    findStraightSide(boundaryPoints,xSign,modelSize)
-% Find one straight side of the end-face boundary.
-%
-% xSign = +1:
-%   Search for the straight edge on the larger-x side.
-%
-% xSign = -1:
-%   Search for the straight edge on the smaller-x side.
-
-    x = boundaryPoints(:,1);
-
-    minimumX = min(x);
-    maximumX = max(x);
-
-    xRange = maximumX-minimumX;
-
-    if xRange <= eps
-        error('The end-face boundary has zero x range.');
-    end
-
-    %% Restrict the search to the appropriate x-side region
-
-    % A relatively wide band permits a slightly inclined straight side.
-
-    sideBandFraction = 0.30;
-
-    if xSign > 0
-
-        candidateIndex = find( ...
-            x >= maximumX-sideBandFraction*xRange);
-
-    else
-
-        candidateIndex = find( ...
-            x <= minimumX+sideBandFraction*xRange);
-    end
-
-    candidatePoints = ...
-        boundaryPoints(candidateIndex,:);
-
-    if size(candidatePoints,1) < 2
-
-        error(['Not enough boundary points were found on one ', ...
-               'x side of the tang end.']);
-    end
-
-    %% Test lines through all candidate point pairs
-
-    lineTolerance = max( ...
+    lineDistanceTolerance = max( ...
         1e-7*modelSize, ...
-        1e-5*xRange);
+        1e-5*max(xRange,yRange));
 
-    bestScore = -inf;
-    bestPoint1 = [];
-    bestPoint2 = [];
-    bestInlier = [];
-    bestDirection = [];
+    %% Find every possible consecutive straight run
 
-    numberCandidatePoints = ...
-        size(candidatePoints,1);
+    runs = struct( ...
+        'startIndex',{}, ...
+        'endIndex',{}, ...
+        'numberEdges',{}, ...
+        'endpoint1',{}, ...
+        'endpoint2',{}, ...
+        'midpoint',{}, ...
+        'length',{}, ...
+        'ySpan',{}, ...
+        'verticalFraction',{}, ...
+        'indices',{});
 
-    for j = 1:numberCandidatePoints-1
+    numberRuns = 0;
 
-        for k = j+1:numberCandidatePoints
+    for startIndex = 1:numberPoints
 
-            point1 = candidatePoints(j,:);
-            point2 = candidatePoints(k,:);
+        nextIndex = mod(startIndex,numberPoints)+1;
 
-            lineDirection = point2-point1;
-            lineLength = norm(lineDirection);
+        firstVector = P(nextIndex,:)-P(startIndex,:);
 
-            if lineLength <= lineTolerance
-                continue
+        firstLength = norm(firstVector);
+
+        if firstLength <= eps
+            continue
+        end
+
+        referenceDirection = ...
+            firstVector/firstLength;
+
+        referencePoint = ...
+            P(startIndex,:);
+
+        runIndices = startIndex;
+
+        currentIndex = startIndex;
+        numberEdges = 0;
+
+        while numberEdges < numberPoints-1
+
+            followingIndex = ...
+                mod(currentIndex,numberPoints)+1;
+
+            currentVector = ...
+                P(followingIndex,:)-P(currentIndex,:);
+
+            currentLength = norm(currentVector);
+
+            if currentLength <= eps
+                break
             end
 
-            unitDirection = ...
-                lineDirection/lineLength;
+            currentDirection = ...
+                currentVector/currentLength;
 
-            %% The side edge should run mainly in the y direction
+            %% Require the next edge to remain parallel to the first edge
 
-            xyLength = norm(unitDirection(1:2));
+            directionOK = ...
+                dot(currentDirection,referenceDirection) >= cosineLimit;
 
-            if xyLength <= eps
-                continue
+            if ~directionOK
+                break
             end
 
-            yDirectionFraction = ...
-                abs(unitDirection(2))/xyLength;
-
-            if yDirectionFraction < 0.50
-                continue
-            end
-
-            %% Calculate distances from every boundary point to this line
+            %% Require the next vertex to remain on the same straight line
 
             vectorFromLine = ...
-                boundaryPoints-point1;
+                P(followingIndex,:)-referencePoint;
 
-            projection = ...
-                vectorFromLine*unitDirection';
+            lineProjection = ...
+                dot(vectorFromLine,referenceDirection);
 
             closestPoint = ...
-                point1 + projection*unitDirection;
+                referencePoint + ...
+                lineProjection*referenceDirection;
 
-            lineDistance = sqrt(sum( ...
-                (boundaryPoints-closestPoint).^2,2));
+            distanceFromLine = ...
+                norm(P(followingIndex,:)-closestPoint);
 
-            inlier = ...
-                lineDistance <= lineTolerance;
+            lineOK = ...
+                distanceFromLine <= lineDistanceTolerance;
 
-            if sum(inlier) < 2
-                continue
+            if ~lineOK
+                break
             end
 
-            inlierPoints = ...
-                boundaryPoints(inlier,:);
+            runIndices(end+1) = followingIndex; %#ok<AGROW>
 
-            meanInlierX = ...
-                mean(inlierPoints(:,1));
-
-            %% Reject lines that are not on the requested outer side
-
-            normalizedX = ...
-                (meanInlierX-minimumX)/xRange;
-
-            if xSign > 0
-
-                outerPositionScore = normalizedX;
-
-                if normalizedX < 0.60
-                    continue
-                end
-
-            else
-
-                outerPositionScore = 1-normalizedX;
-
-                if normalizedX > 0.40
-                    continue
-                end
-            end
-
-            %% Measure the length covered by collinear inlier points
-
-            inlierProjection = ...
-                (inlierPoints-point1)*unitDirection';
-
-            lineSpan = ...
-                max(inlierProjection)-min(inlierProjection);
-
-            numberInliers = sum(inlier);
-
-            % Long straight lines on the appropriate outer side receive
-            % the largest score. The inlier term favors a subdivided
-            % straight edge over a chord through two curved-edge points.
-
-            score = lineSpan* ...
-                (1+0.10*max(numberInliers-2,0))* ...
-                (0.5+outerPositionScore);
-
-            if score > bestScore
-
-                bestScore = score;
-                bestPoint1 = point1;
-                bestPoint2 = point2;
-                bestInlier = inlier;
-                bestDirection = unitDirection;
-            end
+            numberEdges = numberEdges+1;
+            currentIndex = followingIndex;
         end
+
+        if numberEdges < 1
+            continue
+        end
+
+        endpoint1 = P(runIndices(1),:);
+        endpoint2 = P(runIndices(end),:);
+
+        runVector = endpoint2-endpoint1;
+        runLength = norm(runVector);
+
+        if runLength <= eps
+            continue
+        end
+
+        runXYLength = norm(runVector(1:2));
+
+        if runXYLength <= eps
+            continue
+        end
+
+        verticalFraction = ...
+            abs(runVector(2))/runXYLength;
+
+        ySpan = ...
+            abs(endpoint2(2)-endpoint1(2));
+
+        numberRuns = numberRuns+1;
+
+        runs(numberRuns).startIndex = ...
+            runIndices(1);
+
+        runs(numberRuns).endIndex = ...
+            runIndices(end);
+
+        runs(numberRuns).numberEdges = ...
+            numberEdges;
+
+        runs(numberRuns).endpoint1 = ...
+            endpoint1;
+
+        runs(numberRuns).endpoint2 = ...
+            endpoint2;
+
+        runs(numberRuns).midpoint = ...
+            0.5*(endpoint1+endpoint2);
+
+        runs(numberRuns).length = ...
+            runLength;
+
+        runs(numberRuns).ySpan = ...
+            ySpan;
+
+        runs(numberRuns).verticalFraction = ...
+            verticalFraction;
+
+        runs(numberRuns).indices = ...
+            runIndices;
     end
 
-    if isempty(bestPoint1)
-
-        error(['A straight boundary edge could not be found on ', ...
-               'one x side of the tang end.']);
+    if numel(runs) < 2
+        error('Fewer than two straight boundary runs were detected.');
     end
 
-    %% Use the endpoints of the fitted straight-line run
+    %% Retain runs that can represent a left or right side
 
-    straightPoints = ...
-        boundaryPoints(bestInlier,:);
+    allYSpan = [runs.ySpan]';
+    allVerticalFraction = [runs.verticalFraction]';
 
-    straightProjection = ...
-        (straightPoints-bestPoint1)*bestDirection';
+    % The straight sides connect the upper and lower curved boundaries,
+    % so they should have substantial y extent.
 
-    [~,minimumIndex] = min(straightProjection);
-    [~,maximumIndex] = max(straightProjection);
+    minimumYSpan = 0.25*yRange;
 
-    endpoint1 = straightPoints(minimumIndex,:);
-    endpoint2 = straightPoints(maximumIndex,:);
+    acceptable = ...
+        allYSpan >= minimumYSpan & ...
+        allVerticalFraction >= 0.50;
 
-    %% Put larger-y endpoint first
+    candidateRuns = runs(acceptable);
 
-    if endpoint1(2) >= endpoint2(2)
+    if numel(candidateRuns) < 2
 
-        sideEndpoints = [
-            endpoint1
-            endpoint2];
+        % Relax the y-span criterion if the tang is strongly inclined.
+        acceptable = ...
+            allYSpan >= 0.10*yRange & ...
+            allVerticalFraction >= 0.40;
 
-    else
-
-        sideEndpoints = [
-            endpoint2
-            endpoint1];
+        candidateRuns = runs(acceptable);
     end
 
-    %% Diagnostic output
+    if numel(candidateRuns) < 2
 
-    sideInfo.endpoints = sideEndpoints;
-    sideInfo.inlierPoints = straightPoints;
-    sideInfo.direction = bestDirection;
-    sideInfo.score = bestScore;
-    sideInfo.lineTolerance = lineTolerance;
-    sideInfo.initialPoint1 = bestPoint1;
-    sideInfo.initialPoint2 = bestPoint2;
+        error(['Could not identify two long, mostly y-directed ', ...
+               'straight boundary runs.']);
+    end
+
+    %% Remove duplicate runs
+
+    candidateRuns = ...
+        removeDuplicateRuns(candidateRuns);
+
+    if numel(candidateRuns) < 2
+
+        error(['Only one distinct straight side run was found ', ...
+               'on the end-face boundary.']);
+    end
+
+    %% Score candidates by x side, length and y extent
+
+    numberCandidates = ...
+        numel(candidateRuns);
+
+    rightScore = -inf(numberCandidates,1);
+    leftScore = -inf(numberCandidates,1);
+
+    for j = 1:numberCandidates
+
+        meanX = ...
+            candidateRuns(j).midpoint(1);
+
+        normalizedX = ...
+            (meanX-xCenter)/xRange;
+
+        normalizedYSpan = ...
+            candidateRuns(j).ySpan/yRange;
+
+        normalizedLength = ...
+            candidateRuns(j).length/ ...
+            max(xRange,yRange);
+
+        % Position is the primary criterion. Span and length are secondary.
+
+        rightScore(j) = ...
+            normalizedX + ...
+            0.20*normalizedYSpan + ...
+            0.05*normalizedLength;
+
+        leftScore(j) = ...
+            -normalizedX + ...
+            0.20*normalizedYSpan + ...
+            0.05*normalizedLength;
+    end
+
+    %% Select larger-x side
+
+    [~,largeXRunIndex] = ...
+        max(rightScore);
+
+    %% Select smaller-x side, excluding the already selected run
+
+    leftScore(largeXRunIndex) = -inf;
+
+    [~,smallXRunIndex] = ...
+        max(leftScore);
+
+    largeXRun = ...
+        candidateRuns(largeXRunIndex);
+
+    smallXRun = ...
+        candidateRuns(smallXRunIndex);
+
+    %% Verify that the selected runs are on opposite x sides
+
+    if largeXRun.midpoint(1) <= smallXRun.midpoint(1)
+
+        error(['The two detected straight runs could not be ', ...
+               'separated into larger-x and smaller-x sides.']);
+    end
+
+    %% Extract endpoints
+
+    largeXEndpoints = [
+        largeXRun.endpoint1
+        largeXRun.endpoint2];
+
+    smallXEndpoints = [
+        smallXRun.endpoint1
+        smallXRun.endpoint2];
+
+    %% Put larger-y endpoint first on each side
+
+    if largeXEndpoints(1,2) < largeXEndpoints(2,2)
+
+        largeXEndpoints = ...
+            largeXEndpoints([2 1],:);
+    end
+
+    if smallXEndpoints(1,2) < smallXEndpoints(2,2)
+
+        smallXEndpoints = ...
+            smallXEndpoints([2 1],:);
+    end
+
+    %% Diagnostic information
+
+    sideInfo.largeX = largeXRun;
+    sideInfo.largeX.endpoints = largeXEndpoints;
+
+    sideInfo.smallX = smallXRun;
+    sideInfo.smallX.endpoints = smallXEndpoints;
+
+    sideInfo.boundaryVertexLoop = ...
+        boundaryVertexLoop;
+
+    sideInfo.boundaryPointsInOrder = ...
+        P;
+
+    sideInfo.allRuns = runs;
+
+    sideInfo.candidateRuns = candidateRuns;
+
+    sideInfo.lineAngleToleranceDeg = ...
+        lineAngleToleranceDeg;
+
+    sideInfo.lineDistanceTolerance = ...
+        lineDistanceTolerance;
 end
 
 
-function [boundaryEdges,boundaryVertexIDs] = ...
-    findBoundaryEdges(endFaces)
-% Find edges used by exactly one triangle within the selected end face.
-
-    allEdges = [
-        sort(endFaces(:,[1 2]),2)
-        sort(endFaces(:,[2 3]),2)
-        sort(endFaces(:,[3 1]),2)];
-
-    [uniqueEdges,~,edgeMap] = ...
-        unique(allEdges,'rows');
-
-    edgeCount = accumarray(edgeMap,1);
-
-    boundaryEdges = ...
-        uniqueEdges(edgeCount == 1,:);
+function boundaryVertexLoop = orderBoundaryLoop(boundaryEdges)
+%ORDERBOUNDARYLOOP Put boundary-edge vertices into continuous loop order.
 
     boundaryVertexIDs = ...
         unique(boundaryEdges(:));
+
+    maximumVertexID = ...
+        max(boundaryVertexIDs);
+
+    vertexNeighbors = ...
+        cell(maximumVertexID,1);
+
+    for j = 1:size(boundaryEdges,1)
+
+        vertex1 = boundaryEdges(j,1);
+        vertex2 = boundaryEdges(j,2);
+
+        vertexNeighbors{vertex1}(end+1) = vertex2;
+        vertexNeighbors{vertex2}(end+1) = vertex1;
+    end
+
+    %% A simple closed boundary must have two neighbors per vertex
+
+    for j = 1:numel(boundaryVertexIDs)
+
+        vertexID = boundaryVertexIDs(j);
+
+        vertexNeighbors{vertexID} = ...
+            unique(vertexNeighbors{vertexID});
+
+        if numel(vertexNeighbors{vertexID}) ~= 2
+
+            error(['The detected end-face boundary is not one ', ...
+                   'simple closed loop. Boundary vertex %d has ', ...
+                   '%d neighbors.'], ...
+                   vertexID,numel(vertexNeighbors{vertexID}));
+        end
+    end
+
+    %% Walk around the loop
+
+    startVertex = boundaryVertexIDs(1);
+
+    boundaryVertexLoop = ...
+        zeros(numel(boundaryVertexIDs),1);
+
+    boundaryVertexLoop(1) = ...
+        startVertex;
+
+    previousVertex = 0;
+    currentVertex = startVertex;
+
+    for j = 2:numel(boundaryVertexIDs)
+
+        nextCandidates = ...
+            vertexNeighbors{currentVertex};
+
+        if previousVertex == 0
+
+            nextVertex = ...
+                nextCandidates(1);
+
+        else
+
+            nextCandidates = ...
+                nextCandidates( ...
+                nextCandidates ~= previousVertex);
+
+            if isempty(nextCandidates)
+
+                error('The boundary loop ended unexpectedly.');
+            end
+
+            nextVertex = ...
+                nextCandidates(1);
+        end
+
+        boundaryVertexLoop(j) = ...
+            nextVertex;
+
+        previousVertex = currentVertex;
+        currentVertex = nextVertex;
+    end
+
+    %% Verify loop closure
+
+    if ~any(vertexNeighbors{currentVertex} == startVertex)
+
+        error('The detected end-face boundary does not close.');
+    end
 end
 
 
-function neighbors = triangleNeighbors(F)
-% Find triangles that share a complete edge.
+function uniqueRuns = removeDuplicateRuns(runs)
+%REMOVEDUPLICATERUNS Remove repeated versions of the same straight run.
 
-    numberTriangles = size(F,1);
+    keep = true(numel(runs),1);
 
-    edges = [
-        sort(F(:,[1 2]),2)
-        sort(F(:,[2 3]),2)
-        sort(F(:,[3 1]),2)];
+    for j = 1:numel(runs)-1
 
-    triangleID = repmat( ...
-        (1:numberTriangles)',3,1);
-
-    [edges,sortingIndex] = ...
-        sortrows(edges,[1 2]);
-
-    triangleID = ...
-        triangleID(sortingIndex);
-
-    neighbors = ...
-        cell(numberTriangles,1);
-
-    firstEdge = 1;
-
-    while firstEdge <= size(edges,1)
-
-        lastEdge = firstEdge;
-
-        while lastEdge < size(edges,1) && ...
-                all(edges(lastEdge+1,:) == edges(firstEdge,:))
-
-            lastEdge = lastEdge+1;
+        if ~keep(j)
+            continue
         end
 
-        trianglesUsingEdge = unique( ...
-            triangleID(firstEdge:lastEdge));
+        endpointsJ = sort([
+            runs(j).startIndex
+            runs(j).endIndex]);
 
-        if numel(trianglesUsingEdge) > 1
+        for k = j+1:numel(runs)
 
-            for j = 1:numel(trianglesUsingEdge)
+            if ~keep(k)
+                continue
+            end
 
-                currentTriangle = ...
-                    trianglesUsingEdge(j);
+            endpointsK = sort([
+                runs(k).startIndex
+                runs(k).endIndex]);
 
-                otherTriangles = ...
-                    trianglesUsingEdge( ...
-                    trianglesUsingEdge ~= currentTriangle);
+            if all(endpointsJ == endpointsK)
 
-                neighbors{currentTriangle} = [
-                    neighbors{currentTriangle}, ...
-                    otherTriangles'];
+                % Retain the version with the larger span.
+
+                if runs(k).length > runs(j).length
+
+                    keep(j) = false;
+                    break
+
+                else
+
+                    keep(k) = false;
+                end
             end
         end
-
-        firstEdge = lastEdge+1;
-    end
-end
-
-
-function orderedCorners = orderXY(cornerPoints)
-% Order corners according to global x and y coordinates.
-
-    if size(cornerPoints,1) ~= 4
-        error('Exactly four corner points are required.');
     end
 
-    [~,xOrder] = ...
-        sort(cornerPoints(:,1),'descend');
-
-    largerXPoints = ...
-        cornerPoints(xOrder(1:2),:);
-
-    smallerXPoints = ...
-        cornerPoints(xOrder(3:4),:);
-
-    [~,yOrder] = ...
-        sort(largerXPoints(:,2),'descend');
-
-    largerXPoints = ...
-        largerXPoints(yOrder,:);
-
-    [~,yOrder] = ...
-        sort(smallerXPoints(:,2),'descend');
-
-    smallerXPoints = ...
-        smallerXPoints(yOrder,:);
-
-    orderedCorners = [
-        largerXPoints
-        smallerXPoints];
-end
-
-
-function [V,F] = getMeshArrays(stlData)
-% Read mesh arrays from MATLAB's built-in stlread output.
-
-    if isa(stlData,'triangulation')
-
-        V = stlData.Points;
-        F = stlData.ConnectivityList;
-
-        return
-    end
-
-    if ~isstruct(stlData)
-
-        error(['Input must be a triangulation object or a ', ...
-               'structure containing faces and vertices.']);
-    end
-
-    fieldNames = fieldnames(stlData);
-
-    vertexField = find( ...
-        strcmpi(fieldNames,'vertices'),1);
-
-    faceField = find( ...
-        strcmpi(fieldNames,'faces'),1);
-
-    if isempty(vertexField) || isempty(faceField)
-
-        error(['The structure must contain fields named ', ...
-               'vertices and faces.']);
-    end
-
-    V = stlData.(fieldNames{vertexField});
-    F = stlData.(fieldNames{faceField});
+    uniqueRuns = runs(keep);
 end
