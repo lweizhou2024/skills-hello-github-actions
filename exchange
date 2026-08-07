@@ -1,499 +1,155 @@
-[largeXEndpoints,smallXEndpoints,sideInfo] = ...
-    findTwoStraightSides( ...
-    boundaryEdges,V,modelSize);
+from odbAccess import openOdb
+from abaqusConstants import TIME, NODAL, SCALAR
+import numpy as np
 
-largeXInfo = sideInfo.largeX;
-smallXInfo = sideInfo.smallX;
 
+# ---------------------------------------------------------
+# User settings
+# ---------------------------------------------------------
+ratioFile = 'ratio.txt'
+sourceOdbFile = 'thermal.odb'   # Contains NT11 results
+targetOdbFile = 'model.odb'     # Modified directly
 
-function [largeXEndpoints,smallXEndpoints,sideInfo] = ...
-    findTwoStraightSides(boundaryEdges,V,modelSize)
-%FINDTWOSTRAIGHTSIDES Find the two straight side runs of the boundary.
-%
-% The boundary is first ordered into a continuous loop. Consecutive
-% collinear edges are merged into straight runs. The two long runs that
-% extend mainly in y and lie on opposite x sides are selected.
+sourceStepName = 'Step-1'
+newStepName = 'Scaled-NT11'
 
-    %% Order boundary vertices into a continuous loop
+endTime = 300.0
+# ---------------------------------------------------------
 
-    boundaryVertexLoop = ...
-        orderBoundaryLoop(boundaryEdges);
 
-    P = V(boundaryVertexLoop,:);
+# Read comma-separated time and ratio
+# Example:
+# 0,1.0
+# 100,0.9
+# 200,0.8
+# 300,0.7
 
-    numberPoints = size(P,1);
+table = np.loadtxt(ratioFile, delimiter=',')
 
-    if numberPoints < 4
-        error('The end-face boundary has fewer than four vertices.');
-    end
+ratioTime = table[:, 0]
+ratioValue = table[:, 1]
 
-    %% Boundary dimensions
 
-    xRange = max(P(:,1))-min(P(:,1));
-    yRange = max(P(:,2))-min(P(:,2));
+# Open source ODB for reading
+sourceOdb = openOdb(
+    path=sourceOdbFile,
+    readOnly=True
+)
 
-    if xRange <= eps || yRange <= eps
-        error('The end-face boundary has zero x or y range.');
-    end
+# Open target ODB for writing
+targetOdb = openOdb(
+    path=targetOdbFile,
+    readOnly=False
+)
 
-    xCenter = 0.5*(max(P(:,1))+min(P(:,1)));
 
-    %% Settings for grouping consecutive collinear edges
+sourceStep = sourceOdb.steps[sourceStepName]
 
-    lineAngleToleranceDeg = 2.0;
 
-    cosineLimit = ...
-        cos(lineAngleToleranceDeg*pi/180);
+# Create a new step in the target ODB
+targetStep = targetOdb.Step(
+    name=newStepName,
+    description='Scaled NT11',
+    domain=TIME,
+    timePeriod=endTime
+)
 
-    lineDistanceTolerance = max( ...
-        1e-7*modelSize, ...
-        1e-5*max(xRange,yRange));
 
-    %% Find every possible consecutive straight run
+for sourceFrame in sourceStep.frames:
 
-    runs = struct( ...
-        'startIndex',{}, ...
-        'endIndex',{}, ...
-        'numberEdges',{}, ...
-        'endpoint1',{}, ...
-        'endpoint2',{}, ...
-        'midpoint',{}, ...
-        'length',{}, ...
-        'ySpan',{}, ...
-        'verticalFraction',{}, ...
-        'indices',{});
+    time = sourceFrame.frameValue
 
-    numberRuns = 0;
+    if time > endTime:
+        break
 
-    for startIndex = 1:numberPoints
+    # Interpolate ratio at the current time
+    ratio = np.interp(
+        time,
+        ratioTime,
+        ratioValue
+    )
 
-        nextIndex = mod(startIndex,numberPoints)+1;
+    sourceNT11 = sourceFrame.fieldOutputs['NT11']
 
-        firstVector = P(nextIndex,:)-P(startIndex,:);
 
-        firstLength = norm(firstVector);
+    # Create corresponding frame in target ODB
+    targetFrame = targetStep.Frame(
+        incrementNumber=sourceFrame.incrementNumber,
+        frameValue=time
+    )
 
-        if firstLength <= eps
-            continue
-        end
+    targetNT11 = targetFrame.FieldOutput(
+        name='NT11',
+        description='NT11 multiplied by time-dependent ratio',
+        type=SCALAR
+    )
 
-        referenceDirection = ...
-            firstVector/firstLength;
 
-        referencePoint = ...
-            P(startIndex,:);
+    # Process each assembly instance
+    for instanceName in sourceOdb.rootAssembly.instances.keys():
 
-        runIndices = startIndex;
+        sourceInstance = \
+            sourceOdb.rootAssembly.instances[instanceName]
 
-        currentIndex = startIndex;
-        numberEdges = 0;
+        targetInstance = \
+            targetOdb.rootAssembly.instances[instanceName]
 
-        while numberEdges < numberPoints-1
 
-            followingIndex = ...
-                mod(currentIndex,numberPoints)+1;
+        # Get NT11 for this instance
+        instanceNT11 = sourceNT11.getSubset(
+            region=sourceInstance,
+            position=NODAL
+        )
 
-            currentVector = ...
-                P(followingIndex,:)-P(currentIndex,:);
 
-            currentLength = norm(currentVector);
+        # Store node label and scaled NT11
+        nodeData = []
 
-            if currentLength <= eps
-                break
-            end
+        for value in instanceNT11.values:
 
-            currentDirection = ...
-                currentVector/currentLength;
+            scaledTemperature = float(value.data) * ratio
 
-            %% Require the next edge to remain parallel to the first edge
+            nodeData.append(
+                (value.nodeLabel, scaledTemperature)
+            )
 
-            directionOK = ...
-                dot(currentDirection,referenceDirection) >= cosineLimit;
 
-            if ~directionOK
-                break
-            end
+        # Abaqus requires node labels in ascending order
+        nodeData.sort()
 
-            %% Require the next vertex to remain on the same straight line
+        labels = []
+        data = []
 
-            vectorFromLine = ...
-                P(followingIndex,:)-referencePoint;
+        for nodeLabel, temperature in nodeData:
 
-            lineProjection = ...
-                dot(vectorFromLine,referenceDirection);
+            labels.append(nodeLabel)
+            data.append((temperature,))
 
-            closestPoint = ...
-                referencePoint + ...
-                lineProjection*referenceDirection;
 
-            distanceFromLine = ...
-                norm(P(followingIndex,:)-closestPoint);
+        # Write scaled NT11 into target ODB
+        if len(labels) > 0:
 
-            lineOK = ...
-                distanceFromLine <= lineDistanceTolerance;
+            targetNT11.addData(
+                position=NODAL,
+                instance=targetInstance,
+                labels=labels,
+                data=data
+            )
 
-            if ~lineOK
-                break
-            end
 
-            runIndices(end+1) = followingIndex; %#ok<AGROW>
+    print(
+        'Time = %g, ratio = %g'
+        % (time, ratio)
+    )
 
-            numberEdges = numberEdges+1;
-            currentIndex = followingIndex;
-        end
 
-        if numberEdges < 1
-            continue
-        end
+# Save changes directly into target ODB
+targetOdb.save()
 
-        endpoint1 = P(runIndices(1),:);
-        endpoint2 = P(runIndices(end),:);
+targetOdb.close()
+sourceOdb.close()
 
-        runVector = endpoint2-endpoint1;
-        runLength = norm(runVector);
-
-        if runLength <= eps
-            continue
-        end
-
-        runXYLength = norm(runVector(1:2));
-
-        if runXYLength <= eps
-            continue
-        end
-
-        verticalFraction = ...
-            abs(runVector(2))/runXYLength;
-
-        ySpan = ...
-            abs(endpoint2(2)-endpoint1(2));
-
-        numberRuns = numberRuns+1;
-
-        runs(numberRuns).startIndex = ...
-            runIndices(1);
-
-        runs(numberRuns).endIndex = ...
-            runIndices(end);
-
-        runs(numberRuns).numberEdges = ...
-            numberEdges;
-
-        runs(numberRuns).endpoint1 = ...
-            endpoint1;
-
-        runs(numberRuns).endpoint2 = ...
-            endpoint2;
-
-        runs(numberRuns).midpoint = ...
-            0.5*(endpoint1+endpoint2);
-
-        runs(numberRuns).length = ...
-            runLength;
-
-        runs(numberRuns).ySpan = ...
-            ySpan;
-
-        runs(numberRuns).verticalFraction = ...
-            verticalFraction;
-
-        runs(numberRuns).indices = ...
-            runIndices;
-    end
-
-    if numel(runs) < 2
-        error('Fewer than two straight boundary runs were detected.');
-    end
-
-    %% Retain runs that can represent a left or right side
-
-    allYSpan = [runs.ySpan]';
-    allVerticalFraction = [runs.verticalFraction]';
-
-    % The straight sides connect the upper and lower curved boundaries,
-    % so they should have substantial y extent.
-
-    minimumYSpan = 0.25*yRange;
-
-    acceptable = ...
-        allYSpan >= minimumYSpan & ...
-        allVerticalFraction >= 0.50;
-
-    candidateRuns = runs(acceptable);
-
-    if numel(candidateRuns) < 2
-
-        % Relax the y-span criterion if the tang is strongly inclined.
-        acceptable = ...
-            allYSpan >= 0.10*yRange & ...
-            allVerticalFraction >= 0.40;
-
-        candidateRuns = runs(acceptable);
-    end
-
-    if numel(candidateRuns) < 2
-
-        error(['Could not identify two long, mostly y-directed ', ...
-               'straight boundary runs.']);
-    end
-
-    %% Remove duplicate runs
-
-    candidateRuns = ...
-        removeDuplicateRuns(candidateRuns);
-
-    if numel(candidateRuns) < 2
-
-        error(['Only one distinct straight side run was found ', ...
-               'on the end-face boundary.']);
-    end
-
-    %% Score candidates by x side, length and y extent
-
-    numberCandidates = ...
-        numel(candidateRuns);
-
-    rightScore = -inf(numberCandidates,1);
-    leftScore = -inf(numberCandidates,1);
-
-    for j = 1:numberCandidates
-
-        meanX = ...
-            candidateRuns(j).midpoint(1);
-
-        normalizedX = ...
-            (meanX-xCenter)/xRange;
-
-        normalizedYSpan = ...
-            candidateRuns(j).ySpan/yRange;
-
-        normalizedLength = ...
-            candidateRuns(j).length/ ...
-            max(xRange,yRange);
-
-        % Position is the primary criterion. Span and length are secondary.
-
-        rightScore(j) = ...
-            normalizedX + ...
-            0.20*normalizedYSpan + ...
-            0.05*normalizedLength;
-
-        leftScore(j) = ...
-            -normalizedX + ...
-            0.20*normalizedYSpan + ...
-            0.05*normalizedLength;
-    end
-
-    %% Select larger-x side
-
-    [~,largeXRunIndex] = ...
-        max(rightScore);
-
-    %% Select smaller-x side, excluding the already selected run
-
-    leftScore(largeXRunIndex) = -inf;
-
-    [~,smallXRunIndex] = ...
-        max(leftScore);
-
-    largeXRun = ...
-        candidateRuns(largeXRunIndex);
-
-    smallXRun = ...
-        candidateRuns(smallXRunIndex);
-
-    %% Verify that the selected runs are on opposite x sides
-
-    if largeXRun.midpoint(1) <= smallXRun.midpoint(1)
-
-        error(['The two detected straight runs could not be ', ...
-               'separated into larger-x and smaller-x sides.']);
-    end
-
-    %% Extract endpoints
-
-    largeXEndpoints = [
-        largeXRun.endpoint1
-        largeXRun.endpoint2];
-
-    smallXEndpoints = [
-        smallXRun.endpoint1
-        smallXRun.endpoint2];
-
-    %% Put larger-y endpoint first on each side
-
-    if largeXEndpoints(1,2) < largeXEndpoints(2,2)
-
-        largeXEndpoints = ...
-            largeXEndpoints([2 1],:);
-    end
-
-    if smallXEndpoints(1,2) < smallXEndpoints(2,2)
-
-        smallXEndpoints = ...
-            smallXEndpoints([2 1],:);
-    end
-
-    %% Diagnostic information
-
-    sideInfo.largeX = largeXRun;
-    sideInfo.largeX.endpoints = largeXEndpoints;
-
-    sideInfo.smallX = smallXRun;
-    sideInfo.smallX.endpoints = smallXEndpoints;
-
-    sideInfo.boundaryVertexLoop = ...
-        boundaryVertexLoop;
-
-    sideInfo.boundaryPointsInOrder = ...
-        P;
-
-    sideInfo.allRuns = runs;
-
-    sideInfo.candidateRuns = candidateRuns;
-
-    sideInfo.lineAngleToleranceDeg = ...
-        lineAngleToleranceDeg;
-
-    sideInfo.lineDistanceTolerance = ...
-        lineDistanceTolerance;
-end
-
-
-function boundaryVertexLoop = orderBoundaryLoop(boundaryEdges)
-%ORDERBOUNDARYLOOP Put boundary-edge vertices into continuous loop order.
-
-    boundaryVertexIDs = ...
-        unique(boundaryEdges(:));
-
-    maximumVertexID = ...
-        max(boundaryVertexIDs);
-
-    vertexNeighbors = ...
-        cell(maximumVertexID,1);
-
-    for j = 1:size(boundaryEdges,1)
-
-        vertex1 = boundaryEdges(j,1);
-        vertex2 = boundaryEdges(j,2);
-
-        vertexNeighbors{vertex1}(end+1) = vertex2;
-        vertexNeighbors{vertex2}(end+1) = vertex1;
-    end
-
-    %% A simple closed boundary must have two neighbors per vertex
-
-    for j = 1:numel(boundaryVertexIDs)
-
-        vertexID = boundaryVertexIDs(j);
-
-        vertexNeighbors{vertexID} = ...
-            unique(vertexNeighbors{vertexID});
-
-        if numel(vertexNeighbors{vertexID}) ~= 2
-
-            error(['The detected end-face boundary is not one ', ...
-                   'simple closed loop. Boundary vertex %d has ', ...
-                   '%d neighbors.'], ...
-                   vertexID,numel(vertexNeighbors{vertexID}));
-        end
-    end
-
-    %% Walk around the loop
-
-    startVertex = boundaryVertexIDs(1);
-
-    boundaryVertexLoop = ...
-        zeros(numel(boundaryVertexIDs),1);
-
-    boundaryVertexLoop(1) = ...
-        startVertex;
-
-    previousVertex = 0;
-    currentVertex = startVertex;
-
-    for j = 2:numel(boundaryVertexIDs)
-
-        nextCandidates = ...
-            vertexNeighbors{currentVertex};
-
-        if previousVertex == 0
-
-            nextVertex = ...
-                nextCandidates(1);
-
-        else
-
-            nextCandidates = ...
-                nextCandidates( ...
-                nextCandidates ~= previousVertex);
-
-            if isempty(nextCandidates)
-
-                error('The boundary loop ended unexpectedly.');
-            end
-
-            nextVertex = ...
-                nextCandidates(1);
-        end
-
-        boundaryVertexLoop(j) = ...
-            nextVertex;
-
-        previousVertex = currentVertex;
-        currentVertex = nextVertex;
-    end
-
-    %% Verify loop closure
-
-    if ~any(vertexNeighbors{currentVertex} == startVertex)
-
-        error('The detected end-face boundary does not close.');
-    end
-end
-
-
-function uniqueRuns = removeDuplicateRuns(runs)
-%REMOVEDUPLICATERUNS Remove repeated versions of the same straight run.
-
-    keep = true(numel(runs),1);
-
-    for j = 1:numel(runs)-1
-
-        if ~keep(j)
-            continue
-        end
-
-        endpointsJ = sort([
-            runs(j).startIndex
-            runs(j).endIndex]);
-
-        for k = j+1:numel(runs)
-
-            if ~keep(k)
-                continue
-            end
-
-            endpointsK = sort([
-                runs(k).startIndex
-                runs(k).endIndex]);
-
-            if all(endpointsJ == endpointsK)
-
-                % Retain the version with the larger span.
-
-                if runs(k).length > runs(j).length
-
-                    keep(j) = false;
-                    break
-
-                else
-
-                    keep(k) = false;
-                end
-            end
-        end
-    end
-
-    uniqueRuns = runs(keep);
-end
+print(
+    'Finished writing scaled NT11 into '
+    + targetOdbFile
+)
