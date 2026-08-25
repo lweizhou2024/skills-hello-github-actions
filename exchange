@@ -1,155 +1,45 @@
-from odbAccess import openOdb
-from abaqusConstants import TIME, NODAL, SCALAR
-import numpy as np
+@echo off
+setlocal enabledelayedexpansion
 
+set "LOGFILE=job.log"
+set "MAXTRIES=40"
+set "INTERVAL=1800"
 
-# ---------------------------------------------------------
-# User settings
-# ---------------------------------------------------------
-ratioFile = 'ratio.txt'
-sourceOdbFile = 'thermal.odb'   # Contains NT11 results
-targetOdbFile = 'model.odb'     # Modified directly
+for /L %%i in (1,1,%MAXTRIES%) do (
 
-sourceStepName = 'Step-1'
-newStepName = 'Scaled-NT11'
-
-endTime = 300.0
-# ---------------------------------------------------------
-
-
-# Read comma-separated time and ratio
-# Example:
-# 0,1.0
-# 100,0.9
-# 200,0.8
-# 300,0.7
-
-table = np.loadtxt(ratioFile, delimiter=',')
-
-ratioTime = table[:, 0]
-ratioValue = table[:, 1]
-
-
-# Open source ODB for reading
-sourceOdb = openOdb(
-    path=sourceOdbFile,
-    readOnly=True
-)
-
-# Open target ODB for writing
-targetOdb = openOdb(
-    path=targetOdbFile,
-    readOnly=False
-)
-
-
-sourceStep = sourceOdb.steps[sourceStepName]
-
-
-# Create a new step in the target ODB
-targetStep = targetOdb.Step(
-    name=newStepName,
-    description='Scaled NT11',
-    domain=TIME,
-    timePeriod=endTime
-)
-
-
-for sourceFrame in sourceStep.frames:
-
-    time = sourceFrame.frameValue
-
-    if time > endTime:
-        break
-
-    # Interpolate ratio at the current time
-    ratio = np.interp(
-        time,
-        ratioTime,
-        ratioValue
-    )
-
-    sourceNT11 = sourceFrame.fieldOutputs['NT11']
-
-
-    # Create corresponding frame in target ODB
-    targetFrame = targetStep.Frame(
-        incrementNumber=sourceFrame.incrementNumber,
-        frameValue=time
-    )
-
-    targetNT11 = targetFrame.FieldOutput(
-        name='NT11',
-        description='NT11 multiplied by time-dependent ratio',
-        type=SCALAR
-    )
-
-
-    # Process each assembly instance
-    for instanceName in sourceOdb.rootAssembly.instances.keys():
-
-        sourceInstance = \
-            sourceOdb.rootAssembly.instances[instanceName]
-
-        targetInstance = \
-            targetOdb.rootAssembly.instances[instanceName]
-
-
-        # Get NT11 for this instance
-        instanceNT11 = sourceNT11.getSubset(
-            region=sourceInstance,
-            position=NODAL
+    if not exist "%LOGFILE%" (
+        echo [Attempt %%i/%MAXTRIES%] %LOGFILE% not found yet.
+    ) else (
+        rem Get the last non-empty line of the file
+        set "LASTLINE="
+        for /f "usebackq delims=" %%L in ("%LOGFILE%") do (
+            if not "%%L"=="" set "LASTLINE=%%L"
         )
 
+        rem Extract the last word from that line
+        set "LASTWORD="
+        for %%W in (!LASTLINE!) do set "LASTWORD=%%W"
 
-        # Store node label and scaled NT11
-        nodeData = []
+        echo [Attempt %%i/%MAXTRIES%] Last word: "!LASTWORD!"
 
-        for value in instanceNT11.values:
-
-            scaledTemperature = float(value.data) * ratio
-
-            nodeData.append(
-                (value.nodeLabel, scaledTemperature)
-            )
-
-
-        # Abaqus requires node labels in ascending order
-        nodeData.sort()
-
-        labels = []
-        data = []
-
-        for nodeLabel, temperature in nodeData:
-
-            labels.append(nodeLabel)
-            data.append((temperature,))
-
-
-        # Write scaled NT11 into target ODB
-        if len(labels) > 0:
-
-            targetNT11.addData(
-                position=NODAL,
-                instance=targetInstance,
-                labels=labels,
-                data=data
-            )
-
-
-    print(
-        'Time = %g, ratio = %g'
-        % (time, ratio)
+        if "!LASTWORD!"=="COMPLETED" (
+            echo Job completed. Running command...
+            rem ==== put your command here ====
+            call your_command.bat
+            rem ================================
+            goto :done
+        )
     )
 
-
-# Save changes directly into target ODB
-targetOdb.save()
-
-targetOdb.close()
-sourceOdb.close()
-
-print(
-    'Finished writing scaled NT11 into '
-    + targetOdbFile
+    if %%i lss %MAXTRIES% (
+        echo Waiting %INTERVAL% seconds before next check...
+        timeout /t %INTERVAL% /nobreak >nul
+    )
 )
+
+echo Reached maximum number of attempts ^(%MAXTRIES%^) without seeing COMPLETED.
+goto :eof
+
+:done
+echo Done.
+endlocal
