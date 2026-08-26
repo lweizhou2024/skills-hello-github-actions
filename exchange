@@ -2,44 +2,44 @@
 setlocal enabledelayedexpansion
 
 set "LOGFILE=job.log"
+set "TARGET=COMPLETED"
 set "MAXTRIES=40"
 set "INTERVAL=1800"
+set "FOUND=0"
 
 for /L %%i in (1,1,%MAXTRIES%) do (
+    if "!FOUND!"=="0" (
 
-    if not exist "%LOGFILE%" (
-        echo [Attempt %%i/%MAXTRIES%] %LOGFILE% not found yet.
-    ) else (
-        rem Get the last non-empty line of the file
-        set "LASTLINE="
-        for /f "usebackq delims=" %%L in ("%LOGFILE%") do (
-            if not "%%L"=="" set "LASTLINE=%%L"
+        if not exist "%LOGFILE%" (
+            echo [Attempt %%i/%MAXTRIES%] %LOGFILE% not found yet.
+        ) else (
+            set "LASTWORD="
+            for /f "usebackq delims=" %%A in (`powershell -NoProfile -Command "$l = Get-Content -LiteralPath '%LOGFILE%' -Tail 1; if ($l) { ($l.Trim() -split '\s+')[-1] }"`) do set "LASTWORD=%%A"
+
+            echo [Attempt %%i/%MAXTRIES%] Last word: "!LASTWORD!"
+
+            if "!LASTWORD!"=="%TARGET%" (
+                echo Job completed. Running command...
+                rem ==== put your command here ====
+                call your_command.bat
+                rem ================================
+                set "FOUND=1"
+            )
         )
 
-        rem Extract the last word from that line
-        set "LASTWORD="
-        for %%W in (!LASTLINE!) do set "LASTWORD=%%W"
-
-        echo [Attempt %%i/%MAXTRIES%] Last word: "!LASTWORD!"
-
-        if "!LASTWORD!"=="COMPLETED" (
-            echo Job completed. Running command...
-            rem ==== put your command here ====
-            call your_command.bat
-            rem ================================
-            goto :done
+        if "!FOUND!"=="0" (
+            if %%i lss %MAXTRIES% (
+                echo Waiting %INTERVAL% seconds before next check...
+                timeout /t %INTERVAL% /nobreak >nul
+            )
         )
-    )
-
-    if %%i lss %MAXTRIES% (
-        echo Waiting %INTERVAL% seconds before next check...
-        timeout /t %INTERVAL% /nobreak >nul
     )
 )
 
-echo Reached maximum number of attempts ^(%MAXTRIES%^) without seeing COMPLETED.
-goto :eof
+if "!FOUND!"=="1" (
+    echo Done - COMPLETED detected and command executed.
+) else (
+    echo Reached maximum number of attempts ^(%MAXTRIES%^) without seeing COMPLETED.
+)
 
-:done
-echo Done.
 endlocal
