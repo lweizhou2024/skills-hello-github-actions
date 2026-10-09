@@ -1,24 +1,41 @@
-function [Q1, Q2, Q3, n] = moveCirclePoints(P1, P2, P3, d)
+function [Q1, Q2, Q3, center, n] = moveAndRotateCircle(P1, P2, P3, d, theta)
 % P1,P2,P3 : 3-element points on the circle, in rotation order
-% d        : signed distance along the right-hand-rule normal
-% Q1,Q2,Q3 : moved points (same shape as the inputs)
-% n        : unit normal used for the move
+% d        : signed distance to move along the right-hand-rule normal
+% theta    : rotation angle in degrees about the normal axis through the
+%            (moved) circle center; positive = right-hand rule about n
+% Q1,Q2,Q3 : final points (same shape as the inputs)
+% center   : circle center after the move
+% n        : unit normal
 
-    % Remember input shapes (row or column) so outputs match
     sz = size(P1);
-
     p1 = P1(:); p2 = P2(:); p3 = P3(:);
 
-    % Right-hand-rule normal from the point order
-    nv = cross(p2 - p1, p3 - p1);
-    nn = norm(nv);
-    if nn < eps(max(1, norm(p2 - p1) * norm(p3 - p1)))
+    % Normal (right-hand rule from point order)
+    a  = p2 - p1;
+    b  = p3 - p1;
+    nv = cross(a, b);
+    if norm(nv) < eps(max(1, norm(a)*norm(b)))
         error('Points are collinear; they do not define a circle.');
     end
-    n = nv / nn;
+    n = nv / norm(nv);
 
-    % Translate all three points along the normal
-    Q1 = reshape(p1 + d * n, sz);
-    Q2 = reshape(p2 + d * n, sz);
-    Q3 = reshape(p3 + d * n, sz);
+    % Circumcenter of the original points
+    c0 = p1 + (cross(nv, a) * dot(b, b) + cross(b, nv) * dot(a, a)) / (2 * dot(nv, nv));
+
+    % Step 1: move along the normal
+    center = c0 + d * n;
+    q = {p1 + d*n, p2 + d*n, p3 + d*n};
+
+    % Step 2: rotate about the axis (center, n) by theta degrees
+    ct = cosd(theta);
+    st = sind(theta);
+    for k = 1:3
+        v = q{k} - center;                               % offset from center
+        vr = v*ct + cross(n, v)*st + n*dot(n, v)*(1 - ct); % Rodrigues
+        q{k} = center + vr;
+    end
+
+    Q1 = reshape(q{1}, sz);
+    Q2 = reshape(q{2}, sz);
+    Q3 = reshape(q{3}, sz);
 end
