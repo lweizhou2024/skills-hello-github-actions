@@ -1,1 +1,24 @@
-https://www.carpentertechnology.com/hubfs/7407324/Material%20Saftey%20Data%20Sheets/Custom%20630%20(17-4%20PH).pdf
+function [Q1, Q2, Q3, n] = moveCirclePoints(P1, P2, P3, d)
+% P1,P2,P3 : 3-element points on the circle, in rotation order
+% d        : signed distance along the right-hand-rule normal
+% Q1,Q2,Q3 : moved points (same shape as the inputs)
+% n        : unit normal used for the move
+
+    % Remember input shapes (row or column) so outputs match
+    sz = size(P1);
+
+    p1 = P1(:); p2 = P2(:); p3 = P3(:);
+
+    % Right-hand-rule normal from the point order
+    nv = cross(p2 - p1, p3 - p1);
+    nn = norm(nv);
+    if nn < eps(max(1, norm(p2 - p1) * norm(p3 - p1)))
+        error('Points are collinear; they do not define a circle.');
+    end
+    n = nv / nn;
+
+    % Translate all three points along the normal
+    Q1 = reshape(p1 + d * n, sz);
+    Q2 = reshape(p2 + d * n, sz);
+    Q3 = reshape(p3 + d * n, sz);
+end
